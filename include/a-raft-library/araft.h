@@ -55,6 +55,7 @@ typedef struct {
     uint64_t prev_log_term;
     uint64_t leader_commit;
     uint32_t entry_count;
+    uint64_t entry_term; // NEW: The term the entry was originally written in
 } msg_append_entries_t;
 
 typedef struct {
@@ -95,6 +96,22 @@ typedef struct {
     uint64_t target_node_id;
 } deferred_msg_t;
 
+// --- NEW: Thread Bridging Queue ---
+typedef enum {
+    ASYNC_CMD_PROPOSE,
+    ASYNC_CMD_ISOLATE,
+    ASYNC_CMD_RECONNECT
+} async_cmd_type_t;
+
+typedef struct async_cmd_s {
+    async_cmd_type_t type;
+    araft_node_t* node;
+    uint8_t* payload;
+    uint32_t len;
+    struct async_cmd_s* next;
+} async_cmd_t;
+// ----------------------------------
+
 typedef void (*araft_forward_response_cb)(uint64_t request_id, uint8_t success);
 
 struct physical_server_s {
@@ -122,7 +139,12 @@ struct physical_server_s {
     deferred_msg_t deferred_msgs[ARAFT_MAX_DEFERRED_MSGS];
     uint32_t deferred_msg_count;
 
-    // --- NEW: Chaos Engineering Flags ---
+    // --- NEW: Async Thread Bridging ---
+    uv_async_t async_handle;
+    pthread_mutex_t async_mutex;
+    async_cmd_t* async_head;
+    async_cmd_t* async_tail;
+
     bool network_isolated;
 };
 
@@ -149,7 +171,6 @@ struct araft_node_s {
 
     uint64_t last_log_index;
     uint64_t commit_index;
-
     uint64_t known_leader_commit;
 
     uint32_t cluster_size;
@@ -164,18 +185,18 @@ struct araft_node_s {
 
 int  araft_server_init(physical_server_t* server, uv_loop_t* loop, uint64_t node_id, uint32_t max_groups, const char* data_dir);
 int  araft_server_listen(physical_server_t* server, const char* ip, int port);
-
-// --- UPDATED: Pass target_node_id so we know who we are dialing ---
 void araft_server_connect(physical_server_t* server, const char* ip, int port, uint64_t target_node_id);
 
 void araft_node_init(araft_node_t* node, physical_server_t* server, uint64_t group_id, uint32_t cluster_size);
-void araft_node_start(araft_node_t* node);
+
+// Updated explicit timer callbacks
+void araft_on_election_timeout(uv_timer_t* handle);
+void araft_on_heartbeat_tick(uv_timer_t* handle);
 
 void araft_propose(araft_node_t* node, const uint8_t* payload, uint32_t len);
 void araft_forward_request(araft_node_t* node, uint64_t request_id, const uint8_t* payload, uint32_t len);
 void araft_server_set_forward_cb(physical_server_t* server, araft_forward_response_cb cb);
 
-// --- NEW: Chaos API ---
 void araft_server_isolate(physical_server_t* server);
 void araft_server_reconnect(physical_server_t* server);
 

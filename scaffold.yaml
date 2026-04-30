@@ -21,10 +21,16 @@ cxx_standard: "17"
 #   "src/vendor/**": mit
 
 # ── 4. Dependencies ──
-depends_on: []
+depends_on:
+  - common/libuv
+  # - https://github.com/contactandyc/a-write-ahead-log.git
+  - https://github.com/contactandyc/h2o-c-library.git
+  - https://github.com/contactandyc/the-lz4-library.git
 
 examples:
   multi-raft:
     targets:
-      multi-raft:
-        - src/main.c
+      server:
+        - src/server.c
+      client:
+        - src/client.c
