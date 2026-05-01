@@ -31,7 +31,6 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
     snprintf(dat_path, sizeof(dat_path), "%s.dat", base_filepath);
     snprintf(idx_path, sizeof(idx_path), "%s.index", base_filepath);
 
-    // FIXED: Open/Create dat_fd FIRST before read_fd attempts to open it. Dropped O_DIRECT.
 #ifdef __linux__
     engine->dat_fd = open(dat_path, O_RDWR | O_CREAT, 0644);
 #elif defined(__APPLE__)
@@ -49,7 +48,11 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
 
     if (current_size < (off_t)map_size) {
 #ifdef __APPLE__
-        fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, map_size};
+        fstore_t store = {0};
+        store.fst_flags = F_ALLOCATECONTIG;
+        store.fst_posmode = F_PEOFPOSMODE;
+        store.fst_offset = 0;
+        store.fst_length = map_size;
         fcntl(engine->idx_fd, F_PREALLOCATE, &store);
         ftruncate(engine->idx_fd, map_size);
 #else
@@ -57,7 +60,6 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
 #endif
     }
 
-    // FIXED: Removed duplicate mmap memory leak
     engine->index_ram_array = (uint64_t*)mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, engine->idx_fd, 0);
     if (engine->index_ram_array == MAP_FAILED) return -1;
 
@@ -76,12 +78,10 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
     uint32_t block_header[2];
     uint64_t max_index_found = 0;
 
-    // Recover Disk State
     while (pread(engine->dat_fd, block_header, 8, engine->dat_offset) == 8) {
         uint32_t uncomp_len = block_header[0];
         uint32_t comp_len = block_header[1];
 
-        // FIXED: Corruption Check to prevent massive mallocs
         if (uncomp_len > 1024 * 1024 * 50 || comp_len > 1024 * 1024 * 10) break;
 
         uint8_t* comp_buf = malloc(comp_len);
@@ -95,7 +95,7 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
                 uint32_t len;
                 memcpy(&idx, uncomp_buf + pos + 8, 8);
                 memcpy(&len, uncomp_buf + pos + 16, 4);
-                pos += 20 + len;
+                pos += 21 + len; // FIXED offset
 
                 max_index_found = idx;
                 engine->ring.disk_tail++;
@@ -111,26 +111,26 @@ int awal_init(awal_engine_t* engine, const char* base_filepath) {
     engine->ring.commit_index = engine->ring.disk_tail;
     engine->ram_head_start_seq = engine->ring.disk_tail;
     engine->ring.demux_tail = 0;
-
-    // FIXED: Properly set demux expectations for State Machine
     engine->demux_expected_raft_index = max_index_found > 0 ? max_index_found + 1 : 1;
 
     return 0;
 }
 
-void awal_append(awal_engine_t* engine, uint64_t term, uint64_t index, const uint8_t* payload, uint32_t len) {
-    if (len > AWAL_PAYLOAD_MAX) len = AWAL_PAYLOAD_MAX;
+int awal_append(awal_engine_t* engine, uint64_t term, uint64_t index, uint8_t type, const uint8_t* payload, uint32_t len) {
+    // FIXED: Reject oversized payloads instead of silently truncating!
+    if (len > AWAL_PAYLOAD_MAX) return -1;
 
     uint64_t my_seq = atomic_fetch_add_explicit(&engine->ring.head, 1, memory_order_relaxed);
     awal_entry_t* slot = &engine->ring.entries[my_seq & AWAL_RING_MASK];
 
     slot->term = term;
     slot->index = index;
+    slot->type = type;
     slot->data_len = len;
     if (len > 0) memcpy(slot->data, payload, len);
 
-    // FIXED: Ready is the target index. Acts as safety lock.
     atomic_store_explicit(&slot->ready, index, memory_order_release);
+    return 0;
 }
 
 int awal_flush_batch(awal_engine_t* engine) {
@@ -140,10 +140,10 @@ int awal_flush_batch(awal_engine_t* engine) {
 
     while (batch_size < AWAL_RING_CAPACITY) {
         uint64_t target_seq = current_tail + batch_size;
-        if (target_seq >= head) break; // Don't flush un-appended items
+        if (target_seq >= head) break;
 
         awal_entry_t* slot = &engine->ring.entries[target_seq & AWAL_RING_MASK];
-        if (atomic_load_explicit(&slot->ready, memory_order_acquire) != slot->index) break; // Incomplete write
+        if (atomic_load_explicit(&slot->ready, memory_order_acquire) != slot->index) break;
 
         batch_size++;
     }
@@ -163,6 +163,7 @@ int awal_flush_batch(awal_engine_t* engine) {
         memcpy(uncomp_buf + uncomp_len, &slot->term, 8); uncomp_len += 8;
         memcpy(uncomp_buf + uncomp_len, &slot->index, 8); uncomp_len += 8;
         memcpy(uncomp_buf + uncomp_len, &slot->data_len, 4); uncomp_len += 4;
+        memcpy(uncomp_buf + uncomp_len, &slot->type, 1); uncomp_len += 1;
 
         if (slot->data_len > 0) {
             memcpy(uncomp_buf + uncomp_len, slot->data, slot->data_len);
@@ -188,7 +189,7 @@ int awal_flush_batch(awal_engine_t* engine) {
     engine->index_ram_array[c * 2] = first_index;
     engine->index_ram_array[(c * 2) + 1] = engine->dat_offset;
     engine->index_count++;
-    msync(engine->index_ram_array, 1024 * 1024, MS_SYNC); // FIXED: Force Index persistence
+    msync(engine->index_ram_array, 1024 * 1024, MS_SYNC);
 
     engine->dat_offset += 8 + comp_len;
     engine->max_disk_index = last_index;
@@ -201,12 +202,10 @@ int awal_flush_batch(awal_engine_t* engine) {
     return batch_size;
 }
 
-// NEW: Follower Log Truncation to enforce Safety properties
 int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
     uint64_t head = atomic_load(&engine->ring.head);
     uint64_t tail = engine->ring.disk_tail;
 
-    // 1. Truncate RAM ring (Unflushed Entries)
     uint64_t new_head = head;
     for (uint64_t seq = tail; seq < head; seq++) {
         awal_entry_t* slot = &engine->ring.entries[seq & AWAL_RING_MASK];
@@ -217,7 +216,6 @@ int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
     }
     atomic_store(&engine->ring.head, new_head);
 
-    // 2. Truncate Disk (Flushed Entries)
     if (truncate_from_index <= engine->max_disk_index) {
         int64_t block_idx = -1;
         for (uint32_t i = 0; i < engine->index_count; i++) {
@@ -239,14 +237,13 @@ int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
             uint32_t keep_len = 0;
             uint64_t last_valid_idx = 0;
 
-            // Salvage entries prior to the truncate index
             while (pos < header[0]) {
                 uint64_t idx;
                 uint32_t len;
                 memcpy(&idx, uncomp_buf + pos + 8, 8);
                 memcpy(&len, uncomp_buf + pos + 16, 4);
                 if (idx >= truncate_from_index) break;
-                pos += 20 + len;
+                pos += 21 + len; // FIXED offset
                 keep_len = pos;
                 last_valid_idx = idx;
             }
@@ -263,18 +260,24 @@ int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
 
                 engine->dat_offset = offset + 8 + new_comp_len;
                 engine->index_count = block_idx + 1;
+
+                // FIXED: Cache the old max so the tail subtraction actually works!
+                uint64_t old_max = engine->max_disk_index;
                 engine->max_disk_index = last_valid_idx;
-                engine->ring.disk_tail -= (engine->max_disk_index - last_valid_idx); // Adjust tail offset conceptually
+                engine->ring.disk_tail -= (old_max - last_valid_idx);
             } else {
                 engine->dat_offset = offset;
                 engine->index_count = block_idx;
+
+                // FIXED: Properly adjust the tail when an entire block is discarded
+                uint64_t old_max = engine->max_disk_index;
                 engine->max_disk_index = (block_idx > 0) ? truncate_from_index - 1 : 0;
+                engine->ring.disk_tail -= (old_max - engine->max_disk_index);
             }
 
             free(comp_buf);
             free(uncomp_buf);
         } else {
-            // Complete Disk Wipe
             engine->dat_offset = 0;
             engine->index_count = 0;
             engine->max_disk_index = 0;
@@ -283,6 +286,14 @@ int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
         }
 
         ftruncate(engine->dat_fd, engine->dat_offset);
+
+        // FIXED: Force OS to flush the truncated file to physical media
+#ifdef __APPLE__
+        fcntl(engine->dat_fd, F_FULLFSYNC, 0);
+#else
+        fdatasync(engine->dat_fd);
+#endif
+
         memset(engine->index_ram_array + (engine->index_count * 2), 0, (1024 * 1024) - (engine->index_count * 16));
         msync(engine->index_ram_array, 1024 * 1024, MS_SYNC);
     }
@@ -291,7 +302,6 @@ int awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index) {
 
 static uint64_t find_offset_in_index(awal_engine_t* engine, uint64_t target_index) {
     if (engine->index_count == 0) return 0;
-
     int64_t low = 0;
     int64_t high = engine->index_count - 1;
     uint64_t best_offset = 0;
@@ -313,19 +323,19 @@ static uint64_t find_offset_in_index(awal_engine_t* engine, uint64_t target_inde
     return best_offset;
 }
 
-int awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_term, uint8_t** out_payload, uint32_t* out_len) {
+int awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint8_t** out_payload, uint32_t* out_len) {
     uint64_t head = atomic_load_explicit(&engine->ring.head, memory_order_acquire);
     uint64_t tail = engine->ring.disk_tail;
 
-    // 1. Fast Path: Scan RAM backwards. FIXED: Allows reading flushed items still in the ring buffer bounds
     for (uint64_t i = 0; i < AWAL_RING_CAPACITY; i++) {
         if (head <= i) break;
         uint64_t seq = head - 1 - i;
-        if (seq < tail && (tail - seq) >= AWAL_RING_CAPACITY) break; // Overwritten
+        if (seq < tail && (tail - seq) >= AWAL_RING_CAPACITY) break;
 
         awal_entry_t* slot = &engine->ring.entries[seq & AWAL_RING_MASK];
         if (atomic_load_explicit(&slot->ready, memory_order_acquire) == slot->index && slot->index == target_index) {
             *out_term = slot->term;
+            *out_type = slot->type;
             *out_len = slot->data_len;
             *out_payload = NULL;
             if (*out_len > 0) {
@@ -336,7 +346,6 @@ int awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_
         }
     }
 
-    // 2. Slow Path: Read from Compressed Disk
     uint64_t offset = find_offset_in_index(engine, target_index);
     uint32_t header[2];
     if (pread(engine->read_fd, header, 8, offset) != 8) return 0;
@@ -352,29 +361,32 @@ int awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_
     while (pos < header[0]) {
         uint64_t term, idx;
         uint32_t dlen;
+        uint8_t type;
+
         memcpy(&term, uncomp_buf + pos, 8);
         memcpy(&idx, uncomp_buf + pos + 8, 8);
         memcpy(&dlen, uncomp_buf + pos + 16, 4);
+        memcpy(&type, uncomp_buf + pos + 20, 1);
 
         if (idx == target_index) {
             *out_term = term;
+            *out_type = type;
             *out_len = dlen;
             *out_payload = NULL;
             if (dlen > 0) {
                 *out_payload = malloc(dlen);
-                memcpy(*out_payload, uncomp_buf + pos + 20, dlen);
+                memcpy(*out_payload, uncomp_buf + pos + 21, dlen); // FIXED offset
             }
             free(uncomp_buf);
             return 1;
         }
-        pos += 20 + dlen;
+        pos += 21 + dlen; // FIXED offset
     }
     free(uncomp_buf);
     return 0;
 }
 
-int awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_index, uint8_t** out_payload, uint32_t* out_len) {
-    // FIXED: Changed tail-recursion to while(true) to prevent Stack Overflow
+int awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_index, uint8_t* out_type, uint8_t** out_payload, uint32_t* out_len) {
     while (true) {
         uint64_t current_commit = atomic_load_explicit(&engine->ring.commit_index, memory_order_acquire);
         uint64_t my_seq = engine->ring.demux_tail;
@@ -390,6 +402,7 @@ int awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_ind
             awal_entry_t* slot = &engine->ring.entries[my_seq & AWAL_RING_MASK];
             *out_term = slot->term;
             *out_index = slot->index;
+            *out_type = slot->type;
             *out_len = slot->data_len;
             *out_payload = NULL;
 
@@ -432,24 +445,27 @@ int awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_ind
         while (engine->demux_buf_pos < engine->demux_buf_len) {
             uint64_t term, idx;
             uint32_t dlen;
+            uint8_t type;
             uint8_t* base = engine->demux_buf + engine->demux_buf_pos;
 
             memcpy(&term, base, 8);
             memcpy(&idx, base + 8, 8);
             memcpy(&dlen, base + 16, 4);
+            memcpy(&type, base + 20, 1);
 
-            engine->demux_buf_pos += 20 + dlen;
+            engine->demux_buf_pos += 21 + dlen; // FIXED offset
 
             if (idx < engine->demux_expected_raft_index) continue;
 
             *out_term = term;
             *out_index = idx;
+            *out_type = type;
             *out_len = dlen;
             *out_payload = NULL;
 
             if (dlen > 0) {
                 *out_payload = malloc(dlen);
-                memcpy(*out_payload, base + 20, dlen);
+                memcpy(*out_payload, base + 21, dlen); // FIXED offset
             }
 
             engine->demux_expected_raft_index = idx + 1;

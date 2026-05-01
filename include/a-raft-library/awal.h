@@ -19,6 +19,7 @@ typedef struct {
     uint64_t term;
     uint64_t index;
     uint32_t data_len;
+    uint8_t  type;  // NEW: Keep track of Raft config changes
     _Atomic uint32_t ready;
     uint8_t  data[AWAL_PAYLOAD_MAX];
 } __attribute__((aligned(AWAL_ENTRY_SIZE))) awal_entry_t;
@@ -37,7 +38,7 @@ typedef struct {
 
     int dat_fd;
     uint64_t dat_offset;
-    uint64_t max_disk_index; // NEW: Expose to reconstruct last_log_index on boot
+    uint64_t max_disk_index;
 
     int idx_fd;
     uint64_t* index_ram_array;
@@ -54,16 +55,14 @@ typedef struct {
 } awal_engine_t;
 
 int  awal_init(awal_engine_t* engine, const char* base_filepath);
-void awal_append(awal_engine_t* engine, uint64_t term, uint64_t index, const uint8_t* payload, uint32_t len);
+int awal_append(awal_engine_t* engine, uint64_t term, uint64_t index, uint8_t type, const uint8_t* payload, uint32_t len);
 int  awal_flush_batch(awal_engine_t* engine);
-int  awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_index, uint8_t** out_payload, uint32_t* out_len);
 
-// O(1) Random Access for Leader Catch-Up
-int  awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_term, uint8_t** out_payload, uint32_t* out_len);
+// Updated to output the 'type' field
+int  awal_read_entry(awal_engine_t* engine, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint8_t** out_payload, uint32_t* out_len);
+int  awal_demux_step(awal_engine_t* engine, uint64_t* out_term, uint64_t* out_index, uint8_t* out_type, uint8_t** out_payload, uint32_t* out_len);
 
-// NEW: Truncate log on follower conflict
 int  awal_truncate(awal_engine_t* engine, uint64_t truncate_from_index);
-
 void awal_close(awal_engine_t* engine);
 
 #endif // AWAL_H
