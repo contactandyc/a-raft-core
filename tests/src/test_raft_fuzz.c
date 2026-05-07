@@ -46,6 +46,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // Disk Restore Boot
         uint64_t disk_term = fuzz_read_u64(&f);
         uint64_t disk_vote = fuzz_read_u64(&f);
+        uint64_t disk_commit = fuzz_read_u64(&f); // FIXED: Generate fuzzed commit index
         size_t num_disk_entries = (fuzz_read_u8(&f) % 5) + 1; // 1 to 5 entries
 
         raft_entry_t* disk_entries = calloc(num_disk_entries, sizeof(raft_entry_t));
@@ -64,7 +65,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             }
         }
 
-        r = raft_core_restore(1, peers, 2, disk_term, disk_vote, disk_entries, num_disk_entries);
+        // FIXED: Call the updated signature with disk_commit
+        r = raft_core_restore(1, peers, 2, disk_term, disk_vote, disk_commit, disk_entries, num_disk_entries);
 
         // Cleanup the temporary disk structures whether restore succeeded or failed
         for (size_t i = 0; i < num_disk_entries; i++) {
@@ -110,7 +112,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
 
     raft_core_step(r, &msg);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     if (msg.entries) {
         for (size_t i = 0; i < msg.num_entries; i++) {

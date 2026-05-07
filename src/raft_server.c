@@ -9,9 +9,47 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h> // PHASE 5: For O_RDONLY and directory fsync
 
 // Forward declarations
 void raft_node_pump(raft_node_t* node);
+
+// PHASE 5: Atomic HardState Saver
+static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit) {
+    char tmp_path[512], meta_path[512], dir_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/meta_grp%llu.tmp", server->data_dir, group_id);
+    snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", server->data_dir, group_id);
+    snprintf(dir_path, sizeof(dir_path), "%s", server->data_dir);
+
+    FILE* f = fopen(tmp_path, "wb");
+    if (!f) return false;
+
+    if (fwrite(&term, sizeof(uint64_t), 1, f) != 1 ||
+        fwrite(&vote, sizeof(uint64_t), 1, f) != 1 ||
+        fwrite(&commit, sizeof(uint64_t), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    // Atomic overwrite
+    if (rename(tmp_path, meta_path) != 0) return false;
+
+    // Fsync the parent directory so the rename survives a power crash
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0) {
+#ifdef __APPLE__
+        fcntl(dir_fd, F_FULLFSYNC, 0);
+#else
+        fsync(dir_fd);
+#endif
+        close(dir_fd);
+    }
+    return true;
+}
 
 // ============================================================================
 // 1. C CALLBACKS (Replacing Lambdas)
@@ -89,34 +127,32 @@ static void reset_election_timer(raft_node_t* node) {
 }
 
 // The core loop that glues the system together
-// The core loop that glues the system together
 void raft_node_pump(raft_node_t* node) {
     raft_ready_t ready = raft_core_get_ready(node->core);
 
+    // PHASE 5: Track exactly what we achieved so we don't over-advance
+    uint64_t actual_saved_idx = raft_core_last_index(node->core) - ready.num_entries_to_save;
+    uint64_t actual_applied_idx = raft_core_commit_index(node->core) - ready.num_committed_entries;
+
     // 1. DISK I/O (WAL)
     if (ready.num_entries_to_save > 0) {
-        // PHASE 2 SECURITY: If the disk fails, HALT the pump.
         if (!raft_io_save(&node->wal, &ready)) {
             fprintf(stderr, "[ERROR] Raft Disk I/O failed! Halting pump cycle.\n");
             return;
         }
+        actual_saved_idx = raft_core_last_index(node->core);
     }
 
     // 2. DISK I/O (HardState)
     uint64_t current_term = raft_core_term(node->core);
     uint64_t voted_for = raft_core_voted_for(node->core);
+    uint64_t commit_idx = raft_core_commit_index(node->core);
 
-    // PHASE 1 SECURITY: Prevent vote amnesia on crash
-    if (current_term != node->saved_term || voted_for != node->saved_vote) {
-        char meta_path[512];
-        snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", node->server->data_dir, node->group_id);
-        FILE* f = fopen(meta_path, "wb");
-        if (f) {
-            fwrite(&current_term, sizeof(uint64_t), 1, f);
-            fwrite(&voted_for, sizeof(uint64_t), 1, f);
-            fflush(f);
-            fsync(fileno(f)); // Force to physical media
-            fclose(f);
+    // PHASE 5: Fail-Closed Atomic Meta Writes
+    if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx) {
+        if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx)) {
+            fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump to prevent amnesia.\n");
+            return;
         }
         node->saved_term = current_term;
         node->saved_vote = voted_for;
@@ -126,7 +162,6 @@ void raft_node_pump(raft_node_t* node) {
     for (size_t i = 0; i < ready.num_messages; i++) {
         uint8_t* payload;
         uint32_t len;
-        // PHASE 3 SECURITY: Serialize safely and check for bounds errors
         if (raft_codec_serialize_msg(&ready.messages[i], &payload, &len) == 0) {
             router_send_rpc(node->server, node->group_id, ready.messages[i].to, payload, len);
         } else {
@@ -139,8 +174,8 @@ void raft_node_pump(raft_node_t* node) {
         for (size_t i = 0; i < ready.num_committed_entries; i++) {
             // Future Application Logic: Apply ready.committed_entries[i].data here
         }
-        // PHASE 1 SECURITY: Explicitly apply state
         raft_core_apply(node->core);
+        actual_applied_idx = commit_idx;
     }
 
     // 5. Timer Management based on Brain State
@@ -154,13 +189,13 @@ void raft_node_pump(raft_node_t* node) {
         if (uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
             uv_timer_stop(&node->heartbeat_timer);
         }
-        // FIX: If we aren't the leader, ensure the election timer is ALWAYS running to prevent deadlocks
         if (!uv_is_active((uv_handle_t*)&node->election_timer)) {
             reset_election_timer(node);
         }
     }
 
-    raft_core_advance(node->core);
+    // PHASE 5: Safe Explicit Advancement
+    raft_core_advance(node->core, actual_saved_idx, actual_applied_idx);
 }
 
 // ============================================================================
@@ -222,12 +257,13 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
             // PHASE 3 SECURITY: Deserialize safely
             if (raft_codec_deserialize_msg(payload, h->payload_len, &msg) == 0) {
 
-                // FIX: Acknowledge that the leader is alive and reset the election timeout!
-                if (msg.type == MSG_APPEND_ENTRIES || msg.type == MSG_REQUEST_VOTE) {
+                raft_core_step(target_node->core, &msg);
+
+                // PHASE 5: ONLY reset the election timer if the brain verified the leader/vote!
+                if (raft_core_activity_accepted(target_node->core)) {
                     reset_election_timer(target_node);
                 }
 
-                raft_core_step(target_node->core, &msg);
                 raft_codec_free_msg_entries(&msg);
                 raft_node_pump(target_node);
             } else {
@@ -329,18 +365,19 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     snprintf(wal_path, sizeof(wal_path), "%s/wal_grp%llu", server->data_dir, group_id);
     awal_init(&node->wal, wal_path);
 
-    // 1. Read HardState from disk before booting the core
+    uint64_t saved_commit = 0;
     char meta_path[512];
     snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", server->data_dir, group_id);
     FILE* f = fopen(meta_path, "rb");
     if (f) {
         if (fread(&node->saved_term, sizeof(uint64_t), 1, f) != 1) node->saved_term = 0;
         if (fread(&node->saved_vote, sizeof(uint64_t), 1, f) != 1) node->saved_vote = 0;
+        if (fread(&saved_commit, sizeof(uint64_t), 1, f) != 1) saved_commit = 0;
         fclose(f);
     }
 
-    // 2. Feed the loaded HardState into the boot sequence
-    node->core = raft_io_boot(&node->wal, server->physical_node_id, init_peers, num_peers, node->saved_term, node->saved_vote);
+    // PHASE 5: Boot safely restores term, vote, and commit index
+    node->core = raft_io_boot(&node->wal, server->physical_node_id, init_peers, num_peers, node->saved_term, node->saved_vote, saved_commit);
 
     uv_timer_init(server->loop, &node->election_timer);
     node->election_timer.data = node;

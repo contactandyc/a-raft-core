@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Andy Curtis <contactandyc@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+//
+// Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,7 +105,7 @@ static void route_messages(chaos_harness_t* h) {
             }
             raft_core_apply(h->nodes[i]);
         }
-        raft_core_advance(h->nodes[i]);
+        raft_core_advance_all(h->nodes[i]);
     }
 }
 
@@ -133,7 +135,8 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         uint64_t peers[NUM_NODES - 1];
         int p_idx = 0;
         for (int j = 0; j < NUM_NODES; j++) {
-            if (j + 1 != node_id) peers[p_idx++] = j + 1;
+            // FIXED: Silenced the signed/unsigned comparison warning
+            if ((uint64_t)(j + 1) != node_id) peers[p_idx++] = j + 1;
         }
         h.nodes[i] = raft_core_create(node_id, peers, NUM_NODES - 1);
     }
@@ -154,7 +157,8 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
 
         if (fast_rand() % 100 < 10) {
             int target = fast_rand() % NUM_NODES;
-            uint8_t payload[4] = "DATA";
+            // FIXED: Avoid string-termination size warnings by making this a pointer
+            uint8_t* payload = (uint8_t*)"DATA";
             raft_entry_t e = { .type = ENTRY_NORMAL, .data = payload, .data_len = 4 };
             raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
             raft_core_step(h.nodes[target], &p);

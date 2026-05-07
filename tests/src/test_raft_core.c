@@ -44,7 +44,7 @@ MACRO_TEST(raft_win_election_and_noop) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Peer 2 grants vote. (1 self + 1 peer = majority of 3)
     raft_msg_t vote1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
@@ -98,7 +98,7 @@ MACRO_TEST(raft_follower_truncates_on_conflict) {
                         .index = 0, .log_term = 0, .entries = &entry1, .num_entries = 1, .commit = 0 };
     raft_core_step(r, &app1);
     MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // New Leader (Term 2) sends a conflicting index 1
     raft_entry_t conflict = { .term = 2, .index = 1, .data = (uint8_t*)"B", .data_len = 1 };
@@ -126,7 +126,7 @@ MACRO_TEST(raft_leader_steps_down_on_higher_term) {
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Receive AppendEntries from a Leader in Term 2
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 3, .term = 2,
@@ -151,7 +151,7 @@ MACRO_TEST(raft_voter_rejects_stale_candidate) {
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 2,
                        .index = 0, .log_term = 0, .entries = &entry, .num_entries = 1, .commit = 0 };
     raft_core_step(r, &app);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Node 3 campaigns in Term 3, but its log is empty (last_term = 0, last_index = 0)
     raft_msg_t req = { .type = MSG_REQUEST_VOTE, .from = 3, .term = 3,
@@ -183,7 +183,7 @@ MACRO_TEST(raft_figure_8_anomaly_prevention) {
         raft_core_step(r, &v);
     }
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // 2. Propose an entry. Log now has: [Idx 1, Term 1 (No-Op)], [Idx 2, Term 1 (Data)]
     uint8_t data[] = "data";
@@ -209,7 +209,7 @@ MACRO_TEST(raft_figure_8_anomaly_prevention) {
     // Idx 1: Term 1 (No-Op)
     // Idx 2: Term 1 (Data)
     // Idx 3: Term 4 (No-Op)
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // 4. Node 2 acknowledges Idx 2 (Term 1 Data).
     // Leader (1) + Node 2 = 2 nodes. We need 3 for a majority.
@@ -253,7 +253,7 @@ MACRO_TEST(raft_leader_backtracks_next_index_on_reject) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Propose 2 client entries
     uint8_t data[] = "X";
@@ -261,7 +261,7 @@ MACRO_TEST(raft_leader_backtracks_next_index_on_reject) {
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &entry, .num_entries = 1 };
     raft_core_step(r, &prop); // Idx 2
     raft_core_step(r, &prop); // Idx 3
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Node 2 has been offline. It rejects the AppendEntries because it's missing Index 1.
     raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3 };
@@ -290,7 +290,7 @@ MACRO_TEST(raft_leader_ignores_lower_term_append) {
     raft_core_step(r, &hup); // Term 2
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
 
@@ -318,7 +318,7 @@ MACRO_TEST(raft_candidate_ignores_stale_vote_response) {
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
     raft_core_step(r, &hup); // Term 2 Candidate
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Vote response from term 1
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
@@ -336,7 +336,7 @@ MACRO_TEST(raft_candidate_does_not_double_count_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
 
@@ -358,7 +358,7 @@ MACRO_TEST(raft_follower_rejects_second_candidate_same_term) {
 
     raft_ready_t ready = raft_core_get_ready(r);
     MACRO_ASSERT_TRUE(ready.messages[0].reject == false);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t req3 = { .type = MSG_REQUEST_VOTE, .from = 3, .term = 1, .index = 0, .log_term = 0 };
     raft_core_step(r, &req3);
@@ -383,7 +383,7 @@ MACRO_TEST(raft_follower_updates_commit_from_heartbeat) {
                        .index = 0, .log_term = 0, .entries = batch, .num_entries = 2, .commit = 0 };
     raft_core_step(r, &app);
     MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 0);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Heartbeat updates commit to 2
     raft_msg_t hb = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
@@ -424,28 +424,28 @@ MACRO_TEST(raft_leader_backtracks_multiple_times) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Propose 2 times. Log ends at Idx 3.
     raft_entry_t d = { .data = NULL, .data_len = 0 };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &d, .num_entries = 1 };
     raft_core_step(r, &p); // 2
     raft_core_step(r, &p); // 3
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // First reject
     raft_msg_t r1 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3 };
     raft_core_step(r, &r1);
     raft_ready_t rd1 = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(rd1.messages[0].index, 2);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Second reject
     raft_msg_t r2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 2 };
     raft_core_step(r, &r2);
     raft_ready_t rd2 = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(rd2.messages[0].index, 1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Third reject
     raft_msg_t r3 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 1 };
@@ -467,7 +467,7 @@ MACRO_TEST(raft_advance_clears_messages_and_committed_entries) {
     raft_ready_t ready = raft_core_get_ready(r);
     MACRO_ASSERT_TRUE(ready.num_messages > 0);
 
-    raft_core_advance(r);
+    raft_core_advance_all(r);
     ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 0); // Cleared!
 
@@ -524,7 +524,7 @@ MACRO_TEST(raft_follower_conflict_replacement_multiple_entries) {
                         .index = 0, .log_term = 0, .entries = batch1, .num_entries = 3, .commit = 0 };
     raft_core_step(r, &app1);
     MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 3);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Leader sends prev_index=1, prev_term=1. Entries 2:"X", 3:"Y" term 2
     raft_entry_t x2 = { .term = 2, .index = 2, .data = (uint8_t*)"X", .data_len = 1 };
@@ -555,7 +555,7 @@ MACRO_TEST(raft_follower_duplicate_append_is_idempotent) {
 
     raft_core_step(r, &app);
     MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Send exactly the same again
     raft_core_step(r, &app);
@@ -591,7 +591,7 @@ MACRO_TEST(raft_candidate_does_not_count_rejected_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t rej = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = true };
     raft_core_step(r, &rej);
@@ -614,12 +614,12 @@ MACRO_TEST(raft_leader_ignores_unknown_peer_append_res) {
     raft_core_step(r, &hup);
     raft_msg_t v1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &v1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e = { .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(r, &p); // Proposes index 2
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Unknown peer 99 sends ACK
     raft_msg_t ack = { .type = MSG_APPEND_RES, .from = 99, .term = 1, .reject = false, .index = 2 };
@@ -639,12 +639,12 @@ MACRO_TEST(raft_leader_ignores_stale_append_res) {
     raft_core_step(r, &hup); // Term 2
     raft_msg_t v1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
     raft_core_step(r, &v1); // Leader term 2
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e = { .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(r, &p); // Proposes index 2 (term 2)
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Stale ACK from term 1
     raft_msg_t ack = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
@@ -680,7 +680,7 @@ MACRO_TEST(raft_follower_commit_never_decreases) {
                        .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 1 };
     raft_core_step(r, &app);
     MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Heartbeat with commit=0
     raft_msg_t hb = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
@@ -727,7 +727,7 @@ MACRO_TEST(raft_apply_clears_committed_entries) {
 
     // NEW API CONTRACT: We must explicitly consume them!
     raft_core_apply(r);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_committed_entries, 0);
@@ -769,7 +769,7 @@ MACRO_TEST(raft_leader_ignores_hup) {
     MACRO_ASSERT_EQ_INT(raft_core_term(r), 1);
     MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1); // Only 1 no-op
 
-    raft_core_advance(r);
+    raft_core_advance_all(r);
     raft_core_step(r, &hup); // Should be ignored
 
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
@@ -785,7 +785,7 @@ MACRO_TEST(raft_candidate_steps_down_on_higher_term_request_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t req = { .type = MSG_REQUEST_VOTE, .from = 2, .term = 2, .index = 0, .log_term = 0 };
     raft_core_step(r, &req);
@@ -810,7 +810,7 @@ MACRO_TEST(raft_leader_steps_down_on_higher_term_request_vote) {
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t req = { .type = MSG_REQUEST_VOTE, .from = 3, .term = 2, .index = raft_core_last_index(r), .log_term = 1 };
     raft_core_step(r, &req);
@@ -866,7 +866,7 @@ MACRO_TEST(raft_leader_rejects_empty_proposal) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = NULL, .num_entries = 0 }; // Malformed
     raft_core_step(r, &prop);
@@ -889,7 +889,7 @@ MACRO_TEST(raft_ready_populates_entries_to_save) {
     raft_ready_t ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 1); // The no-op
 
-    raft_core_advance(r); // Simulates writing to disk
+    raft_core_advance_all(r); // Simulates writing to disk
 
     ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 0); // Cleared
@@ -934,7 +934,7 @@ MACRO_TEST(raft_ready_populates_entries_to_save_on_follower_append) {
     MACRO_ASSERT_EQ_INT(ready.entries_to_save[0].index, 1);
     MACRO_ASSERT_EQ_INT(ready.entries_to_save[0].term, 1);
 
-    raft_core_advance(r);
+    raft_core_advance_all(r);
     ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 0);
 
@@ -949,7 +949,7 @@ MACRO_TEST(raft_leader_ignores_zero_entry_proposal_even_with_entries_pointer) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e = { .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 0 }; // num_entries = 0
@@ -968,7 +968,7 @@ MACRO_TEST(raft_leader_appends_multiple_proposed_entries) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e1 = { .data = (uint8_t*)"X", .data_len = 1 };
     raft_entry_t e2 = { .data = (uint8_t*)"Y", .data_len = 1 };
@@ -1000,7 +1000,7 @@ MACRO_TEST(raft_ready_returns_only_newly_committed_entries_after_apply) {
 
     // NEW API CONTRACT: Consume the first batch
     raft_core_apply(r);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Commit Index 2
     raft_msg_t app2 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
@@ -1022,7 +1022,7 @@ MACRO_TEST(raft_follower_duplicate_append_with_higher_commit_advances_commit) {
     raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
                         .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
     raft_core_step(r, &app1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
     MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 0);
 
     // Duplicate append, but now leader says it's committed
@@ -1044,7 +1044,7 @@ MACRO_TEST(raft_follower_rejects_wrong_prev_log_term) {
     raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
                         .index = 0, .log_term = 0, .entries = &e1, .num_entries = 1, .commit = 0 };
     raft_core_step(r, &app1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Leader sends PrevIndex = 1, but says PrevTerm = 2 (Mismatch!)
     raft_entry_t e2 = { .term = 2, .index = 2, .data = (uint8_t*)"B", .data_len = 1 };
@@ -1070,7 +1070,7 @@ MACRO_TEST(raft_append_reject_reports_last_index) {
     raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
                         .index = 0, .log_term = 0, .entries = batch, .num_entries = 2, .commit = 0 };
     raft_core_step(r, &app1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Gap in log (Leader sends Index 5)
     raft_msg_t app2 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
@@ -1086,7 +1086,6 @@ MACRO_TEST(raft_append_reject_reports_last_index) {
 }
 
 MACRO_TEST(raft_create_rejects_too_many_peers_and_self) {
-    uint64_t valid_peers[] = {2, 3};
     uint64_t invalid_self_peers[] = {1, 2}; // Includes own ID (1)
 
     raft_core_t* r1 = raft_core_create(1, invalid_self_peers, 2);
@@ -1103,7 +1102,7 @@ MACRO_TEST(raft_candidate_ignores_unknown_peer_vote_response) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Vote from unknown node 99
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 99, .term = 1, .reject = false };
@@ -1125,7 +1124,7 @@ MACRO_TEST(raft_follower_heartbeat_clamps_commit_to_prev_index) {
     raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
                         .index = 0, .log_term = 0, .entries = batch, .num_entries = 2, .commit = 0 };
     raft_core_step(r, &app1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Heartbeat says commit is 5, but ONLY proves the leader has index 1.
     // The follower MUST clamp commit to 1, not its local max of 2.
@@ -1148,7 +1147,7 @@ MACRO_TEST(raft_leader_backoff_floor) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Send 3 rejections to force it to floor at index 1
     raft_msg_t rj = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 99 };
@@ -1172,7 +1171,7 @@ MACRO_TEST(raft_leader_ignores_out_of_bounds_match_index) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Leader log_len is 2 (Index 0 dummy + Index 1 No-Op).
     // Peer sends malicious/broken ack for index 999.
@@ -1197,7 +1196,7 @@ MACRO_TEST(raft_follower_mixed_conflict_batch) {
     raft_entry_t b1[] = { e1, e2, e3 };
     raft_msg_t a1 = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = b1, .num_entries = 3 };
     raft_core_step(r, &a1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Leader sends: B_t1, C_t1, D_t2. (B and C match identically).
     raft_entry_t nx2 = { .term = 1, .index = 2, .data = (uint8_t*)"B", .data_len = 1 };
@@ -1288,7 +1287,7 @@ MACRO_TEST(raft_multi_node_smoke_test) {
                 int target = rd.messages[m].to - 1;
                 raft_core_step(nodes[target], &rd.messages[m]);
             }
-            raft_core_advance(nodes[i]);
+            raft_core_advance_all(nodes[i]);
         }
     }
 
@@ -1311,7 +1310,7 @@ MACRO_TEST(raft_multi_node_smoke_test) {
                 int target = rd.messages[m].to - 1;
                 raft_core_step(nodes[target], &rd.messages[m]);
             }
-            raft_core_advance(nodes[i]);
+            raft_core_advance_all(nodes[i]);
         }
     }
 
@@ -1330,7 +1329,7 @@ MACRO_TEST(raft_multi_node_smoke_test) {
                 int target = rd.messages[m].to - 1;
                 raft_core_step(nodes[target], &rd.messages[m]);
             }
-            raft_core_advance(nodes[i]);
+            raft_core_advance_all(nodes[i]);
         }
     }
 
@@ -1370,7 +1369,7 @@ MACRO_TEST(raft_conf_change_applies_only_on_commit) {
 
     // Explicit application cycle
     raft_core_apply(r);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Verify peer was finally added
     num = raft_core_peers(r, active_peers);
@@ -1418,7 +1417,7 @@ MACRO_TEST(raft_conf_add_node_applies_on_commit) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Propose adding Node 4
     uint64_t new_node = 4;
@@ -1437,7 +1436,7 @@ MACRO_TEST(raft_conf_add_node_applies_on_commit) {
 
     // Explicitly apply state
     raft_core_apply(r);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // NOW the peer should be added!
     num = raft_core_peers(r, active_peers);
@@ -1457,7 +1456,7 @@ MACRO_TEST(raft_conf_remove_node_applies_on_commit) {
     raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .from = 3, .term = 1, .reject = false };
     raft_core_step(r, &vote1);
     raft_core_step(r, &vote2);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Propose removing Node 3
     uint64_t rm_node = 3;
@@ -1479,7 +1478,7 @@ MACRO_TEST(raft_conf_remove_node_applies_on_commit) {
 
     // Explicitly apply state
     raft_core_apply(r);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Verify it was safely shifted out after commit
     num = raft_core_peers(r, active_peers);
@@ -1501,12 +1500,12 @@ MACRO_TEST(raft_leader_ignores_append_res_beyond_log_end) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(r, &prop);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Malicious/broken ACK for an index the leader never created
     raft_msg_t bogus = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 999 };
@@ -1537,7 +1536,7 @@ MACRO_TEST(raft_follower_rejects_conflict_before_commit_index) {
                         .entries = &e1, .num_entries = 1, .commit = 1 };
     raft_core_step(r, &app1);
     MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 1);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Rogue leader tries to overwrite index 1
     raft_entry_t conflict = { .term = 2, .type = ENTRY_NORMAL, .data = (uint8_t*)"B", .data_len = 1 };
@@ -1563,7 +1562,7 @@ MACRO_TEST(raft_leader_tick_sends_heartbeat_to_all_peers) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_msg_t tick = { .type = MSG_TICK };
     raft_core_step(r, &tick);
@@ -1597,14 +1596,14 @@ MACRO_TEST(raft_leader_tick_sends_pending_entries_to_lagging_peer) {
     raft_core_step(r, &hup);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     raft_entry_t e = { .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(r, &prop);
 
     // Simulate network drop: Leader sends payload but it gets lost in the void
-    raft_core_advance(r);
+    raft_core_advance_all(r);
 
     // Tick triggers a heartbeat. Because Leader uses optimistic pipelining,
     // it assumes Node 3 received the payload, so it sends an empty heartbeat at the tip of the log.
@@ -1621,7 +1620,7 @@ MACRO_TEST(raft_leader_tick_sends_pending_entries_to_lagging_peer) {
 
     // Node 3 receives this heartbeat, realizes it is missing the data, and REJECTS it!
     uint64_t hb_prev_index = to_node_3->index;
-    raft_core_advance(r); // clear queue
+    raft_core_advance_all(r); // clear queue
 
     raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = true, .index = hb_prev_index };
     raft_core_step(r, &rej);

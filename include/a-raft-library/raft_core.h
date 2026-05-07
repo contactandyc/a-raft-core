@@ -26,7 +26,6 @@ typedef enum {
     MSG_REQUEST_VOTE_RES
 } msg_type_t;
 
-// NEW: Identify if an entry is standard data or a cluster reconfiguration
 typedef enum {
     ENTRY_NORMAL = 0,
     ENTRY_CONF_ADD = 1,
@@ -36,7 +35,7 @@ typedef enum {
 typedef struct {
     uint64_t term;
     uint64_t index;
-    entry_type_t type;     // NEW
+    entry_type_t type;
     uint8_t* data;
     size_t   data_len;
 } raft_entry_t;
@@ -72,22 +71,30 @@ typedef struct raft_core_s raft_core_t;
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers);
 void         raft_core_destroy(raft_core_t* r);
 
+// PHASE 5: Added commit_index to safely replay configurations on reboot
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
-                               uint64_t term, uint64_t voted_for,
+                               uint64_t term, uint64_t voted_for, uint64_t commit_index,
                                raft_entry_t* entries, size_t num_entries);
 
 void         raft_core_step(raft_core_t* r, raft_msg_t* msg);
 raft_ready_t raft_core_get_ready(raft_core_t* r);
-void         raft_core_advance(raft_core_t* r);
+
+// PHASE 5: Explicit advancement prevents the core from blindly assuming success
+void         raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index);
+void         raft_core_apply(raft_core_t* r);
+
+// Convenience wrapper that assumes 100% success (perfect for tests!)
+void raft_core_advance_all(raft_core_t* r);
 
 raft_state_t raft_core_state(raft_core_t* r);
 uint64_t     raft_core_term(raft_core_t* r);
+uint64_t     raft_core_voted_for(raft_core_t* r);
 uint64_t     raft_core_commit_index(raft_core_t* r);
 uint64_t     raft_core_last_index(raft_core_t* r);
 
-size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
+// PHASE 5: Safe timeout management
+bool         raft_core_activity_accepted(raft_core_t* r);
 
-void         raft_core_apply(raft_core_t* r);
-uint64_t     raft_core_voted_for(raft_core_t* r);
+size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
 
 #endif // RAFT_CORE_H

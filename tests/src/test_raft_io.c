@@ -30,48 +30,44 @@ MACRO_TEST(io_save_and_boot) {
     awal_engine_t wal;
     MACRO_ASSERT_EQ_INT(awal_init(&wal, wal_path), 0);
 
-    // 1. Create a fresh core and save its initial state to disk
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0);
+    // FIXED: Added the 0 for the initial commit index
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
-    // Fake a leader election
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(core, &hup);
 
-    // NEW: Send a fake vote from Node 2 so Node 1 wins the election!
-    // (Term is 1 because MSG_HUP incremented it from 0 to 1)
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(core, &vote);
 
-    // NOW it is the leader and will accept the proposal!
     raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"HELLO", .data_len = 5 };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(core, &prop);
 
-    // 2. Pass the volatile state to the I/O bridge to flush to the SSD
     raft_ready_t ready = raft_core_get_ready(core);
     MACRO_ASSERT_TRUE(ready.num_entries_to_save > 0);
     raft_io_save(&wal, &ready);
-    raft_core_advance(core);
+    raft_core_advance_all(core); // Using your new convenience wrapper!
 
     uint64_t saved_term = raft_core_term(core);
     uint64_t saved_last_index = raft_core_last_index(core);
 
-    // 3. SIMULATE A CRASH (Destroy RAM state completely)
+    // NEW: Capture the commit index before destroying
+    uint64_t saved_commit = raft_core_commit_index(core);
+
     raft_core_destroy(core);
     awal_close(&wal);
 
-    // 4. SIMULATE A BOOT (Read from SSD)
     MACRO_ASSERT_EQ_INT(awal_init(&wal, wal_path), 0);
-    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1);
+
+    // FIXED: Pass the saved_commit into the boot sequence
+    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1, saved_commit);
 
     MACRO_ASSERT_TRUE(recovered_core != NULL);
     MACRO_ASSERT_EQ_INT(raft_core_term(recovered_core), saved_term);
     MACRO_ASSERT_EQ_INT(raft_core_last_index(recovered_core), saved_last_index);
 
-    // Verify the payload survived LZ4 compression and disk persistence
     ready = raft_core_get_ready(recovered_core);
-    // Since it was saved, the new core shouldn't think it needs to save anything!
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 0);
 
     raft_core_destroy(recovered_core);

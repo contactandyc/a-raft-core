@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Andy Curtis <contactandyc@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+//
+// Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,8 @@ static void close_walk_cb(uv_handle_t* handle, void* arg) {
 
 // The multi-stage cluster verification engine
 static void on_test_check(uv_timer_t* handle) {
+    (void)handle;
+
     static int ticks = 0;
     ticks++;
     if (ticks > 100) { // 10 second hard timeout

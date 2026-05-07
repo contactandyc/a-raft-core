@@ -9,10 +9,9 @@
 #include "a-raft-library/raft_core.h"
 #include "a-raft-library/awal.h"
 
-// Wakes up a node, parsing the WAL and feeding it safely into raft_core_restore
-raft_core_t* raft_io_boot(awal_engine_t* wal, uint64_t node_id, uint64_t* init_peers, size_t num_peers, uint64_t saved_term, uint64_t saved_vote);
+// PHASE 5: Added saved_commit
+raft_core_t* raft_io_boot(awal_engine_t* wal, uint64_t node_id, uint64_t* init_peers, size_t num_peers, uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit);
 
-// Reads entries_to_save, streams them to the LZ4 WAL, and performs rollback truncations automatically
 bool raft_io_save(awal_engine_t* wal, raft_ready_t* ready);
 
 #endif // RAFT_IO_H

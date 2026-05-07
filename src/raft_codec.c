@@ -8,14 +8,19 @@
 #include <string.h>
 
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
-    uint32_t len = 1 + 8*6 + 1 + 8; // Base fields
+    if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1; // PHASE 5
+
+    uint64_t len = 1 + 8*6 + 1 + 8; // Phase 5: uint64_t to prevent overflow wrap
+
     for (size_t i = 0; i < m->num_entries; i++) {
-        len += 8 + 8 + 1 + 4 + m->entries[i].data_len;
+        uint64_t entry_size = 8 + 8 + 1 + 4 + (uint64_t)m->entries[i].data_len;
+
+        // PHASE 5: Strict overflow check before accumulation
+        if (len > RAFT_MAX_FRAME_SIZE - entry_size) return -1;
+        len += entry_size;
     }
 
-    if (len > RAFT_MAX_FRAME_SIZE) return -1; // Abort if it violates max frame size
-
-    uint8_t* buf = malloc(len);
+    uint8_t* buf = malloc((size_t)len);
     if (!buf) return -1;
 
     uint32_t pos = 0;
@@ -43,13 +48,13 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
     }
 
     *out_buf = buf;
-    *out_len = len;
+    *out_len = (uint32_t)len;
     return 0;
 }
 
 int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) {
     memset(m, 0, sizeof(raft_msg_t));
-    if (!buf || len < 58) return -1; // 58 bytes is the absolute minimum valid Raft frame
+    if (!buf || len < 58) return -1;
 
     uint32_t pos = 0;
     m->type = buf[pos++];
@@ -64,19 +69,17 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     uint64_t num_e;
     memcpy(&num_e, buf+pos, 8); pos += 8;
 
-    // STRICT BOUNDS CHECK: Prevent billion-entry memory exhaustion attacks
     if (num_e > RAFT_MAX_MSG_ENTRIES) return -1;
     m->num_entries = num_e;
 
     if (num_e > 0) {
-        // STRICT BOUNDS CHECK: 21 bytes is the minimum size of an entry WITHOUT a payload.
         if (pos + (num_e * 21) > len) return -1;
 
         m->entries = calloc(num_e, sizeof(raft_entry_t));
         if (!m->entries) return -1;
 
         for (size_t i = 0; i < num_e; i++) {
-            if (pos + 21 > len) goto cleanup_error; // Check base entry bounds
+            if (pos + 21 > len) goto cleanup_error;
 
             memcpy(&m->entries[i].term, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
@@ -86,11 +89,9 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
             m->entries[i].data_len = dlen;
 
             if (dlen > 0) {
-                if (pos + dlen > len) goto cleanup_error; // Check dynamic payload bounds!
-
+                if (pos + dlen > len) goto cleanup_error;
                 m->entries[i].data = malloc(dlen);
                 if (!m->entries[i].data) goto cleanup_error;
-
                 memcpy(m->entries[i].data, buf+pos, dlen); pos += dlen;
             }
         }
