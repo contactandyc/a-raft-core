@@ -8,7 +8,7 @@
 #include <string.h>
 
 #define MAX_PEERS 16
-#define RAFT_MAX_APPEND_BATCH 2048
+#define RAFT_MAX_APPEND_BATCH 2048 // GAP 1: Prevents network/codec deadlocks
 
 struct raft_core_s {
     uint64_t id;
@@ -22,6 +22,10 @@ struct raft_core_s {
     raft_state_t state;
     uint64_t current_term;
     uint64_t voted_for;
+
+    // GAP 2: Snapshot Offset Trackers
+    uint64_t snapshot_index;
+    uint64_t snapshot_term;
 
     raft_entry_t* log;
     size_t log_len;
@@ -41,7 +45,7 @@ struct raft_core_s {
     size_t num_msgs;
     size_t msg_cap;
 
-    bool activity_accepted; // PHASE 5: Track safe timeout resets
+    bool activity_accepted; // Track safe timeout resets
 };
 
 static void send_msg(raft_core_t* r, raft_msg_t m) {
@@ -54,10 +58,31 @@ static void send_msg(raft_core_t* r, raft_msg_t m) {
     r->msgs[r->num_msgs++] = m;
 }
 
-static uint64_t log_term(raft_core_t* r, uint64_t idx) {
-    if (idx >= r->log_len) return 0;
-    return r->log[idx].term;
+// ============================================================================
+// LOGICAL vs PHYSICAL INDEX MAPPING (GAP 2)
+// ============================================================================
+
+uint64_t raft_core_last_index(raft_core_t* r) {
+    return r->snapshot_index + r->log_len - 1;
 }
+
+// Safely translates a Raft Index into a physical RAM array pointer
+static raft_entry_t* log_at(raft_core_t* r, uint64_t absolute_index) {
+    if (absolute_index < r->snapshot_index) return NULL;
+    size_t arr_idx = absolute_index - r->snapshot_index;
+    if (arr_idx >= r->log_len) return NULL;
+    return &r->log[arr_idx];
+}
+
+static uint64_t log_term(raft_core_t* r, uint64_t idx) {
+    if (idx == r->snapshot_index) return r->snapshot_term;
+    raft_entry_t* e = log_at(r, idx);
+    return e ? e->term : 0;
+}
+
+// ============================================================================
+// LOG MUTATIONS
+// ============================================================================
 
 static void apply_conf_change(raft_core_t* r, entry_type_t type, const uint8_t* data, size_t len) {
     if (len != sizeof(uint64_t)) return;
@@ -70,7 +95,7 @@ static void apply_conf_change(raft_core_t* r, entry_type_t type, const uint8_t* 
 
         if (r->num_peers < MAX_PEERS) {
             r->peers[r->num_peers] = pid;
-            r->next_index[r->num_peers] = r->log_len;
+            r->next_index[r->num_peers] = raft_core_last_index(r) + 1;
             r->match_index[r->num_peers] = 0;
             r->num_peers++;
         }
@@ -96,7 +121,7 @@ static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, const u
         if (!r->log) abort();
     }
     raft_entry_t* e = &r->log[r->log_len];
-    e->index = r->log_len;
+    e->index = r->snapshot_index + r->log_len;
     e->term = term;
     e->type = type;
     e->data_len = len;
@@ -111,15 +136,52 @@ static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, const u
     r->log_len++;
 }
 
-static void log_truncate(raft_core_t* r, uint64_t index) {
-    for (size_t i = index; i < r->log_len; i++) {
+static void log_truncate(raft_core_t* r, uint64_t absolute_index) {
+    if (absolute_index <= r->snapshot_index) return; // Protected boundary
+    size_t arr_idx = absolute_index - r->snapshot_index;
+
+    for (size_t i = arr_idx; i < r->log_len; i++) {
         if (r->log[i].data) free(r->log[i].data);
     }
-    r->log_len = index;
-    if (index > 0 && r->last_saved_index >= index) {
-        r->last_saved_index = index - 1;
+    r->log_len = arr_idx;
+    if (absolute_index > 0 && r->last_saved_index >= absolute_index) {
+        r->last_saved_index = absolute_index - 1;
     }
 }
+
+// GAP 2: Safe Memory Compaction
+void raft_core_compact(raft_core_t* r, uint64_t compact_index) {
+    if (compact_index <= r->snapshot_index) return;
+    if (compact_index > r->commit_index) return; // Never compact uncommitted data!
+
+    uint64_t new_snapshot_term = log_term(r, compact_index);
+    size_t arr_idx = compact_index - r->snapshot_index;
+
+    // Free the heap allocations for the evicted entries
+    for (size_t i = 0; i < arr_idx; i++) {
+        if (r->log[i].data) free(r->log[i].data);
+    }
+
+    // Shift the surviving tail of the log to the front of the array
+    size_t remaining = r->log_len - arr_idx;
+    memmove(r->log, &r->log[arr_idx], remaining * sizeof(raft_entry_t));
+    r->log_len = remaining;
+
+    // Update the offset truth
+    r->snapshot_index = compact_index;
+    r->snapshot_term = new_snapshot_term;
+
+    // The entry at index 0 now acts as the permanent "dummy" anchor
+    r->log[0].data = NULL;
+    r->log[0].data_len = 0;
+    r->log[0].type = ENTRY_NORMAL;
+    r->log[0].index = compact_index;
+    r->log[0].term = new_snapshot_term;
+}
+
+// ============================================================================
+// CORE LIFECYCLE
+// ============================================================================
 
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers) {
     if (num_peers > 0 && peers == NULL) return NULL;
@@ -143,6 +205,8 @@ raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers) {
     }
 
     r->state = RAFT_STATE_FOLLOWER;
+    r->snapshot_index = 0;
+    r->snapshot_term = 0;
     log_append(r, 0, ENTRY_NORMAL, NULL, 0);
 
     return r;
@@ -164,13 +228,22 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     ready.num_messages = r->num_msgs;
 
     if (r->commit_index > r->last_applied) {
-        ready.committed_entries = &r->log[r->last_applied + 1];
-        ready.num_committed_entries = r->commit_index - r->last_applied;
+        uint64_t first_app_idx = r->last_applied + 1;
+        if (first_app_idx >= r->snapshot_index) {
+            size_t arr_idx = first_app_idx - r->snapshot_index;
+            ready.committed_entries = &r->log[arr_idx];
+            ready.num_committed_entries = r->commit_index - r->last_applied;
+        }
     }
 
-    if (r->log_len - 1 > r->last_saved_index) {
-        ready.entries_to_save = &r->log[r->last_saved_index + 1];
-        ready.num_entries_to_save = (r->log_len - 1) - r->last_saved_index;
+    uint64_t last_idx = raft_core_last_index(r);
+    if (last_idx > r->last_saved_index) {
+        uint64_t first_save_idx = r->last_saved_index + 1;
+        if (first_save_idx >= r->snapshot_index) {
+            size_t arr_idx = first_save_idx - r->snapshot_index;
+            ready.entries_to_save = &r->log[arr_idx];
+            ready.num_entries_to_save = last_idx - r->last_saved_index;
+        }
     }
 
     return ready;
@@ -182,9 +255,28 @@ static int cmp_u64(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
+// ============================================================================
+// GAP 1: THE PAGINATION ENGINE
+// ============================================================================
+
 static void send_append(raft_core_t* r, size_t peer_idx) {
     uint64_t prev_idx = r->next_index[peer_idx] - 1;
-    uint64_t num_entries = r->log_len - (prev_idx + 1);
+
+    // GAP 2: If the follower needs a deleted entry, send a snapshot!
+    if (prev_idx < r->snapshot_index) {
+        raft_msg_t snap = {
+            .type = MSG_INSTALL_SNAPSHOT,
+            .to = r->peers[peer_idx],
+            .term = r->current_term,
+            .index = r->snapshot_index,
+            .log_term = r->snapshot_term,
+            .commit = r->commit_index
+        };
+        send_msg(r, snap);
+        return;
+    }
+
+    uint64_t num_entries = raft_core_last_index(r) - prev_idx;
 
     // Clamp batch size to prevent max-frame network deadlocks
     if (num_entries > RAFT_MAX_APPEND_BATCH) {
@@ -194,10 +286,11 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
     // Optimistically advance next_index so we can pipeline payloads
     r->next_index[peer_idx] = prev_idx + 1 + num_entries;
 
+    size_t arr_idx = (prev_idx + 1) - r->snapshot_index;
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = r->peers[peer_idx], .term = r->current_term,
                        .index = prev_idx, .log_term = log_term(r, prev_idx),
                        .commit = r->commit_index,
-                       .entries = num_entries > 0 ? &r->log[prev_idx + 1] : NULL,
+                       .entries = num_entries > 0 ? &r->log[arr_idx] : NULL,
                        .num_entries = num_entries };
     send_msg(r, app);
 }
@@ -212,23 +305,28 @@ static void become_leader(raft_core_t* r) {
     r->state = RAFT_STATE_LEADER;
     log_append(r, r->current_term, ENTRY_NORMAL, NULL, 0);
 
+    uint64_t last_idx = raft_core_last_index(r);
     if (r->num_peers == 0) {
-        r->commit_index = r->log_len - 1;
+        r->commit_index = last_idx;
         return;
     }
     for (size_t i = 0; i < r->num_peers; i++) {
-        r->next_index[i] = r->log_len;
+        r->next_index[i] = last_idx + 1;
         r->match_index[i] = 0;
     }
     bcast_append(r);
 }
+
+// ============================================================================
+// THE STATE MACHINE ENGINE
+// ============================================================================
 
 void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     if (msg->to != 0 && msg->to != r->id) return;
 
     if (msg->term > 0 && msg->term < r->current_term) {
         if (msg->type == MSG_APPEND_ENTRIES) {
-            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = r->log_len - 1 };
+            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index(r) };
             send_msg(r, res);
         } else if (msg->type == MSG_REQUEST_VOTE) {
             raft_msg_t res = { .type = MSG_REQUEST_VOTE_RES, .to = msg->from, .term = r->current_term, .reject = true };
@@ -261,7 +359,7 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
             return;
         }
 
-        uint64_t last_idx = r->log_len - 1;
+        uint64_t last_idx = raft_core_last_index(r);
         for (size_t i = 0; i < r->num_peers; i++) {
             raft_msg_t req = { .type = MSG_REQUEST_VOTE, .to = r->peers[i], .term = r->current_term,
                                .index = last_idx, .log_term = log_term(r, last_idx) };
@@ -271,14 +369,14 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     else if (msg->type == MSG_REQUEST_VOTE) {
         raft_msg_t res = { .type = MSG_REQUEST_VOTE_RES, .to = msg->from, .term = r->current_term, .reject = true };
 
-        uint64_t my_last_idx = r->log_len - 1;
+        uint64_t my_last_idx = raft_core_last_index(r);
         uint64_t my_last_term = log_term(r, my_last_idx);
         bool log_ok = (msg->log_term > my_last_term) || (msg->log_term == my_last_term && msg->index >= my_last_idx);
 
         if (msg->term == r->current_term && (r->voted_for == 0 || r->voted_for == msg->from) && log_ok) {
             r->voted_for = msg->from;
             res.reject = false;
-            r->activity_accepted = true; // PHASE 5: We granted a vote, reset timer safely
+            r->activity_accepted = true;
         }
         send_msg(r, res);
     }
@@ -296,46 +394,50 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     }
     else if (msg->type == MSG_PROPOSE && r->state == RAFT_STATE_LEADER) {
         if (msg->num_entries == 0 || msg->entries == NULL) return;
-        uint64_t old_log_len = r->log_len;
+        uint64_t old_last_idx = raft_core_last_index(r);
+
         for (size_t i = 0; i < msg->num_entries; i++) {
             log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].data, msg->entries[i].data_len);
         }
         if (r->num_peers == 0) {
-            r->commit_index = r->log_len - 1;
+            r->commit_index = raft_core_last_index(r);
             return;
         }
         for (size_t i = 0; i < r->num_peers; i++) {
-            if (r->next_index[i] == old_log_len) {
-                // Was fully caught up before we appended. Send the new paginated batch!
-                send_append(r, i);
+            if (r->next_index[i] == old_last_idx + 1) {
+                send_append(r, i); // Fully caught up, send paginated payload
             }
         }
     }
     else if (msg->type == MSG_APPEND_ENTRIES) {
         if (msg->num_entries > 0 && msg->entries == NULL) {
-            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = r->log_len - 1 };
+            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index(r) };
             send_msg(r, res);
             return;
         }
 
-        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = r->log_len - 1 };
+        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index(r) };
 
         if (msg->term >= r->current_term) {
             r->state = RAFT_STATE_FOLLOWER;
-            r->activity_accepted = true; // PHASE 5: Recognized valid leader
+            r->activity_accepted = true;
 
-            if (msg->index < r->log_len && log_term(r, msg->index) == msg->log_term) {
+            uint64_t my_last_idx = raft_core_last_index(r);
+
+            if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && log_term(r, msg->index) == msg->log_term) {
                 res.reject = false;
 
                 if (msg->num_entries > 0) {
                     for (size_t i = 0; i < msg->num_entries; i++) {
                         uint64_t new_idx = msg->index + 1 + i;
-                        if (new_idx < r->log_len && log_term(r, new_idx) == msg->entries[i].term) continue;
+                        my_last_idx = raft_core_last_index(r);
+
+                        if (new_idx <= my_last_idx && log_term(r, new_idx) == msg->entries[i].term) continue;
                         if (new_idx <= r->commit_index) {
                             res.reject = true;
                             break;
                         }
-                        if (new_idx < r->log_len) log_truncate(r, new_idx);
+                        if (new_idx <= my_last_idx) log_truncate(r, new_idx);
                         log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].data, msg->entries[i].data_len);
                     }
                 }
@@ -346,29 +448,67 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                         r->commit_index = (msg->commit < res.index) ? msg->commit : res.index;
                     }
                 }
+            } else if (msg->index < r->snapshot_index) {
+                // Should only happen if the leader's network is lagging behind our compaction
+                res.reject = true;
+                res.index = r->snapshot_index;
             }
+        }
+        send_msg(r, res);
+    }
+    else if (msg->type == MSG_INSTALL_SNAPSHOT) {
+        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index(r) };
+
+        if (msg->term >= r->current_term) {
+            r->state = RAFT_STATE_FOLLOWER;
+            r->activity_accepted = true;
+
+            if (msg->index > r->snapshot_index) {
+                // Total Amnesia: Nuke our current log, adopt the snapshot's timeline
+                for (size_t i = 0; i < r->log_len; i++) {
+                    if (r->log[i].data) free(r->log[i].data);
+                }
+
+                r->log_len = 1;
+                r->snapshot_index = msg->index;
+                r->snapshot_term = msg->log_term;
+
+                r->log[0].index = msg->index;
+                r->log[0].term = msg->log_term;
+                r->log[0].data = NULL;
+                r->log[0].data_len = 0;
+
+                // Fast-forward application state
+                if (r->commit_index < msg->index) r->commit_index = msg->index;
+                if (r->last_applied < msg->index) r->last_applied = msg->index;
+
+                // Future Implementation: Trigger the application layer to load `msg->snapshot_data` here
+            }
+            res.reject = false;
+            res.index = msg->index;
         }
         send_msg(r, res);
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
-        if (!msg->reject && msg->index >= r->log_len) return;
+
+        uint64_t my_last_idx = raft_core_last_index(r);
+        if (!msg->reject && msg->index > my_last_idx) return;
 
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
                 if (msg->reject) {
-                    // Backtrack and resend the paginated chunk
                     r->next_index[i] = (r->next_index[i] > 1) ? r->next_index[i] - 1 : 1;
                     send_append(r, i);
                 } else {
-                    uint64_t safe_idx = msg->index < r->log_len ? msg->index : r->log_len - 1;
+                    uint64_t safe_idx = msg->index < my_last_idx ? msg->index : my_last_idx;
                     if (safe_idx >= r->match_index[i]) {
                         r->match_index[i] = safe_idx;
                         r->next_index[i] = safe_idx + 1;
                     }
 
                     uint64_t matches[MAX_PEERS + 1];
-                    matches[0] = r->log_len - 1;
+                    matches[0] = my_last_idx;
                     for (size_t j = 0; j < r->num_peers; j++) matches[j+1] = r->match_index[j];
 
                     qsort(matches, r->num_peers + 1, sizeof(uint64_t), cmp_u64);
@@ -378,8 +518,8 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                         r->commit_index = median;
                     }
 
-                    // FAST CATCH-UP: If the follower is still behind, pipeline the next batch immediately!
-                    if (r->next_index[i] < r->log_len) {
+                    // FAST CATCH-UP PIPELINE: Keep firing pages if they are still behind!
+                    if (r->next_index[i] <= my_last_idx) {
                         send_append(r, i);
                     }
                 }
@@ -389,10 +529,13 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     }
 }
 
+// ============================================================================
+// ACCESSORS & ADVANCEMENT
+// ============================================================================
+
 raft_state_t raft_core_state(raft_core_t* r) { return r->state; }
 uint64_t raft_core_term(raft_core_t* r) { return r->current_term; }
 uint64_t raft_core_commit_index(raft_core_t* r) { return r->commit_index; }
-uint64_t raft_core_last_index(raft_core_t* r) { return r->log_len - 1; }
 uint64_t raft_core_voted_for(raft_core_t* r) { return r->voted_for; }
 bool raft_core_activity_accepted(raft_core_t* r) { return r->activity_accepted; }
 
@@ -406,14 +549,15 @@ size_t raft_core_peers(raft_core_t* r, uint64_t* out_peers) {
 void raft_core_apply(raft_core_t* r) {
     while (r->last_applied < r->commit_index) {
         uint64_t next = r->last_applied + 1;
-        if (r->log[next].type == ENTRY_CONF_ADD || r->log[next].type == ENTRY_CONF_REMOVE) {
-            apply_conf_change(r, r->log[next].type, r->log[next].data, r->log[next].data_len);
+        raft_entry_t* e = log_at(r, next);
+
+        if (e && (e->type == ENTRY_CONF_ADD || e->type == ENTRY_CONF_REMOVE)) {
+            apply_conf_change(r, e->type, e->data, e->data_len);
         }
         r->last_applied = next;
     }
 }
 
-// PHASE 5: Explicit Advancement
 void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index) {
     if (saved_index > r->last_saved_index) r->last_saved_index = saved_index;
     if (applied_index > r->last_applied) r->last_applied = applied_index;
@@ -422,19 +566,20 @@ void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_in
 }
 
 void raft_core_advance_all(raft_core_t* r) {
-    // Automatically advance to the absolute limits of the current state
     raft_core_advance(r, raft_core_last_index(r), raft_core_commit_index(r));
 }
 
-// PHASE 5: Config Replay on Boot
+// ============================================================================
+// BOOTSTRAP RECOVERY
+// ============================================================================
+
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index,
                                raft_entry_t* entries, size_t num_entries) {
     if (num_entries == 0 || entries == NULL) return NULL;
-    if (entries[0].index != 0) return NULL;
 
     for (size_t i = 1; i < num_entries; i++) {
-        if (entries[i].index != i) return NULL;
+        if (entries[i].index <= entries[i-1].index) return NULL;
         if (entries[i].term < entries[i-1].term) return NULL;
     }
 
@@ -444,6 +589,10 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
     r->current_term = term;
     r->voted_for = voted_for;
 
+    // Use the first restored entry to anchor the snapshot offset
+    r->snapshot_index = entries[0].index;
+    r->snapshot_term = entries[0].term;
+
     if (r->log[0].data) free(r->log[0].data);
     r->log_len = 0;
 
@@ -451,10 +600,9 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
         log_append(r, entries[i].term, entries[i].type, entries[i].data, entries[i].data_len);
     }
 
-    r->last_saved_index = r->log_len - 1;
+    r->last_saved_index = raft_core_last_index(r);
     r->commit_index = commit_index;
 
-    // Explicitly replay committed configuration changes!
     raft_core_apply(r);
 
     return r;

@@ -23,7 +23,8 @@ typedef enum {
     MSG_APPEND_ENTRIES,
     MSG_APPEND_RES,
     MSG_REQUEST_VOTE,
-    MSG_REQUEST_VOTE_RES
+    MSG_REQUEST_VOTE_RES,
+    MSG_INSTALL_SNAPSHOT
 } msg_type_t;
 
 typedef enum {
@@ -51,6 +52,9 @@ typedef struct {
 
     raft_entry_t* entries;
     size_t num_entries;
+
+    uint8_t* snapshot_data;
+    size_t snapshot_len;
 
     bool reject;
 } raft_msg_t;
@@ -96,5 +100,8 @@ uint64_t     raft_core_last_index(raft_core_t* r);
 bool         raft_core_activity_accepted(raft_core_t* r);
 
 size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
+
+// Compacts the in-memory log, shifting the array left and freeing old entries.
+void raft_core_compact(raft_core_t* r, uint64_t compact_index);
 
 #endif // RAFT_CORE_H
