@@ -6,7 +6,7 @@
 #include "a-raft-library/raft_io.h"
 #include <stdlib.h>
 
-raft_core_t* raft_io_boot(awal_engine_t* wal, uint64_t node_id, uint64_t* init_peers, size_t num_peers, uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit) {
+raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id, uint64_t* init_peers, size_t num_peers, uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit) {
 
     // PHASE 5: If the WAL is empty, we MUST STILL restore the HardState using a dummy entry!
     if (wal->max_disk_index == 0) {
@@ -22,7 +22,7 @@ raft_core_t* raft_io_boot(awal_engine_t* wal, uint64_t node_id, uint64_t* init_p
     for (uint64_t i = 1; i <= wal->max_disk_index; i++) {
         uint64_t term; uint8_t type; uint8_t* payload = NULL; uint32_t len = 0;
 
-        if (awal_read_entry(wal, i, &term, &type, &payload, &len)) {
+        if (raft_wal_read_entry(wal, i, &term, &type, &payload, &len)) {
             entries[i].term = term;
             entries[i].index = i;
             entries[i].type = (entry_type_t)type;
@@ -44,21 +44,22 @@ raft_core_t* raft_io_boot(awal_engine_t* wal, uint64_t node_id, uint64_t* init_p
     return core;
 }
 
-bool raft_io_save(awal_engine_t* wal, raft_ready_t* ready) {
+bool raft_io_save(raft_wal_t* wal, raft_ready_t* ready) {
     if (ready->num_entries_to_save == 0) return true;
 
     uint64_t first_idx = ready->entries_to_save[0].index;
 
+    // Use the new tail truncation logic
     if (first_idx <= wal->max_disk_index) {
-        awal_truncate(wal, first_idx);
+        raft_wal_truncate_tail(wal, first_idx);
     }
 
     for (size_t i = 0; i < ready->num_entries_to_save; i++) {
         raft_entry_t* e = &ready->entries_to_save[i];
-        if (awal_append(wal, e->term, e->index, (uint8_t)e->type, e->data, e->data_len) != 0) {
+        if (raft_wal_append(wal, e->term, e->index, (uint8_t)e->type, e->data, e->data_len) != 0) {
             return false;
         }
     }
 
-    return awal_flush_batch(wal) >= 0;
+    return raft_wal_flush_batch(wal) == 0; // Note: raft_wal_flush_batch returns 0 on success
 }

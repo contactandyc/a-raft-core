@@ -63,7 +63,7 @@ static void on_test_check(uv_timer_t* handle) {
             uv_close((uv_handle_t*)&nodes[2]->election_timer, NULL);
             uv_close((uv_handle_t*)&nodes[2]->heartbeat_timer, NULL);
 
-            awal_close(&nodes[2]->wal);
+            raft_wal_close(&nodes[2]->wal);
             raft_core_destroy(nodes[2]->core);
 
             // Propose new data while it is dead (Nodes 1 and 2 still hold quorum)
@@ -137,7 +137,7 @@ MACRO_TEST(cluster_tcp_crash_recovery_and_resync) {
     uv_walk(loop, close_walk_cb, NULL);
     uv_run(loop, UV_RUN_DEFAULT);
 
-    awal_close(&nodes[0]->wal); awal_close(&nodes[1]->wal); awal_close(&nodes[2]->wal);
+    raft_wal_close(&nodes[0]->wal); raft_wal_close(&nodes[1]->wal); raft_wal_close(&nodes[2]->wal);
     raft_core_destroy(nodes[0]->core); raft_core_destroy(nodes[1]->core); raft_core_destroy(nodes[2]->core);
 
     free(nodes[0]); free(nodes[1]); free(nodes[2]);

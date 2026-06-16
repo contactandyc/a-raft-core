@@ -55,11 +55,11 @@ find_package(the_lz4_library CONFIG REQUIRED)
 # ── Main Targets (Compiled Libraries) ─────────────────────────────────────────
 
 add_library(a_raft_library_debug STATIC
-  src/awal.c
   src/raft_codec.c
   src/raft_core.c
   src/raft_io.c
   src/raft_server.c
+  src/raft_wal.c
 )
 
 target_include_directories(a_raft_library_debug PUBLIC
@@ -90,11 +90,11 @@ install(TARGETS a_raft_library_debug EXPORT a_raft_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_raft_library_memory STATIC
-  src/awal.c
   src/raft_codec.c
   src/raft_core.c
   src/raft_io.c
   src/raft_server.c
+  src/raft_wal.c
 )
 
 target_include_directories(a_raft_library_memory PUBLIC
@@ -128,11 +128,11 @@ install(TARGETS a_raft_library_memory EXPORT a_raft_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_raft_library_static STATIC
-  src/awal.c
   src/raft_codec.c
   src/raft_core.c
   src/raft_io.c
   src/raft_server.c
+  src/raft_wal.c
 )
 
 target_include_directories(a_raft_library_static PUBLIC
@@ -163,11 +163,11 @@ install(TARGETS a_raft_library_static EXPORT a_raft_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_raft_library_shared SHARED
-  src/awal.c
   src/raft_codec.c
   src/raft_core.c
   src/raft_io.c
   src/raft_server.c
+  src/raft_wal.c
 )
 
 target_include_directories(a_raft_library_shared PUBLIC

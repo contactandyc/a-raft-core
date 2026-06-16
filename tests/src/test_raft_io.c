@@ -10,16 +10,13 @@
 #include <sys/stat.h>
 #include "a-raft-library/raft_core.h"
 #include "a-raft-library/raft_io.h"
-#include "a-raft-library/awal.h"
+#include "a-raft-library/raft_wal.h" // <-- CHANGED
 #include "the-macro-library/macro_test.h"
 
-// Helper to wipe the test database files before/after runs
 static void cleanup_wal_files(const char* base_path) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s.dat", base_path);
-    unlink(path);
-    snprintf(path, sizeof(path), "%s.index", base_path);
-    unlink(path);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", base_path);
+    system(cmd);
 }
 
 MACRO_TEST(io_save_and_boot) {
@@ -27,10 +24,11 @@ MACRO_TEST(io_save_and_boot) {
     cleanup_wal_files(wal_path);
 
     uint64_t peers[] = {2, 3};
-    awal_engine_t wal;
-    MACRO_ASSERT_EQ_INT(awal_init(&wal, wal_path), 0);
+    raft_wal_t wal; // <-- CHANGED
 
-    // FIXED: Added the 0 for the initial commit index
+    // Boot the WAL with 16MB segments and 4 standby files
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0); // <-- CHANGED
+
     raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
@@ -46,21 +44,19 @@ MACRO_TEST(io_save_and_boot) {
 
     raft_ready_t ready = raft_core_get_ready(core);
     MACRO_ASSERT_TRUE(ready.num_entries_to_save > 0);
+
     raft_io_save(&wal, &ready);
-    raft_core_advance_all(core); // Using your new convenience wrapper!
+    raft_core_advance_all(core);
 
     uint64_t saved_term = raft_core_term(core);
     uint64_t saved_last_index = raft_core_last_index(core);
-
-    // NEW: Capture the commit index before destroying
     uint64_t saved_commit = raft_core_commit_index(core);
 
     raft_core_destroy(core);
-    awal_close(&wal);
+    raft_wal_close(&wal); // <-- CHANGED
 
-    MACRO_ASSERT_EQ_INT(awal_init(&wal, wal_path), 0);
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0); // <-- CHANGED
 
-    // FIXED: Pass the saved_commit into the boot sequence
     raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1, saved_commit);
 
     MACRO_ASSERT_TRUE(recovered_core != NULL);
@@ -71,7 +67,7 @@ MACRO_TEST(io_save_and_boot) {
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 0);
 
     raft_core_destroy(recovered_core);
-    awal_close(&wal);
+    raft_wal_close(&wal); // <-- CHANGED
     cleanup_wal_files(wal_path);
 }
 

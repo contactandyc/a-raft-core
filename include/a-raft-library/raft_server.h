@@ -11,7 +11,7 @@
 #include <uv.h>
 #include "a-raft-library/raft_core.h"
 #include "a-raft-library/raft_io.h"
-#include "a-raft-library/awal.h"
+#include "a-raft-library/raft_wal.h"
 
 #define RAFT_MAX_PEERS 64
 
@@ -56,7 +56,7 @@ struct raft_node_s {
     raft_server_t* server;
 
     raft_core_t* core;   // THE BRAIN
-    awal_engine_t wal;   // THE DISK
+    raft_wal_t wal;   // THE DISK
 
     uint64_t saved_term;
     uint64_t saved_vote;

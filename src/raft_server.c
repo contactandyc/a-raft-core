@@ -363,7 +363,9 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
 
     char wal_path[512];
     snprintf(wal_path, sizeof(wal_path), "%s/wal_grp%llu", server->data_dir, group_id);
-    awal_init(&node->wal, wal_path);
+
+    // Boot the new Raft WAL with 16MB segments and a max of 4 standby files
+    raft_wal_init(&node->wal, wal_path, 16, 4);
 
     uint64_t saved_commit = 0;
     char meta_path[512];

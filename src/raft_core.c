@@ -8,6 +8,7 @@
 #include <string.h>
 
 #define MAX_PEERS 16
+#define RAFT_MAX_APPEND_BATCH 2048
 
 struct raft_core_s {
     uint64_t id;
@@ -181,14 +182,29 @@ static int cmp_u64(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
+static void send_append(raft_core_t* r, size_t peer_idx) {
+    uint64_t prev_idx = r->next_index[peer_idx] - 1;
+    uint64_t num_entries = r->log_len - (prev_idx + 1);
+
+    // Clamp batch size to prevent max-frame network deadlocks
+    if (num_entries > RAFT_MAX_APPEND_BATCH) {
+        num_entries = RAFT_MAX_APPEND_BATCH;
+    }
+
+    // Optimistically advance next_index so we can pipeline payloads
+    r->next_index[peer_idx] = prev_idx + 1 + num_entries;
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = r->peers[peer_idx], .term = r->current_term,
+                       .index = prev_idx, .log_term = log_term(r, prev_idx),
+                       .commit = r->commit_index,
+                       .entries = num_entries > 0 ? &r->log[prev_idx + 1] : NULL,
+                       .num_entries = num_entries };
+    send_msg(r, app);
+}
+
 static void bcast_append(raft_core_t* r) {
     for (size_t i = 0; i < r->num_peers; i++) {
-        uint64_t prev_idx = r->next_index[i] - 1;
-        raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = r->peers[i], .term = r->current_term,
-                           .index = prev_idx, .log_term = log_term(r, prev_idx),
-                           .commit = r->commit_index, .entries = &r->log[prev_idx + 1],
-                           .num_entries = r->log_len - (prev_idx + 1) };
-        send_msg(r, app);
+        send_append(r, i);
     }
 }
 
@@ -290,12 +306,8 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         }
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->next_index[i] == old_log_len) {
-                r->next_index[i] = r->log_len;
-                raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = r->peers[i], .term = r->current_term,
-                                   .index = old_log_len - 1, .log_term = log_term(r, old_log_len - 1),
-                                   .commit = r->commit_index, .entries = &r->log[old_log_len],
-                                   .num_entries = msg->num_entries };
-                send_msg(r, app);
+                // Was fully caught up before we appended. Send the new paginated batch!
+                send_append(r, i);
             }
         }
     }
@@ -345,13 +357,9 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
                 if (msg->reject) {
+                    // Backtrack and resend the paginated chunk
                     r->next_index[i] = (r->next_index[i] > 1) ? r->next_index[i] - 1 : 1;
-                    uint64_t prev_idx = r->next_index[i] - 1;
-                    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = msg->from, .term = r->current_term,
-                                       .index = prev_idx, .log_term = log_term(r, prev_idx),
-                                       .commit = r->commit_index, .entries = &r->log[prev_idx + 1],
-                                       .num_entries = r->log_len - (prev_idx + 1) };
-                    send_msg(r, app);
+                    send_append(r, i);
                 } else {
                     uint64_t safe_idx = msg->index < r->log_len ? msg->index : r->log_len - 1;
                     if (safe_idx >= r->match_index[i]) {
@@ -368,6 +376,11 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
                     if (median > r->commit_index && log_term(r, median) == r->current_term) {
                         r->commit_index = median;
+                    }
+
+                    // FAST CATCH-UP: If the follower is still behind, pipeline the next batch immediately!
+                    if (r->next_index[i] < r->log_len) {
+                        send_append(r, i);
                     }
                 }
                 break;
