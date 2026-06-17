@@ -1,17 +1,34 @@
-Here is the restructured and consolidated roadmap.
+### Phase 1 Summary: Immediate Safety & Core Correctness
 
-I have removed the two major gaps we just resolved (**Network Pagination/Deadlocks** and **Core Snapshot/Memory Compaction**) and reorganized the remaining items into logical, actionable phases. I've also incorporated the nuances regarding Check-Quorum and decoupled the internal Raft state from the application state machine.
+#### 1. Mathematical Quorum Correction
 
----
+* **The Bug:** The core previously calculated the commit index using a simple median (`matches[(num_peers + 1) / 2]`). In even-sized clusters (e.g., 4 nodes), this mathematically selected the second-highest index, effectively committing data that only existed on a minority of nodes (2 out of 4).
+* **The Fix:** We implemented explicit quorum math (`total - quorum`), guaranteeing that the leader strictly validates a majority overlap before ever advancing the commit index.
 
-### **Phase 1: Immediate Safety & Core Correctness**
+#### 2. TCP Buffer Scaling & Codec Deadlock Prevention
 
-*These are mathematical or state-machine footguns that could cause data loss or cluster corruption under normal operation.*
+* **The Bug:** The network codec permitted up to 10 MB payload frames, but the peer connection struct hardcoded a static 64 KB receive buffer. A large, valid Raft frame would overflow the buffer, force a disconnect, and permanently stall lagging followers.
+* **The Fix:** We converted the `peer_connection_t` buffer into a dynamically scaling heap allocation. It now correctly doubles its capacity on demand, safely capped by `RAFT_MAX_FRAME_SIZE` to prevent malicious memory-exhaustion attacks.
 
-* **1. Even-Sized Cluster Majority Bug:** The leader computes the commit candidate as a median of match indexes. In a 4-node cluster (quorum = 3), the median selects the 2nd index, committing entries replicated to only a minority. *Fix: Implement explicit quorum math.*
-* **2. State Machine "Apply" Decoupling:** `raft_node_pump` artificially marks entries as applied without waiting for a real application callback. Raft must not advance `last_applied` until the host database actually acknowledges the write.
-* **3. Config vs. Application Replay:** On boot, `raft_core_restore` blindly calls `raft_core_apply`, which advances `last_applied`. This is safe for internal config changes but dangerous for normal commands, which the host database might have already applied (or might need to apply at its own pace).
-* **4. TCP Buffer / Codec Mismatch:** The codec allows up to 10 MB frames, but `peer_connection_t` uses a rigid 64 KB buffer. If a valid Raft frame exceeds 64 KB, the connection will drop and silently fail to recover.
+#### 3. State Machine Decoupling
+
+* **The Bug:** The core assumed that any committed configuration change or log entry should be instantly applied to the internal state. During a boot sequence, `raft_io_boot` would advance `last_applied` artificially before the host application had actually ingested the data.
+* **The Fix:** We removed `raft_core_apply` from internal loops and the bootloader. Application progress is now strictly decoupled and driven by the host via `raft_core_advance()`. Raft will no longer lie about what the host database has successfully processed.
+
+#### 4. Fast Conflict Backtracking
+
+* **The Bug:** When a follower rejected an `AppendEntries` message due to a log mismatch, the leader would naively step its `next_index` backward by exactly 1 and retry. A follower behind by 5,000 entries would require 5,000 failed network roundtrips to sync.
+* **The Fix:** We implemented fast backtracking. The leader now reads the `msg->index` from the follower's rejection and jumps its `next_index` directly to that point, resolving conflicts in $O(1)$ network trips.
+
+#### 5. Memory Safety & Libuv Crash Resolution
+
+* **The Bugs:** The test suite exposed two critical memory panics. First, the bootloader allocated memory using `aml_malloc` but attempted to free it with standard `free()`. Second, the cluster simulation test forcefully destroyed libuv timers (`uv_close`) mid-tick, causing use-after-free panics.
+* **The Fixes:** We swapped the bootloader to use `aml_free` strictly, and we updated the test harness to safely pause timers (`uv_timer_stop`) rather than destroying asynchronous handles out from under the event loop.
+
+#### 6. Hermetic Build Isolation
+
+* **The Bug:** The scaffolding engine successfully pulled the isolated dependencies, but the host machine's system-level `pkg-config` leaked into the build, forcing CMake to link against stale libraries outside the workspace.
+* **The Fix:** We injected strict overrides for `PKG_CONFIG_PATH` and `CMAKE_PREFIX_PATH` into all Jinja2 build templates, forcing CMake to prioritize the local `repos/install` sandbox exclusively.
 
 ### **Phase 2: Disk I/O & Boot Integrity**
 

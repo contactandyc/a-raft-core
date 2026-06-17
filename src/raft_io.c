@@ -4,11 +4,11 @@
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include "a-raft-library/raft_io.h"
+#include "a-memory-library/aml_alloc.h" // <-- MUST INCLUDE THIS
 #include <stdlib.h>
 
 raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id, uint64_t* init_peers, size_t num_peers, uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit) {
 
-    // PHASE 5: If the WAL is empty, we MUST STILL restore the HardState using a dummy entry!
     if (wal->max_disk_index == 0) {
         raft_entry_t dummy = { .term = 0, .index = 0, .type = ENTRY_NORMAL, .data = NULL, .data_len = 0 };
         return raft_core_restore(node_id, init_peers, num_peers, saved_term, saved_vote, saved_commit, &dummy, 1);
@@ -29,6 +29,10 @@ raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id, uint64_t* init_peer
             entries[i].data = payload;
             entries[i].data_len = len;
         } else {
+            // Memory Leak Fix: Must aml_free any previously loaded payloads before returning NULL
+            for(size_t j = 1; j < i; j++) {
+                if (entries[j].data) aml_free(entries[j].data);
+            }
             free(entries);
             return NULL;
         }
@@ -37,7 +41,8 @@ raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id, uint64_t* init_peer
     raft_core_t* core = raft_core_restore(node_id, init_peers, num_peers, saved_term, saved_vote, saved_commit, entries, total_entries);
 
     for (size_t i = 1; i <= wal->max_disk_index; i++) {
-        if (entries[i].data) free(entries[i].data);
+        // USE AML_FREE! The WAL allocated this via a-memory-library.
+        if (entries[i].data) aml_free(entries[i].data);
     }
     free(entries);
 
@@ -49,7 +54,6 @@ bool raft_io_save(raft_wal_t* wal, raft_ready_t* ready) {
 
     uint64_t first_idx = ready->entries_to_save[0].index;
 
-    // Use the new tail truncation logic
     if (first_idx <= wal->max_disk_index) {
         raft_wal_truncate_tail(wal, first_idx);
     }
@@ -61,5 +65,5 @@ bool raft_io_save(raft_wal_t* wal, raft_ready_t* ready) {
         }
     }
 
-    return raft_wal_flush_batch(wal) == 0; // Note: raft_wal_flush_batch returns 0 on success
+    return raft_wal_flush_batch(wal) == 0;
 }

@@ -47,6 +47,9 @@ esac
 
 VAR_CMAKE="${VRAW//-/_}"
 
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export CMAKE_PREFIX_PATH="$PREFIX"
+
 # --- banner ---
 cat <<EOF
 ▶ Building tests with:

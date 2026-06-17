@@ -9,12 +9,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h> // PHASE 5: For O_RDONLY and directory fsync
+#include <fcntl.h>
 
 // Forward declarations
 void raft_node_pump(raft_node_t* node);
 
-// PHASE 5: Atomic HardState Saver
 static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit) {
     char tmp_path[512], meta_path[512], dir_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s/meta_grp%llu.tmp", server->data_dir, group_id);
@@ -35,10 +34,8 @@ static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t te
     fsync(fileno(f));
     fclose(f);
 
-    // Atomic overwrite
     if (rename(tmp_path, meta_path) != 0) return false;
 
-    // Fsync the parent directory so the rename survives a power crash
     int dir_fd = open(dir_path, O_RDONLY);
     if (dir_fd >= 0) {
 #ifdef __APPLE__
@@ -51,10 +48,6 @@ static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t te
     return true;
 }
 
-// ============================================================================
-// 1. C CALLBACKS (Replacing Lambdas)
-// ============================================================================
-
 static void on_write_done(uv_write_t* req, int status) {
     (void)status;
     free(req->data);
@@ -62,7 +55,9 @@ static void on_write_done(uv_write_t* req, int status) {
 }
 
 static void on_client_close(uv_handle_t* handle) {
-    free(handle);
+    peer_connection_t* peer = (peer_connection_t*)handle;
+    if (peer->buffer) free(peer->buffer);
+    free(peer);
 }
 
 static void on_election_timeout(uv_timer_t* handle) {
@@ -85,10 +80,6 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     if (!buf->base) buf->len = 0;
     else buf->len = suggested_size;
 }
-
-// ============================================================================
-// 2. THE EVENT PUMP (Brain -> Disk -> Network -> State Machine)
-// ============================================================================
 
 static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t target_node_id, uint8_t* payload, uint32_t len) {
     if (server->network_isolated) {
@@ -122,15 +113,13 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
 
 static void reset_election_timer(raft_node_t* node) {
     uv_timer_stop(&node->election_timer);
-    uint64_t timeout = 150 + (rand() % 150); // 150-300ms randomized
+    uint64_t timeout = 150 + (rand() % 150);
     uv_timer_start(&node->election_timer, on_election_timeout, timeout, 0);
 }
 
-// The core loop that glues the system together
 void raft_node_pump(raft_node_t* node) {
     raft_ready_t ready = raft_core_get_ready(node->core);
 
-    // PHASE 5: Track exactly what we achieved so we don't over-advance
     uint64_t actual_saved_idx = raft_core_last_index(node->core) - ready.num_entries_to_save;
     uint64_t actual_applied_idx = raft_core_commit_index(node->core) - ready.num_committed_entries;
 
@@ -148,7 +137,6 @@ void raft_node_pump(raft_node_t* node) {
     uint64_t voted_for = raft_core_voted_for(node->core);
     uint64_t commit_idx = raft_core_commit_index(node->core);
 
-    // PHASE 5: Fail-Closed Atomic Meta Writes
     if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx) {
         if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx)) {
             fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump to prevent amnesia.\n");
@@ -174,7 +162,6 @@ void raft_node_pump(raft_node_t* node) {
         for (size_t i = 0; i < ready.num_committed_entries; i++) {
             // Future Application Logic: Apply ready.committed_entries[i].data here
         }
-        raft_core_apply(node->core);
         actual_applied_idx = commit_idx;
     }
 
@@ -183,7 +170,7 @@ void raft_node_pump(raft_node_t* node) {
     if (state == RAFT_STATE_LEADER) {
         if (!uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
             uv_timer_stop(&node->election_timer);
-            uv_timer_start(&node->heartbeat_timer, on_heartbeat_tick, 50, 50); // 50ms steady heartbeats
+            uv_timer_start(&node->heartbeat_timer, on_heartbeat_tick, 50, 50);
         }
     } else {
         if (uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
@@ -194,13 +181,8 @@ void raft_node_pump(raft_node_t* node) {
         }
     }
 
-    // PHASE 5: Safe Explicit Advancement
     raft_core_advance(node->core, actual_saved_idx, actual_applied_idx);
 }
-
-// ============================================================================
-// 4. TCP NETWORKING (Dumb pipes)
-// ============================================================================
 
 static void remove_peer(raft_server_t* server, peer_connection_t* peer) {
     for (uint32_t i = 0; i < server->active_peer_count; i++) {
@@ -221,11 +203,22 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         return;
     }
 
-    if (peer->buffer_len + nread > sizeof(peer->buffer)) {
-        remove_peer(peer->server, peer);
-        uv_close((uv_handle_t*)client, on_client_close);
-        if (buf->base) free(buf->base);
-        return;
+    // PHASE 1: Dynamic Buffer Scaling to accommodate Multi-Megabyte Frames gracefully
+    if (peer->buffer_len + nread > peer->buffer_cap) {
+        size_t new_cap = peer->buffer_cap * 2;
+        while (peer->buffer_len + nread > new_cap) new_cap *= 2;
+
+        size_t max_allowed = RAFT_MAX_FRAME_SIZE + sizeof(raft_net_header_t);
+        if (new_cap > max_allowed) new_cap = max_allowed;
+
+        if (peer->buffer_len + nread > new_cap) {
+            fprintf(stderr, "[WARN] Disconnecting peer: Buffer capacity exceeded max frame size.\n");
+            remove_peer(peer->server, peer);
+            uv_close((uv_handle_t*)client, on_client_close);
+            if (buf->base) free(buf->base);
+            return;
+        }
+        peer->buffer = realloc(peer->buffer, new_cap);
     }
 
     memcpy(peer->buffer + peer->buffer_len, buf->base, nread);
@@ -235,7 +228,6 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     while (peer->buffer_len - offset >= sizeof(raft_net_header_t)) {
         raft_net_header_t *h = (raft_net_header_t *)(peer->buffer + offset);
 
-        // PHASE 3 SECURITY: Check Max Frame Bounds
         if (h->payload_len > RAFT_MAX_FRAME_SIZE) {
             fprintf(stderr, "[WARN] Disconnecting peer: Frame size exceeds limit.\n");
             remove_peer(peer->server, peer);
@@ -254,12 +246,10 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
             raft_node_t* target_node = peer->server->groups[h->group_id];
 
             raft_msg_t msg;
-            // PHASE 3 SECURITY: Deserialize safely
             if (raft_codec_deserialize_msg(payload, h->payload_len, &msg) == 0) {
 
                 raft_core_step(target_node->core, &msg);
 
-                // PHASE 5: ONLY reset the election timer if the brain verified the leader/vote!
                 if (raft_core_activity_accepted(target_node->core)) {
                     reset_election_timer(target_node);
                 }
@@ -289,7 +279,10 @@ static void register_peer(raft_server_t* server, peer_connection_t* peer) {
 static void on_new_connection(uv_stream_t *server_stream, int status) {
     if (status < 0) return;
     raft_server_t *server = (raft_server_t*)server_stream->data;
+
     peer_connection_t *peer = calloc(1, sizeof(peer_connection_t));
+    peer->buffer_cap = 65536; // Boot buffer safely
+    peer->buffer = malloc(peer->buffer_cap);
 
     uv_tcp_init(server->loop, &peer->handle);
     peer->server = server;
@@ -343,6 +336,9 @@ void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64
     if (server->network_isolated) return;
 
     peer_connection_t* peer = calloc(1, sizeof(peer_connection_t));
+    peer->buffer_cap = 65536;
+    peer->buffer = malloc(peer->buffer_cap);
+
     uv_tcp_init(server->loop, &peer->handle);
     peer->server = server;
     peer->remote_node_id = target_node_id;
@@ -364,7 +360,6 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     char wal_path[512];
     snprintf(wal_path, sizeof(wal_path), "%s/wal_grp%llu", server->data_dir, group_id);
 
-    // Boot the new Raft WAL with 16MB segments and a max of 4 standby files
     raft_wal_init(&node->wal, wal_path, 16, 4);
 
     uint64_t saved_commit = 0;
@@ -378,7 +373,6 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
         fclose(f);
     }
 
-    // PHASE 5: Boot safely restores term, vote, and commit index
     node->core = raft_io_boot(&node->wal, server->physical_node_id, init_peers, num_peers, node->saved_term, node->saved_vote, saved_commit);
 
     uv_timer_init(server->loop, &node->election_timer);

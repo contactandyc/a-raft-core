@@ -40,7 +40,7 @@ case "$COMMAND" in
   unboot)
     echo "-- Removing bootstrap artifacts --"
     rm -rf repos .scaffold*
-    rm -rf "$BUILD_DIR"
+    rm -rf "$BUILD_DIR" "build-coverage"
     echo "✅ Unboot complete."
     ;;
   bootstrap)
@@ -49,6 +49,8 @@ case "$COMMAND" in
     # --- FAILSAFE: Shield against leaky parent environments ---
     export PREFIX="$PWD/repos/install"
     export WORKSPACE_DIR="$PWD/repos"
+    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$PREFIX"
 
     # 1. Fetch the scaffolding engine to disk so it is visible and editable
     mkdir -p repos
@@ -92,6 +94,9 @@ case "$COMMAND" in
     pick_generator
     echo "--- Building Project (Generator: $GENERATOR, Variant: $BUILD_VARIANT) ---"
 
+    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$PREFIX"
+
     cmake -S . -B "$BUILD_DIR" -G "$GENERATOR" \
       -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
       -DCMAKE_PREFIX_PATH="$PREFIX" \
@@ -126,6 +131,9 @@ case "$COMMAND" in
       echo "Error: abidiff not found. Are you running this inside the dev container?" >&2
       exit 1
     fi
+
+    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$PREFIX"
 
     # 1. Build the old reference in a temporary worktree
     OLD_DIR=$(mktemp -d)
@@ -173,6 +181,9 @@ case "$COMMAND" in
     pick_generator
     COV_BUILD_DIR="build-coverage"
     echo "--- Running Coverage (Generator: $GENERATOR) ---"
+
+    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$PREFIX"
 
     cmake -S . -B "$COV_BUILD_DIR" -G "$GENERATOR" \
       -DA_ENABLE_COVERAGE=ON \

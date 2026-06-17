@@ -31,10 +31,9 @@ typedef struct {
     in_flight_msg_t network[MAX_INFLIGHT];
     int current_tick;
 
-    // THE TRUTH TRACKER
     applied_entry_t state_machines[NUM_NODES][MAX_LOG_SIZE];
     uint64_t commit_indices[NUM_NODES];
-    uint64_t leaders_in_term[10000]; // Maps term -> node_id
+    uint64_t leaders_in_term[10000];
 } chaos_harness_t;
 
 static uint32_t seed = 123456789;
@@ -47,25 +46,22 @@ static uint32_t fast_rand() {
 
 static void route_messages(chaos_harness_t* h) {
     for (int i = 0; i < NUM_NODES; i++) {
-        // PHASE 4 SAFETY: Track split-brain leaders
         if (raft_core_state(h->nodes[i]) == RAFT_STATE_LEADER) {
             uint64_t term = raft_core_term(h->nodes[i]);
             if (h->leaders_in_term[term] == 0) {
                 h->leaders_in_term[term] = i + 1;
             } else {
-                // FATAL: Two leaders elected in the exact same term!
                 MACRO_ASSERT_EQ_INT(h->leaders_in_term[term], i + 1);
             }
         }
 
         raft_ready_t ready = raft_core_get_ready(h->nodes[i]);
 
-        // 1. Process Network Traffic
         for (size_t m = 0; m < ready.num_messages; m++) {
             raft_msg_t msg = ready.messages[m];
-            if (fast_rand() % 100 < 5) continue; // 5% Packet Drop
+            if (fast_rand() % 100 < 5) continue;
 
-            int delay = 1 + (fast_rand() % 10); // 1-10 tick latency
+            int delay = 1 + (fast_rand() % 10);
             for (int j = 0; j < MAX_INFLIGHT; j++) {
                 if (!h->network[j].active) {
                     h->network[j].msg = msg;
@@ -87,7 +83,6 @@ static void route_messages(chaos_harness_t* h) {
             }
         }
 
-        // 2. Process Committed State
         if (ready.num_committed_entries > 0) {
             for (size_t c = 0; c < ready.num_committed_entries; c++) {
                 uint64_t idx = ready.committed_entries[c].index;
@@ -99,11 +94,9 @@ static void route_messages(chaos_harness_t* h) {
                     memcpy(h->state_machines[i][idx].payload, ready.committed_entries[c].data, ready.committed_entries[c].data_len);
                 }
 
-                // Assert monotonic commits
                 MACRO_ASSERT_TRUE(idx > h->commit_indices[i] || h->commit_indices[i] == 0);
                 h->commit_indices[i] = idx;
             }
-            raft_core_apply(h->nodes[i]);
         }
         raft_core_advance_all(h->nodes[i]);
     }
@@ -135,17 +128,14 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         uint64_t peers[NUM_NODES - 1];
         int p_idx = 0;
         for (int j = 0; j < NUM_NODES; j++) {
-            // FIXED: Silenced the signed/unsigned comparison warning
             if ((uint64_t)(j + 1) != node_id) peers[p_idx++] = j + 1;
         }
         h.nodes[i] = raft_core_create(node_id, peers, NUM_NODES - 1);
     }
 
-    // Node 1 triggers election
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(h.nodes[0], &hup);
 
-    // THE CHAOS LOOP
     for (h.current_tick = 0; h.current_tick < MAX_TICKS; h.current_tick++) {
         route_messages(&h);
         deliver_due_messages(&h);
@@ -157,7 +147,6 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
 
         if (fast_rand() % 100 < 10) {
             int target = fast_rand() % NUM_NODES;
-            // FIXED: Avoid string-termination size warnings by making this a pointer
             uint8_t* payload = (uint8_t*)"DATA";
             raft_entry_t e = { .type = ENTRY_NORMAL, .data = payload, .data_len = 4 };
             raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
@@ -170,18 +159,14 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         }
     }
 
-    // ========================================================================
-    // PHASE 4 ASSERTION: GLOBAL LINEARIZABILITY PROOF
-    // ========================================================================
     uint64_t max_commit = 0;
     for (int i = 0; i < NUM_NODES; i++) {
         if (h.commit_indices[i] > max_commit) max_commit = h.commit_indices[i];
     }
     MACRO_ASSERT_TRUE(max_commit > 0);
 
-    printf("[INFO] Highest committed index across the chaotic cluster: %llu\n", max_commit);
+    printf("[INFO] Highest committed index across the chaotic cluster: %llu\n", (unsigned long long)max_commit);
 
-    // Iterate through every single index that was committed
     for (uint64_t idx = 1; idx <= max_commit; idx++) {
         uint64_t expected_term = 0;
         uint8_t expected_payload[16] = {0};
@@ -190,14 +175,12 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
 
         for (int i = 0; i < NUM_NODES; i++) {
             if (h.commit_indices[i] >= idx) {
-                // First node found provides the "ground truth" for this index
                 if (!found) {
                     expected_term = h.state_machines[i][idx].term;
                     expected_len = h.state_machines[i][idx].payload_len;
                     if (expected_len > 0) memcpy(expected_payload, h.state_machines[i][idx].payload, expected_len);
                     found = true;
                 } else {
-                    // All other nodes MUST match the ground truth mathematically
                     MACRO_ASSERT_EQ_INT(h.state_machines[i][idx].term, expected_term);
                     MACRO_ASSERT_EQ_INT(h.state_machines[i][idx].payload_len, expected_len);
                     if (expected_len > 0) {

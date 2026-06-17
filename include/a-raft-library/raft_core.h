@@ -24,7 +24,7 @@ typedef enum {
     MSG_APPEND_RES,
     MSG_REQUEST_VOTE,
     MSG_REQUEST_VOTE_RES,
-    MSG_INSTALL_SNAPSHOT
+    MSG_INSTALL_SNAPSHOT // Added for Snapshot protocol
 } msg_type_t;
 
 typedef enum {
@@ -53,6 +53,7 @@ typedef struct {
     raft_entry_t* entries;
     size_t num_entries;
 
+    // Snapshot Transfer
     uint8_t* snapshot_data;
     size_t snapshot_len;
 
@@ -75,7 +76,6 @@ typedef struct raft_core_s raft_core_t;
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers);
 void         raft_core_destroy(raft_core_t* r);
 
-// PHASE 5: Added commit_index to safely replay configurations on reboot
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index,
                                raft_entry_t* entries, size_t num_entries);
@@ -83,25 +83,20 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
 void         raft_core_step(raft_core_t* r, raft_msg_t* msg);
 raft_ready_t raft_core_get_ready(raft_core_t* r);
 
-// PHASE 5: Explicit advancement prevents the core from blindly assuming success
+// PHASE 1: Explicit advancement drives all internal config changes and memory
 void         raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index);
-void         raft_core_apply(raft_core_t* r);
+void         raft_core_advance_all(raft_core_t* r);
 
-// Convenience wrapper that assumes 100% success (perfect for tests!)
-void raft_core_advance_all(raft_core_t* r);
+// Memory Management
+void         raft_core_compact(raft_core_t* r, uint64_t compact_index);
 
 raft_state_t raft_core_state(raft_core_t* r);
 uint64_t     raft_core_term(raft_core_t* r);
 uint64_t     raft_core_voted_for(raft_core_t* r);
 uint64_t     raft_core_commit_index(raft_core_t* r);
 uint64_t     raft_core_last_index(raft_core_t* r);
-
-// PHASE 5: Safe timeout management
 bool         raft_core_activity_accepted(raft_core_t* r);
 
 size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
-
-// Compacts the in-memory log, shifting the array left and freeing old entries.
-void raft_core_compact(raft_core_t* r, uint64_t compact_index);
 
 #endif // RAFT_CORE_H

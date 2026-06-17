@@ -15,7 +15,6 @@
 
 #define RAFT_MAX_PEERS 64
 
-// The binary frame for TCP routing
 #pragma pack(push, 1)
 typedef struct {
     uint32_t payload_len;
@@ -31,8 +30,9 @@ typedef struct peer_connection_s peer_connection_t;
 struct peer_connection_s {
     uv_tcp_t handle;
     raft_server_t* server;
-    uint8_t buffer[65536];
+    uint8_t* buffer;      // PHASE 1: Dynamic buffer to handle large frames safely
     size_t buffer_len;
+    size_t buffer_cap;
     uint64_t remote_node_id;
 };
 
@@ -55,8 +55,8 @@ struct raft_node_s {
     uint64_t group_id;
     raft_server_t* server;
 
-    raft_core_t* core;   // THE BRAIN
-    raft_wal_t wal;   // THE DISK
+    raft_core_t* core;
+    raft_wal_t wal;
 
     uint64_t saved_term;
     uint64_t saved_vote;

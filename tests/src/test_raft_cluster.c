@@ -59,9 +59,9 @@ static void on_test_check(uv_timer_t* handle) {
             // Kill its networking, nuke its RAM core, and close its disk handles
             servers[2].network_isolated = true;
 
-            // FIXED: Cleanly close the active libuv handles before destroying the node!
-            uv_close((uv_handle_t*)&nodes[2]->election_timer, NULL);
-            uv_close((uv_handle_t*)&nodes[2]->heartbeat_timer, NULL);
+            // Safely stop the timers instead of asynchronously closing them mid-loop
+            uv_timer_stop(&nodes[2]->election_timer);
+            uv_timer_stop(&nodes[2]->heartbeat_timer);
 
             raft_wal_close(&nodes[2]->wal);
             raft_core_destroy(nodes[2]->core);
@@ -76,13 +76,12 @@ static void on_test_check(uv_timer_t* handle) {
         if (c1 >= 3 && c2 >= 3) {
             printf("[Stage 3] Payload 2 committed by survivors. Resurrecting Node 3 from Disk...\n");
 
-            // FIXED: Allocate a completely fresh block of memory so we don't overwrite
-            // the old libuv timers that are still asynchronous-closing in the background!
-            nodes[2] = calloc(1, sizeof(raft_node_t));
-
             uint64_t peers3[] = {1, 2};
+            // Safely re-initialize the existing node struct
             raft_node_init(nodes[2], &servers[2], 0, peers3, 2);
             servers[2].network_isolated = false;
+
+            printf("[Stage 3] Payload 2 committed by survivors. Resurrecting Node 3 from Disk...\n");
 
             // Reconnect TCP pipes
             raft_server_connect(&servers[2], "127.0.0.1", 18081, 1);
