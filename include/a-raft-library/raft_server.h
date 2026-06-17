@@ -60,6 +60,7 @@ struct raft_node_s {
 
     uint64_t saved_term;
     uint64_t saved_vote;
+    uint64_t saved_applied; // PHASE 2: Application bounds
 
     uv_timer_t election_timer;
     uv_timer_t heartbeat_timer;

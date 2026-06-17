@@ -30,14 +30,27 @@
 * **The Bug:** The scaffolding engine successfully pulled the isolated dependencies, but the host machine's system-level `pkg-config` leaked into the build, forcing CMake to link against stale libraries outside the workspace.
 * **The Fix:** We injected strict overrides for `PKG_CONFIG_PATH` and `CMAKE_PREFIX_PATH` into all Jinja2 build templates, forcing CMake to prioritize the local `repos/install` sandbox exclusively.
 
-### **Phase 2: Disk I/O & Boot Integrity**
+### **Phase 2 Summary: Disk I/O & Boot Integrity**
 
-*These gaps involve how the system writes to and recovers from the physical disk, ensuring it survives hard power loss.*
+#### 1. Purged WAL Boot Failure (Gap 5)
 
-* **5. Purged WAL Boot Failure:** Because we implemented `raft_core_compact` (Gap 2), the WAL will eventually purge old segments. However, `raft_io_boot` currently hardcodes recovery to start at `index 1`. If `index 1` is purged, the node will fail to boot entirely.
-* **6. Incomplete WAL Frame Checksums:** The WAL frame header contains CRC, length, term, index, and type, but the CRC is computed *only* over the payload. A flipped bit in the `term` or `index` metadata will corrupt the timeline silently.
-* **7. Missing CRC Re-Check on Read:** `raft_wal_read_entry` blindly trusts data off the disk without re-validating the CRC.
-* **8. Incomplete HardState Persistence:** The node saves `term` and `voted_for` atomically, but the `commit_index` and `last_applied` bounds are not strictly persisted alongside the snapshots, risking amnesia on crash.
+* **The Bug:** The recovery bootloader (`raft_io_boot`) hardcoded its disk read loop to always start at `index 1`. If the node had successfully compacted its memory and purged older WAL segments (e.g., indexes 1 through 1000 were deleted), the bootloader would immediately fail to find index 1, abort, and permanently brick the node on restart.
+* **The Fix:** We implemented dynamic index discovery. The bootloader now scans the O(1) offset map to find the first surviving, un-purged index on disk. It safely anchors the restoration process at this dynamic index, allowing nodes to reboot seamlessly regardless of how much historical data has been garbage-collected.
+
+#### 2. Full-Frame WAL Checksums (Gap 6)
+
+* **The Bug:** The WAL frame checksum (`crc32`) was previously computed exclusively over the payload data. The 21-byte frame metadata (term, index, type, payload length) was written to disk completely unprotected. A flipped bit in a frame's term or index would silently corrupt the timeline.
+* **The Fix:** We separated the CRC hashing logic into a chainable `crc32_update` function. The `raft_wal_append` function now calculates a continuous cryptographic checksum over both the metadata header and the payload, ensuring the entire block is tamper-proof.
+
+#### 3. Read-Time CRC Validation (Gap 7)
+
+* **The Bug:** While the bootloader verified checksums on startup, runtime disk reads via `raft_wal_read_entry` blindly trusted the bytes returned by the OS without validating them. If disk rot occurred while the node was active, it could accidentally transmit corrupted historical data to a lagging follower.
+* **The Fix:** We added strict read-time verification. `raft_wal_read_entry` now re-computes the full-frame CRC for every fetched entry and compares it to the header's stored CRC. Corrupted entries are safely discarded and reported as missing, forcing the Raft protocol to handle it naturally rather than propagating bad data.
+
+#### 4. Comprehensive HardState Persistence (Gap 8)
+
+* **The Bug:** The node safely persisted the `term` and `voted_for` values atomically to its `.dat` meta-file, but it neglected to track `last_applied`. If a node crashed after applying transactions to the host database but before a new snapshot was taken, it would reboot with `last_applied = 0` and forcefully double-execute historical commands.
+* **The Fix:** We expanded the atomic HardState footprint. The `save_hardstate` function now natively persists the `applied_index` boundary. The bootloader reads this value and locks `r->last_applied` inside the core during restoration, strictly preserving exactly-once application semantics across hard power loss.
 
 ### **Phase 3: Network Liveness & Performance**
 

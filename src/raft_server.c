@@ -14,7 +14,8 @@
 // Forward declarations
 void raft_node_pump(raft_node_t* node);
 
-static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit) {
+// PHASE 2: Added 'applied' to HardState persistence
+static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit, uint64_t applied) {
     char tmp_path[512], meta_path[512], dir_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s/meta_grp%llu.tmp", server->data_dir, group_id);
     snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", server->data_dir, group_id);
@@ -25,7 +26,8 @@ static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t te
 
     if (fwrite(&term, sizeof(uint64_t), 1, f) != 1 ||
         fwrite(&vote, sizeof(uint64_t), 1, f) != 1 ||
-        fwrite(&commit, sizeof(uint64_t), 1, f) != 1) {
+        fwrite(&commit, sizeof(uint64_t), 1, f) != 1 ||
+        fwrite(&applied, sizeof(uint64_t), 1, f) != 1) { // <-- NEW
         fclose(f);
         return false;
     }
@@ -136,14 +138,17 @@ void raft_node_pump(raft_node_t* node) {
     uint64_t current_term = raft_core_term(node->core);
     uint64_t voted_for = raft_core_voted_for(node->core);
     uint64_t commit_idx = raft_core_commit_index(node->core);
+    uint64_t last_applied = raft_core_last_applied(node->core);
 
-    if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx) {
-        if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx)) {
+    // Track the new application bounds securely
+    if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx || last_applied > node->saved_applied) {
+        if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx, last_applied)) {
             fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump to prevent amnesia.\n");
             return;
         }
         node->saved_term = current_term;
         node->saved_vote = voted_for;
+        node->saved_applied = last_applied;
     }
 
     // 3. NETWORK I/O
@@ -363,6 +368,7 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     raft_wal_init(&node->wal, wal_path, 16, 4);
 
     uint64_t saved_commit = 0;
+    uint64_t saved_applied = 0;
     char meta_path[512];
     snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", server->data_dir, group_id);
     FILE* f = fopen(meta_path, "rb");
@@ -370,10 +376,12 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
         if (fread(&node->saved_term, sizeof(uint64_t), 1, f) != 1) node->saved_term = 0;
         if (fread(&node->saved_vote, sizeof(uint64_t), 1, f) != 1) node->saved_vote = 0;
         if (fread(&saved_commit, sizeof(uint64_t), 1, f) != 1) saved_commit = 0;
+        if (fread(&saved_applied, sizeof(uint64_t), 1, f) != 1) saved_applied = 0;
         fclose(f);
     }
 
-    node->core = raft_io_boot(&node->wal, server->physical_node_id, init_peers, num_peers, node->saved_term, node->saved_vote, saved_commit);
+    node->saved_applied = saved_applied;
+    node->core = raft_io_boot(&node->wal, server->physical_node_id, init_peers, num_peers, node->saved_term, node->saved_vote, saved_commit, saved_applied);
 
     uv_timer_init(server->loop, &node->election_timer);
     node->election_timer.data = node;

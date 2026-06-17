@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include "a-raft-library/raft_core.h"
 #include "a-raft-library/raft_io.h"
-#include "a-raft-library/raft_wal.h" // <-- CHANGED
+#include "a-raft-library/raft_wal.h"
 #include "the-macro-library/macro_test.h"
 
 static void cleanup_wal_files(const char* base_path) {
@@ -24,12 +24,12 @@ MACRO_TEST(io_save_and_boot) {
     cleanup_wal_files(wal_path);
 
     uint64_t peers[] = {2, 3};
-    raft_wal_t wal; // <-- CHANGED
+    raft_wal_t wal;
 
-    // Boot the WAL with 16MB segments and 4 standby files
-    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0); // <-- CHANGED
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0, 0);
+    // Add 0 for applied bounds
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
     raft_msg_t hup = { .type = MSG_HUP };
@@ -53,11 +53,11 @@ MACRO_TEST(io_save_and_boot) {
     uint64_t saved_commit = raft_core_commit_index(core);
 
     raft_core_destroy(core);
-    raft_wal_close(&wal); // <-- CHANGED
+    raft_wal_close(&wal);
 
-    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0); // <-- CHANGED
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
-    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1, saved_commit);
+    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1, saved_commit, 0);
 
     MACRO_ASSERT_TRUE(recovered_core != NULL);
     MACRO_ASSERT_EQ_INT(raft_core_term(recovered_core), saved_term);
@@ -67,7 +67,40 @@ MACRO_TEST(io_save_and_boot) {
     MACRO_ASSERT_EQ_INT(ready.num_entries_to_save, 0);
 
     raft_core_destroy(recovered_core);
-    raft_wal_close(&wal); // <-- CHANGED
+    raft_wal_close(&wal);
+    cleanup_wal_files(wal_path);
+}
+
+// PHASE 2: Ensure we don't permanently brick a node if we purged historical segments
+MACRO_TEST(io_boot_with_purged_wal) {
+    const char* wal_path = "/tmp/raft_test_wal_purged";
+    cleanup_wal_files(wal_path);
+
+    raft_wal_t wal;
+    // 1MB segments force heavy rotation
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 2), 0);
+
+    uint8_t dummy[1024] = {0};
+    for (uint64_t i = 1; i <= 2000; i++) {
+        raft_wal_append(&wal, 1, i, 0, dummy, 1024); // Spills into multiple 1MB files
+    }
+    raft_wal_flush_batch(&wal);
+
+    // Purge everything up to index 1000
+    raft_wal_purge_head(&wal, 1000);
+    raft_wal_close(&wal);
+
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 2), 0);
+
+    uint64_t peers[] = {2, 3};
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 1, 0, 1000, 1000);
+    MACRO_ASSERT_TRUE(core != NULL);
+
+    // The WAL safely anchored itself at the first valid, un-purged index!
+    MACRO_ASSERT_TRUE(raft_core_last_index(core) == 2000);
+
+    raft_core_destroy(core);
+    raft_wal_close(&wal);
     cleanup_wal_files(wal_path);
 }
 
@@ -75,6 +108,7 @@ int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
     MACRO_ADD(tests, io_save_and_boot);
+    MACRO_ADD(tests, io_boot_with_purged_wal);
     macro_run_all("raft_io_layer", tests, test_count);
     return 0;
 }

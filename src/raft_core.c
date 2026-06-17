@@ -543,8 +543,10 @@ void raft_core_advance_all(raft_core_t* r) {
     raft_core_advance(r, raft_core_last_index(r), raft_core_commit_index(r));
 }
 
+uint64_t raft_core_last_applied(raft_core_t* r) { return r->last_applied; }
+
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
-                               uint64_t term, uint64_t voted_for, uint64_t commit_index,
+                               uint64_t term, uint64_t voted_for, uint64_t commit_index, uint64_t applied_index,
                                raft_entry_t* entries, size_t num_entries) {
     if (num_entries == 0 || entries == NULL) return NULL;
 
@@ -572,9 +574,8 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
     r->last_saved_index = raft_core_last_index(r);
     r->commit_index = commit_index;
 
-    // PHASE 1: Notice there is NO apply/advance function here anymore!
-    // Booting leaves `last_applied` at 0. The host application will catch up
-    // safely and naturally reconstruct the configuration.
+    // PHASE 2: Lock the application boundary so the host isn't forced to double-execute
+    r->last_applied = applied_index;
 
     return r;
 }
