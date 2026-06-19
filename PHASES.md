@@ -219,3 +219,72 @@
 
 * **The Goal:** Ensure the node handles catastrophic system and network failures gracefully without silent data corruption.
 * **The Validation:** We integrated AddressSanitizer (ASAN), UndefinedBehaviorSanitizer (UBSAN), and ThreadSanitizer (TSAN) runs against deterministic fault injections. The suite actively triggers crashes before/after WAL `fsync`, meta renames, and snapshot renames. It simulates duplicate `InstallSnapshot` payloads, learner promotions during leader failover, and rejected `ReadIndex` responses from stale terms.
+
+### **Phase 12 Summary: Strict Durability & I/O Ordering**
+
+#### 35. Network Responses Preceding HardState Persistence
+
+* **The Bug:** In `raft_node_pump()`, network messages were serialized and transmitted before the `.meta` file (HardState) was written to disk. If a node granted a vote, sent the ACK, and crashed before the disk synced, it would reboot and illegally grant a second vote in the same term.
+* **The Fix:** We instituted a strict ordering barrier inside the pump. The sequence is now strictly: (1) persist new log entries to the WAL, (2) persist HardState and ConfState to the `.meta` file, (3) transmit outbound network messages, (4) apply committed entries to the state machine.
+
+#### 36. Configuration Persistence Race Conditions
+
+* **The Bug:** Topology changes were applied to the core's in-memory state during `raft_core_advance()`, but the pump persisted the `.meta` file *before* calling `advance`. A crash would leave the node with a successfully advanced `last_applied` index but an outdated peer list on disk, causing permanent topology desynchronization on reboot.
+* **The Fix:** Metadata saving was shifted. ConfState (voters, learners, self-role) is now durably flushed to the `.meta` file only *after* the `advance` cycle completes and the application acknowledges the configuration change.
+
+#### 37. Boot-Time Invariant Violations
+
+* **The Bug:** The restorer blindly accepted disk metadata, risking undefined behavior if the disk suffered partial corruption (e.g., `applied_index > commit_index`, or a `snapshot_index` with a missing `snapshot_term`).
+* **The Fix:** We implemented mathematical bounds checking in `raft_io_boot`. The bootloader now formally asserts `snapshot_index <= applied_index <= commit_index` and `commit_index <= last_log_index` (unless equal to `snapshot_index`). Violations immediately trigger a safe fail-closed state rather than booting corrupted consensus.
+
+---
+
+### **Phase 13 Summary: The Snapshot State Machine**
+
+#### 38. Leader Snapshot Omission
+
+* **The Bug:** When a follower fell behind the leader's `snapshot_index`, the leader's `send_append` function simply returned early, abandoning the lagging follower forever.
+* **The Fix:** The leader now actively constructs and dispatches `MSG_INSTALL_SNAPSHOT` when `next_index <= r->snapshot_index`. This payload packages the last-included index, term, configuration metadata, and the durable snapshot bytes.
+
+#### 39. Premature Snapshot Acknowledgments
+
+* **The Bug:** The core set `res.reject = false` immediately upon receiving a snapshot, allowing the leader to advance `match_index` before the follower had actually secured the bytes to disk. If the follower crashed during the write, the cluster would assume it had the data.
+* **The Fix:** Snapshot installation is now a multi-stage application callback. The follower only dispatches a successful `MSG_APPEND_RES` back to the leader *after* the snapshot file is written, checksummed, renamed, and the `.meta` file is `fsync`ed. The WAL is never purged on a failed install.
+
+#### 40. Decoupled Local Compaction
+
+* **The Bug:** Calling `raft_core_compact()` truncated the Raft log in memory without proving that the host application had successfully written a durable snapshot file to cover the deleted history.
+* **The Fix:** Compaction is now a two-step contract. The host application must explicitly create and sync a snapshot file. Only after the application confirms durability does it invoke `raft_core_compact()`, guaranteeing the node can recover using the snapshot alone.
+
+---
+
+### **Phase 14 Summary: Advanced Quorum & Topology Safety**
+
+#### 41. Hostile ReadIndex Responses
+
+* **The Bug:** `MSG_READ_INDEX_RES` was blindly accepted into the read states array without validating the sender, and the leader tallied read ACKs from `MSG_APPEND_RES` even if the response was a rejection.
+* **The Fix:** ReadIndex validation is now hardened. The leader only tallies ACKs if `msg.reject == false`, `msg.term == current_term`, the sender is a recognized active voter, and the response maps to an actively pending read barrier. Stale, forged, or rejected responses are strictly dropped.
+
+#### 42. Unsafe Direct Voter Additions
+
+* **The Bug:** Despite implementing learners, the system still allowed `ENTRY_CONF_ADD` to instantly inject a voting member into the cluster, and promotion was handled via a direct function call rather than a sequenced log entry.
+* **The Fix:** The topology lifecycle is now strictly linear. A node must be added via `ENTRY_CONF_ADD_LEARNER`. It replicates logs until its `match_index` catches up. The leader then proposes an explicit `ENTRY_CONF_PROMOTE_LEARNER` log entry. The learner only gains voting rights once that promotion entry is committed.
+
+#### 43. Ephemeral Self-Removal Roles
+
+* **The Bug:** When a node was removed from the cluster, `removed = true` and `is_learner_self = true` were set in memory, but this status was not explicitly serialized. A reboot would wipe this knowledge, allowing a deposed node to mistakenly campaign for leadership.
+* **The Fix:** The atomic `.meta` payload now explicitly encodes the local node's `removed` and `self-learner` status, permanently quarantining removed nodes even across hard power cycles.
+
+---
+
+### **Phase 15 Summary: Hostile Environment Hardening**
+
+#### 44. Codec Integer Overflow Vulnerabilities
+
+* **The Bug:** In `raft_codec_deserialize_msg`, bounds checks were written as `pos + dlen > len`. A maliciously crafted or corrupted packet with a massive `dlen` (e.g., `UINT32_MAX`) would overflow the integer addition, bypassing the safety check and triggering a massive out-of-bounds heap allocation.
+* **The Fix:** We rewrote all binary boundary assertions to use subtraction-form checks (`if (dlen > len - pos) goto cleanup_error;`), rendering integer overflow attacks mathematically impossible.
+
+#### 45. Shallow WAL Corruption Testing
+
+* **The Bug:** The WAL test suite covered basic truncation and rotation but lacked coverage for deep disk corruption or torn writes.
+* **The Fix:** We introduced the deep corruption matrix to the WAL test suite. The engine now formally verifies its ability to detect and recover from corrupted magic numbers, non-monotonic segment indices, torn frame headers, trailing garbage, and invalid checksums.

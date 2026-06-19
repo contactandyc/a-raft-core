@@ -27,10 +27,14 @@ typedef struct {
 #define RAFT_APPLY_TRANSIENT 1
 #define RAFT_APPLY_FATAL 2
 
-typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
+#define RAFT_SNAPSHOT_OK 0
+#define RAFT_SNAPSHOT_FAILED 1
 
-// PHASE 9: Callback for linearizable read resolution
+typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
 typedef void (*raft_read_cb)(void* ctx, uint64_t read_seq);
+
+// PHASE 13: Callback for the application to ingest snapshot payloads natively
+typedef int (*raft_snapshot_fn)(void* ctx, uint64_t index, uint64_t term, const uint8_t* data, size_t len);
 
 typedef struct raft_node_s raft_node_t;
 typedef struct raft_server_s raft_server_t;
@@ -101,7 +105,9 @@ struct raft_node_s {
     raft_read_cb read_cb;
     void* read_ctx;
 
-    // PHASE 9: Blocked ReadIndex queue waiting for actual_applied_idx >= barrier
+    raft_snapshot_fn snap_cb;
+    void* snap_ctx;
+
     raft_read_state_t pending_reads[128];
     size_t num_pending_reads;
 
@@ -113,9 +119,13 @@ int  raft_server_listen(raft_server_t* server, const char* ip, int port);
 void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64_t target_node_id);
 
 void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers,
-                    raft_apply_fn apply_cb, void* apply_ctx, raft_read_cb read_cb, void* read_ctx);
+                    raft_apply_fn apply_cb, void* apply_ctx, raft_read_cb read_cb, void* read_ctx,
+                    raft_snapshot_fn snap_cb, void* snap_ctx);
 
 int  raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id);
 int  raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_leader_id);
+
+// PHASE 13: Two-step decoupled API. App generates durable snapshot, then orders Raft to compact history safely.
+int  raft_node_compact(raft_node_t* node, uint64_t compact_index);
 
 #endif // RAFT_SERVER_H

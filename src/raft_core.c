@@ -71,6 +71,11 @@ struct raft_core_s {
     bool pending_snapshot;
     uint8_t* pending_snapshot_data;
     size_t pending_snapshot_len;
+
+    // PHASE 13: Staged snapshot identifiers awaiting application validation
+    uint64_t pending_snapshot_from;
+    uint64_t pending_snapshot_msg_index;
+    uint64_t pending_snapshot_msg_term;
 };
 
 static void send_msg(raft_core_t* r, raft_msg_t msg) {
@@ -145,23 +150,28 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
     uint64_t next = r->next_index[peer_idx];
     uint64_t last = raft_core_last_index_internal(r);
 
-    if (next <= r->snapshot_index) return;
+    // PHASE 13: Active Leader Snapshot Rescue Dispatch
+    if (next <= r->snapshot_index) {
+        raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
+                           .index = r->snapshot_index, .log_term = r->snapshot_term };
+        send_msg(r, msg);
+        return;
+    }
 
     raft_msg_t msg = { .type = MSG_APPEND_ENTRIES, .to = peer_id, .term = r->current_term,
                        .index = next - 1, .log_term = log_term(r, next - 1), .commit = r->commit_index,
                        .read_seq = r->current_read_seq };
 
     size_t num_entries = last >= next ? last - next + 1 : 0;
-    if (num_entries > 500) num_entries = 500; // Hard cap on object count
+    if (num_entries > 500) num_entries = 500;
 
-    // PHASE 10: Byte-Bounded Batching (Cap payload frame size strictly to 1MB)
     size_t batch_bytes = 0;
     size_t actual_entries = 0;
     for (size_t i = 0; i < num_entries; i++) {
         raft_entry_t* src = log_get(r, next + i);
         if (!src) break;
         if (batch_bytes + src->data_len > 1048576) {
-            if (actual_entries == 0) actual_entries = 1; // Guarantee progress on massive entries
+            if (actual_entries == 0) actual_entries = 1;
             break;
         }
         batch_bytes += src->data_len;
@@ -708,8 +718,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
             } else if (msg->index < r->snapshot_index) {
                 res.reject = true;
                 res.index = r->snapshot_index;
-
-                // PHASE 10: Deep Conflict Hint triggers InstallSnapshot instantly
                 res.conflict_term = 0;
                 res.conflict_index = r->snapshot_index + 1;
             } else {
@@ -737,59 +745,33 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         send_msg(r, res);
     }
     else if (msg->type == MSG_INSTALL_SNAPSHOT) {
-        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
-
         if (msg->term >= r->current_term) {
             r->state = RAFT_STATE_FOLLOWER;
             r->activity_accepted = true;
 
+            // PHASE 13: Deferred Snapshot Execution. Mutate memory only after Pump ACKs durability.
             if (msg->index > r->snapshot_index) {
-                bool suffix_match = false;
-                uint64_t my_last_idx = raft_core_last_index_internal(r);
-                if (msg->index <= my_last_idx && log_term(r, msg->index) == msg->log_term) {
-                    suffix_match = true;
-                }
-
-                if (suffix_match) {
-                    size_t keep_len = my_last_idx - msg->index + 1;
-                    for (uint64_t i = r->snapshot_index + 1; i <= msg->index; i++) {
-                        raft_entry_t* e = log_get(r, i);
-                        if (e && e->data) free(e->data);
-                    }
-                    memmove(&r->log[1], &r->log[msg->index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
-                    r->log_len = keep_len;
-                } else {
-                    for (size_t i = 0; i < r->log_len; i++) {
-                        if (r->log[i].data) free(r->log[i].data);
-                    }
-                    r->log_len = 1;
-                }
-
-                r->snapshot_index = msg->index;
-                r->snapshot_term = msg->log_term;
-                r->log[0].index = msg->index;
-                r->log[0].term = msg->log_term;
-                r->log[0].data = NULL;
-                r->log[0].data_len = 0;
-
                 r->pending_snapshot = true;
+                r->pending_snapshot_from = msg->from;
+                r->pending_snapshot_msg_index = msg->index;
+                r->pending_snapshot_msg_term = msg->log_term;
+
                 if (r->pending_snapshot_data) free(r->pending_snapshot_data);
                 r->pending_snapshot_data = msg->snapshot_len > 0 ? malloc(msg->snapshot_len) : NULL;
                 if (msg->snapshot_len > 0 && r->pending_snapshot_data) {
                     memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
                 }
                 r->pending_snapshot_len = msg->snapshot_len;
-
-                // PHASE 11 FIX: Only ACK if the snapshot was actually installed!
-                res.reject = false;
-                res.index = msg->index;
             } else {
-                // PHASE 11 FIX: Explicitly reject redundant snapshots
-                res.reject = true;
-                res.index = r->snapshot_index;
+                // If it's an old snapshot, just ACK it instantly to suppress re-transmissions
+                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
+                send_msg(r, res);
             }
+        } else {
+            // Stale Term Rejection
+            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
+            send_msg(r, res);
         }
-        send_msg(r, res);
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
@@ -896,6 +878,55 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     }
 }
 
+// PHASE 13: Safe snapshot integration. Only called by the pump if NVMe fsyncs pass!
+void raft_core_snapshot_acked(raft_core_t* r, bool success) {
+    if (!r->pending_snapshot) return;
+
+    if (success) {
+        bool suffix_match = false;
+        uint64_t my_last_idx = raft_core_last_index_internal(r);
+
+        if (r->pending_snapshot_msg_index <= my_last_idx && log_term(r, r->pending_snapshot_msg_index) == r->pending_snapshot_msg_term) {
+            suffix_match = true;
+        }
+
+        if (suffix_match) {
+            size_t keep_len = my_last_idx - r->pending_snapshot_msg_index + 1;
+            for (uint64_t i = r->snapshot_index + 1; i <= r->pending_snapshot_msg_index; i++) {
+                raft_entry_t* e = log_get(r, i);
+                if (e && e->data) free(e->data);
+            }
+            memmove(&r->log[1], &r->log[r->pending_snapshot_msg_index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
+            r->log_len = keep_len;
+        } else {
+            for (size_t i = 0; i < r->log_len; i++) {
+                if (r->log[i].data) free(r->log[i].data);
+            }
+            r->log_len = 1;
+        }
+
+        r->snapshot_index = r->pending_snapshot_msg_index;
+        r->snapshot_term = r->pending_snapshot_msg_term;
+        r->log[0].index = r->snapshot_index;
+        r->log[0].term = r->snapshot_term;
+        r->log[0].data = NULL;
+        r->log[0].data_len = 0;
+
+        if (r->last_saved_index < r->snapshot_index) r->last_saved_index = r->snapshot_index;
+        if (r->commit_index < r->snapshot_index) r->commit_index = r->snapshot_index;
+        if (r->last_applied < r->snapshot_index) r->last_applied = r->snapshot_index;
+    }
+
+    raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
+                       .reject = !success, .index = success ? r->snapshot_index : raft_core_last_index_internal(r) };
+    send_msg(r, res);
+
+    if (r->pending_snapshot_data) free(r->pending_snapshot_data);
+    r->pending_snapshot_data = NULL;
+    r->pending_snapshot_len = 0;
+    r->pending_snapshot = false;
+}
+
 raft_ready_t raft_core_get_ready(raft_core_t* r) {
     raft_ready_t ready;
     memset(&ready, 0, sizeof(ready));
@@ -903,11 +934,8 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     ready.messages = r->msg_queue;
     ready.num_messages = r->msg_queue_len;
 
-    // 1. Clamp the save boundary to prevent fetching purged prefixes
     uint64_t save_from = r->last_saved_index;
-    if (save_from < r->snapshot_index) {
-        save_from = r->snapshot_index;
-    }
+    if (save_from < r->snapshot_index) save_from = r->snapshot_index;
 
     uint64_t last_idx = raft_core_last_index_internal(r);
     if (last_idx > save_from) {
@@ -922,11 +950,8 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
         }
     }
 
-    // 2. Clamp the apply boundary to prevent fetching purged prefixes
     uint64_t apply_from = r->last_applied;
-    if (apply_from < r->snapshot_index) {
-        apply_from = r->snapshot_index;
-    }
+    if (apply_from < r->snapshot_index) apply_from = r->snapshot_index;
 
     if (r->commit_index > apply_from) {
         size_t count = r->commit_index - apply_from;
@@ -943,9 +968,10 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     ready.read_states = r->read_states;
     ready.num_read_states = r->num_read_states;
 
+    // PHASE 13: Export staged payload to pump for installation
     ready.install_snapshot = r->pending_snapshot;
-    ready.snapshot_index = r->snapshot_index;
-    ready.snapshot_term = r->snapshot_term;
+    ready.snapshot_index = r->pending_snapshot_msg_index;
+    ready.snapshot_term = r->pending_snapshot_msg_term;
     ready.snapshot_data = r->pending_snapshot_data;
     ready.snapshot_len = r->pending_snapshot_len;
 
@@ -953,17 +979,6 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
 }
 
 void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index) {
-    if (r->pending_snapshot) {
-        if (r->last_saved_index < r->snapshot_index) r->last_saved_index = r->snapshot_index;
-        if (r->commit_index < r->snapshot_index) r->commit_index = r->snapshot_index;
-        if (r->last_applied < r->snapshot_index) r->last_applied = r->snapshot_index;
-
-        if (r->pending_snapshot_data) free(r->pending_snapshot_data);
-        r->pending_snapshot_data = NULL;
-        r->pending_snapshot_len = 0;
-        r->pending_snapshot = false;
-    }
-
     if (saved_index > r->last_saved_index) r->last_saved_index = saved_index;
 
     for(uint64_t i = r->last_applied + 1; i <= applied_index; i++) {
@@ -1080,7 +1095,6 @@ void raft_core_promote_learner(raft_core_t* r, uint64_t peer_id) {
     }
 }
 
-// PHASE 10: Holistic backpressure byte calculation
 uint64_t raft_core_uncommitted_bytes(raft_core_t* r) {
     uint64_t bytes = 0;
     uint64_t last = raft_core_last_index_internal(r);

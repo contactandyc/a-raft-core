@@ -112,6 +112,9 @@ void         raft_core_advance_all(raft_core_t* r);
 
 void         raft_core_compact(raft_core_t* r, uint64_t compact_index);
 
+// PHASE 13: Pump-deferred acknowledgement API
+void         raft_core_snapshot_acked(raft_core_t* r, bool success);
+
 raft_state_t raft_core_state(raft_core_t* r);
 uint64_t     raft_core_term(raft_core_t* r);
 uint64_t     raft_core_voted_for(raft_core_t* r);
@@ -129,8 +132,6 @@ void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
 size_t       raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners);
 uint64_t     raft_core_snapshot_index(raft_core_t* r);
 uint64_t     raft_core_snapshot_term(raft_core_t* r);
-
-// PHASE 10: Holistic backpressure byte extractor
 uint64_t     raft_core_uncommitted_bytes(raft_core_t* r);
 
 #endif // RAFT_CORE_H

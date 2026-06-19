@@ -5,12 +5,28 @@
 
 #include "a-raft-library/raft_io.h"
 #include "a-memory-library/aml_alloc.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                           uint64_t* loaded_peers, bool* loaded_learners, size_t num_peers,
                           uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit, uint64_t saved_applied,
                           uint64_t snapshot_index, uint64_t snapshot_term) {
+
+    // PHASE 12: Strict Boot-Time Invariant Assertions
+    // Prevent the node from booting if the disk suffered partial sector corruption
+    if (saved_applied < snapshot_index || saved_commit < saved_applied) {
+        fprintf(stderr, "[FATAL] Boot invariant failed: snapshot_index <= applied_index <= commit_index violated.\n");
+        return NULL;
+    }
+    if (snapshot_index > 0 && snapshot_term == 0) {
+        fprintf(stderr, "[FATAL] Boot invariant failed: valid snapshot lacks a corresponding snapshot_term.\n");
+        return NULL;
+    }
+    if (wal->max_disk_index > 0 && saved_commit > wal->max_disk_index && saved_commit != snapshot_index) {
+        fprintf(stderr, "[FATAL] Boot invariant failed: commit_index exceeds WAL bounds.\n");
+        return NULL;
+    }
 
     uint64_t start_idx = snapshot_index + 1;
     if (wal->max_disk_index > 0) {
