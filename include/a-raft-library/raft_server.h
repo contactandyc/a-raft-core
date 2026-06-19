@@ -31,20 +31,19 @@ typedef struct known_peer_s known_peer_t;
 struct peer_connection_s {
     uv_tcp_t handle;
     raft_server_t* server;
-    known_peer_t* kp; // PHASE 3: Link back to persistent anchor
+    known_peer_t* kp;
     uint8_t* buffer;
     size_t buffer_len;
     size_t buffer_cap;
     uint64_t remote_node_id;
 };
 
-// PHASE 3 (Gap 11): Persistent peer anchors for reconnections & outbound queues
 struct known_peer_s {
     raft_server_t* server;
     uint64_t node_id;
     char ip[64];
     int port;
-    peer_connection_t* conn; // NULL if disconnected
+    peer_connection_t* conn;
     uv_timer_t reconnect_timer;
 
     uint8_t* out_queue;
@@ -61,7 +60,7 @@ struct raft_server_s {
     uint32_t max_groups;
     raft_node_t** groups;
 
-    known_peer_t* known_peers[RAFT_MAX_PEERS]; // PHASE 3
+    known_peer_t* known_peers[RAFT_MAX_PEERS];
     uint32_t known_peer_count;
 
     peer_connection_t* active_peers[RAFT_MAX_PEERS];
@@ -91,5 +90,8 @@ void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64
 
 void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers);
 void raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len);
+
+// PHASE 4 (Gap 13): Expose safe linearizable read interface
+void raft_node_read_index(raft_node_t* node, uint64_t read_seq);
 
 #endif // RAFT_SERVER_H

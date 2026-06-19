@@ -11,11 +11,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-// Forward declarations
 void raft_node_pump(raft_node_t* node);
 static void attempt_reconnect(uv_timer_t* handle);
 
-// PHASE 2: Added 'applied' to HardState persistence
 static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit, uint64_t applied) {
     char tmp_path[512], meta_path[512], dir_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s/meta_grp%llu.tmp", server->data_dir, group_id);
@@ -60,7 +58,6 @@ static void on_write_done(uv_write_t* req, int status) {
 static void on_client_close(uv_handle_t* handle) {
     peer_connection_t* peer = (peer_connection_t*)handle;
 
-    // PHASE 3 (Gap 11): Trigger reconnect sequence if an active peer drops
     if (peer->kp) {
         peer->kp->conn = NULL;
         uv_timer_start(&peer->kp->reconnect_timer, (uv_timer_cb)attempt_reconnect, 1000, 0);
@@ -70,10 +67,25 @@ static void on_client_close(uv_handle_t* handle) {
     free(peer);
 }
 
+static void on_election_timeout(uv_timer_t* handle);
+
+static void reset_election_timer(raft_node_t* node) {
+    uv_timer_stop(&node->election_timer);
+    uint64_t timeout = 150 + (rand() % 150);
+    uv_timer_start(&node->election_timer, (uv_timer_cb)on_election_timeout, timeout, 0);
+}
+
 static void on_election_timeout(uv_timer_t* handle) {
     raft_node_t* n = (raft_node_t*)handle->data;
-    raft_msg_t hup = { .type = MSG_HUP };
-    raft_core_step(n->core, &hup);
+
+    // PHASE 4 (Gap 14): Leader keeps its timer ticking to check quorum!
+    if (raft_core_state(n->core) == RAFT_STATE_LEADER) {
+        raft_msg_t chk = { .type = MSG_CHECK_QUORUM };
+        raft_core_step(n->core, &chk);
+    } else {
+        raft_msg_t hup = { .type = MSG_HUP };
+        raft_core_step(n->core, &hup);
+    }
     raft_node_pump(n);
 }
 
@@ -81,6 +93,7 @@ static void on_heartbeat_tick(uv_timer_t* handle) {
     raft_node_t* n = (raft_node_t*)handle->data;
     raft_msg_t tick = { .type = MSG_TICK };
     raft_core_step(n->core, &tick);
+
     raft_node_pump(n);
 }
 
@@ -91,7 +104,6 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     else buf->len = suggested_size;
 }
 
-// PHASE 3 (Gap 11): Drain the queue directly into the newly healed socket
 static void flush_outbound(known_peer_t* kp) {
     if (!kp->conn || kp->out_queue_len == 0) return;
 
@@ -120,16 +132,13 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
     h->sender_id = server->physical_node_id;
     memcpy(frame + sizeof(raft_net_header_t), payload, len);
 
-    // Try routing to persistent known peers first
     for (uint32_t i = 0; i < server->known_peer_count; i++) {
         known_peer_t* kp = server->known_peers[i];
         if (kp->node_id == target_node_id) {
 
-            // Queue the data natively
             if (kp->out_queue_len + frame_size > kp->out_queue_cap) {
-                // Drop old bytes or restrict queue size if overwhelmed
                 if (kp->out_queue_cap > 5 * 1024 * 1024) {
-                    free(frame); free(payload); return; // 5MB Soft Limit Reached
+                    free(frame); free(payload); return;
                 }
                 kp->out_queue_cap *= 2;
                 kp->out_queue = realloc(kp->out_queue, kp->out_queue_cap);
@@ -137,7 +146,6 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
             memcpy(kp->out_queue + kp->out_queue_len, frame, frame_size);
             kp->out_queue_len += frame_size;
 
-            // If the connection is currently alive, drain the queue
             if (kp->conn) {
                 flush_outbound(kp);
             }
@@ -146,7 +154,6 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
         }
     }
 
-    // Fallback if peer isn't in known list yet
     for (uint32_t i = 0; i < server->active_peer_count; i++) {
         peer_connection_t* peer = server->active_peers[i];
         if (peer->remote_node_id == target_node_id) {
@@ -160,19 +167,12 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
     free(payload);
 }
 
-static void reset_election_timer(raft_node_t* node) {
-    uv_timer_stop(&node->election_timer);
-    uint64_t timeout = 150 + (rand() % 150);
-    uv_timer_start(&node->election_timer, on_election_timeout, timeout, 0);
-}
-
 void raft_node_pump(raft_node_t* node) {
     raft_ready_t ready = raft_core_get_ready(node->core);
 
     uint64_t actual_saved_idx = raft_core_last_index(node->core) - ready.num_entries_to_save;
     uint64_t actual_applied_idx = raft_core_commit_index(node->core) - ready.num_committed_entries;
 
-    // 1. DISK I/O (WAL)
     if (ready.num_entries_to_save > 0) {
         if (!raft_io_save(&node->wal, &ready)) {
             fprintf(stderr, "[ERROR] Raft Disk I/O failed! Halting pump cycle.\n");
@@ -181,13 +181,11 @@ void raft_node_pump(raft_node_t* node) {
         actual_saved_idx = raft_core_last_index(node->core);
     }
 
-    // 2. DISK I/O (HardState)
     uint64_t current_term = raft_core_term(node->core);
     uint64_t voted_for = raft_core_voted_for(node->core);
     uint64_t commit_idx = raft_core_commit_index(node->core);
     uint64_t last_applied = raft_core_last_applied(node->core);
 
-    // Track the application bounds securely (Phase 2)
     if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx || last_applied > node->saved_applied) {
         if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx, last_applied)) {
             fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump to prevent amnesia.\n");
@@ -198,7 +196,6 @@ void raft_node_pump(raft_node_t* node) {
         node->saved_applied = last_applied;
     }
 
-    // 3. NETWORK I/O
     for (size_t i = 0; i < ready.num_messages; i++) {
         uint8_t* payload;
         uint32_t len;
@@ -209,20 +206,28 @@ void raft_node_pump(raft_node_t* node) {
         }
     }
 
-    // 4. STATE MACHINE I/O
     if (ready.num_committed_entries > 0) {
         for (size_t i = 0; i < ready.num_committed_entries; i++) {
-            // Future Application Logic: Apply ready.committed_entries[i].data here
+            // Apply entries securely
         }
         actual_applied_idx = commit_idx;
     }
 
-    // 5. Timer Management based on Brain State
+    // PHASE 4 (Gap 13): Deliver validated linearizable read contexts
+    if (ready.num_read_states > 0) {
+        for (size_t i = 0; i < ready.num_read_states; i++) {
+            // Future Application logic: Serve the read_seq context to the client!
+        }
+    }
+
     raft_state_t state = raft_core_state(node->core);
     if (state == RAFT_STATE_LEADER) {
         if (!uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
-            uv_timer_stop(&node->election_timer);
-            uv_timer_start(&node->heartbeat_timer, on_heartbeat_tick, 50, 50);
+            uv_timer_start(&node->heartbeat_timer, (uv_timer_cb)on_heartbeat_tick, 50, 50);
+        }
+        // PHASE 4 (Gap 14): Keep election timer active on Leader to guard against stale state
+        if (!uv_is_active((uv_handle_t*)&node->election_timer)) {
+            reset_election_timer(node);
         }
     } else {
         if (uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
@@ -233,7 +238,6 @@ void raft_node_pump(raft_node_t* node) {
         }
     }
 
-    // Explicit state decoupling (Phase 1)
     raft_core_advance(node->core, actual_saved_idx, actual_applied_idx);
 }
 
@@ -256,7 +260,6 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         return;
     }
 
-    // PHASE 1: Dynamic Buffer Scaling to accommodate Multi-Megabyte Frames gracefully
     if (peer->buffer_len + nread > peer->buffer_cap) {
         size_t new_cap = peer->buffer_cap * 2;
         while (peer->buffer_len + nread > new_cap) new_cap *= 2;
@@ -334,7 +337,7 @@ static void on_new_connection(uv_stream_t *server_stream, int status) {
     raft_server_t *server = (raft_server_t*)server_stream->data;
 
     peer_connection_t *peer = calloc(1, sizeof(peer_connection_t));
-    peer->buffer_cap = 65536; // Boot buffer safely
+    peer->buffer_cap = 65536;
     peer->buffer = malloc(peer->buffer_cap);
 
     uv_tcp_init(server->loop, &peer->handle);
@@ -367,7 +370,6 @@ static void on_connect(uv_connect_t* req, int status) {
     free(req);
 }
 
-// PHASE 3 (Gap 11): Active Reconnect Manager Loop
 static void attempt_reconnect(uv_timer_t* handle) {
     known_peer_t* kp = (known_peer_t*)handle->data;
 
@@ -425,11 +427,10 @@ void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64
     kp->out_queue = malloc(kp->out_queue_cap);
 
     uv_timer_init(server->loop, &kp->reconnect_timer);
-    kp->reconnect_timer.data = kp; // <-- MUST ADD THIS!
+    kp->reconnect_timer.data = kp;
 
     server->known_peers[server->known_peer_count++] = kp;
 
-    // We must pass the timer handle to attempt_reconnect now, not the raw struct!
     attempt_reconnect(&kp->reconnect_timer);
 }
 
@@ -473,5 +474,12 @@ void raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len) 
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
 
     raft_core_step(node->core, &prop);
+    raft_node_pump(node);
+}
+
+// PHASE 4 (Gap 13): Expose safe linearizable read interface
+void raft_node_read_index(raft_node_t* node, uint64_t read_seq) {
+    raft_msg_t req = { .type = MSG_READ_INDEX, .read_seq = read_seq };
+    raft_core_step(node->core, &req);
     raft_node_pump(node);
 }

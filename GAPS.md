@@ -75,19 +75,28 @@
 
 ---
 
-### **Phase 4: Advanced Protocol Features (Pending)**
+### **Phase 4 Summary: Advanced Protocol Features**
 
-*These are required for zero-downtime operations and strict read safety.*
+#### 12. Partial Membership Changes (Learners & Stepdowns)
 
-* **12. Partial Membership Changes:** The code lacks joint consensus, leader self-removal stepdown, and `LEARNER` roles. Adding an empty node currently drops write availability because quorum sizes increase before the new node has downloaded the history.
-* **13. Missing Safe Read Protocol (ReadIndex):** To do a linearizable read right now, clients must propose a dummy write. The implementation needs `ReadIndex` so the leader can verify its authority via memory heartbeats without hitting the disk.
-* **14. Missing Check-Quorum (Stale Leader Guard):** A leader in a minority partition will never see a higher term, so it remains `RAFT_STATE_LEADER` forever. While it cannot commit writes (write-safe), it *can* serve stale reads to clients unless it tracks heartbeats and voluntarily steps down.
+* **The Bug:** The cluster lacked joint consensus and non-voting ingestion capabilities. If a new, empty node was added, the global quorum size instantly increased, causing a complete drop in write availability until the new node finished downloading the entire historical log. Furthermore, if a leader was removed from the cluster, it didn't know how to step down.
+* **The Fix:** We implemented `ENTRY_CONF_ADD_LEARNER` and dynamic topology parsing. New nodes now join as `LEARNER`s, securely syncing the state machine without participating in elections or stalling the commit quorum. Once caught up, they can be seamlessly promoted. We also added self-removal logic so a leader will gracefully step down to a follower if it is voted out of the cluster.
+
+#### 13. Strict Linearizable Reads (ReadIndex)
+
+* **The Bug:** To ensure a read was not served by a stale, isolated leader, clients were previously forced to propose a dummy "write" to the physical disk. This choked read throughput by tying it directly to disk IOPS.
+* **The Fix:** We implemented the `ReadIndex` protocol. The leader now buffers incoming read requests, snapshots its current `commit_index`, and relies on its lightweight memory heartbeats to confirm it still holds a quorum. Once the quorum ACKs the heartbeat, the leader echoes the client's `read_seq` context back to the application layer, guaranteeing a linearizable, disk-free read.
+
+#### 14. Check-Quorum (Stale Leader Guard)
+
+* **The Bug:** If a network partition separated the leader from the majority of the cluster, the isolated leader would never see a higher term and would remain in `RAFT_STATE_LEADER` forever. While it couldn't commit *new* writes, it could potentially serve stale, outdated reads to any clients trapped in its partition.
+* **The Fix:** We implemented an active Check-Quorum heartbeat guard. The leader now tracks a `recent_active` array for all network traffic. Instead of ignoring its own election timer, the leader now uses it to periodically execute a `MSG_CHECK_QUORUM` routine. If it realizes it hasn't heard from a majority of the cluster within the election window, it autonomously steps down, actively protecting clients from stale reads.
 
 ---
 
 ### **Phase 5: API, Limits, and Polish (Pending)**
 
-*These are necessary to expose the library to end-users safely.*
+*This is the final phase! These gaps involve exposing the library to end-users safely.*
 
 * **15. No Backpressure Mechanisms:** `raft_node_propose` accepts unbounded payloads. There are no limits on in-flight append bytes or client queues, risking OOM if clients push data faster than the disks can sync.
 * **16. Client Retry Deduplication:** If the leader crashes after committing a write but before responding to the client, the client will retry. Without a sequence/ID deduplicator, the write executes twice.

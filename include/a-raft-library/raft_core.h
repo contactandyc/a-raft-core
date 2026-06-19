@@ -12,7 +12,7 @@
 
 typedef enum {
     RAFT_STATE_FOLLOWER,
-    RAFT_STATE_PRE_CANDIDATE, // PHASE 3: Gap 10
+    RAFT_STATE_PRE_CANDIDATE,
     RAFT_STATE_CANDIDATE,
     RAFT_STATE_LEADER
 } raft_state_t;
@@ -25,15 +25,19 @@ typedef enum {
     MSG_APPEND_RES,
     MSG_REQUEST_VOTE,
     MSG_REQUEST_VOTE_RES,
-    MSG_PRE_VOTE,         // PHASE 3: Gap 10
-    MSG_PRE_VOTE_RES,     // PHASE 3: Gap 10
-    MSG_INSTALL_SNAPSHOT
+    MSG_PRE_VOTE,
+    MSG_PRE_VOTE_RES,
+    MSG_INSTALL_SNAPSHOT,
+    MSG_CHECK_QUORUM,     // PHASE 4 (Gap 14): Stale Leader Guard
+    MSG_READ_INDEX,       // PHASE 4 (Gap 13): Linearizable Reads
+    MSG_READ_INDEX_RES
 } msg_type_t;
 
 typedef enum {
     ENTRY_NORMAL = 0,
     ENTRY_CONF_ADD = 1,
-    ENTRY_CONF_REMOVE = 2
+    ENTRY_CONF_REMOVE = 2,
+    ENTRY_CONF_ADD_LEARNER = 3 // PHASE 4 (Gap 12): Non-Voting Ingestion
 } entry_type_t;
 
 typedef struct {
@@ -53,9 +57,11 @@ typedef struct {
     uint64_t index;
     uint64_t commit;
 
-    // PHASE 3 (Gap 9): Conflict Hints for O(1) Backtracking
     uint64_t conflict_term;
     uint64_t conflict_index;
+
+    // PHASE 4 (Gap 13): Sequence tracker for Safe Reads
+    uint64_t read_seq;
 
     raft_entry_t* entries;
     size_t num_entries;
@@ -66,6 +72,12 @@ typedef struct {
     bool reject;
 } raft_msg_t;
 
+// PHASE 4 (Gap 13): Notifies host application exactly when a local read is linearizable
+typedef struct {
+    uint64_t index;
+    uint64_t read_seq;
+} raft_read_state_t;
+
 typedef struct {
     raft_msg_t* messages;
     size_t num_messages;
@@ -75,6 +87,9 @@ typedef struct {
 
     raft_entry_t* committed_entries;
     size_t num_committed_entries;
+
+    raft_read_state_t* read_states; // PHASE 4 (Gap 13)
+    size_t num_read_states;
 } raft_ready_t;
 
 typedef struct raft_core_s raft_core_t;
@@ -103,5 +118,9 @@ uint64_t     raft_core_last_applied(raft_core_t* r);
 bool         raft_core_activity_accepted(raft_core_t* r);
 
 size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
+
+// PHASE 4 (Gap 12): Learner APIs
+void         raft_core_add_learner(raft_core_t* r, uint64_t peer_id);
+void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
 
 #endif // RAFT_CORE_H

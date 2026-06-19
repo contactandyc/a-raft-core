@@ -1608,6 +1608,129 @@ MACRO_TEST(raft_pre_vote_prevents_disruption) {
     raft_core_destroy(r);
 }
 
+MACRO_TEST(raft_learner_does_not_vote_or_count_in_quorum) {
+    uint64_t peers[] = {2};
+    raft_core_t* r = raft_core_create(1, peers, 1);
+    raft_core_add_learner(r, 3); // Node 3 is a Learner
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &vote);
+    raft_core_advance_all(r);
+
+    // FIX: Node 2 must ACK the leader's No-Op to establish the initial commit quorum!
+    raft_msg_t ack2_noop = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 1 };
+    raft_core_step(r, &ack2_noop);
+    MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 1);
+
+    // Propose the actual payload
+    raft_entry_t e_data = { .term = 1, .index = 2, .type = ENTRY_NORMAL, .data = (uint8_t*)"x", .data_len = 1 };
+    raft_msg_t p_data = { .type = MSG_PROPOSE, .entries = &e_data, .num_entries = 1 };
+    raft_core_step(r, &p_data);
+    raft_core_advance_all(r);
+
+    // Learner (Node 3) ACKs the payload
+    raft_msg_t ack3 = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = false, .index = 2 };
+    raft_core_step(r, &ack3);
+
+    // Learner ACK does NOT safely advance the commit_index to 2! It stays at 1.
+    MACRO_ASSERT_EQ_INT(raft_core_commit_index(r), 1);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_read_index_success_on_heartbeat_quorum) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &vote);
+    raft_core_advance_all(r);
+
+    // Propose an entry to assert authority for the term
+    raft_entry_t e = { .data = (uint8_t*)"x", .data_len = 1 };
+    raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+    raft_core_step(r, &p);
+    raft_core_advance_all(r);
+    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_core_step(r, &ack2);
+    raft_core_advance_all(r);
+
+    // Fire the ReadIndex pipeline (Phase 4)
+    raft_msg_t ri = { .type = MSG_READ_INDEX, .read_seq = 12345 };
+    raft_core_step(r, &ri);
+    raft_core_advance_all(r);
+
+    // Provide proof of life via an empty append ACK mimicking a heartbeat response
+    raft_msg_t ack3 = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = false, .index = 2, .read_seq = 1 };
+    raft_core_step(r, &ack3);
+
+    raft_ready_t ready = raft_core_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_read_states, 1);
+    MACRO_ASSERT_EQ_INT(ready.read_states[0].read_seq, 12345);
+    MACRO_ASSERT_EQ_INT(ready.read_states[0].index, 2);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_check_quorum_steps_down_stale_leader) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &vote);
+    raft_core_advance_all(r);
+
+    // First CheckQuorum validates successfully because votes registered network activity
+    raft_msg_t chk = { .type = MSG_CHECK_QUORUM };
+    raft_core_step(r, &chk);
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
+
+    // Second CheckQuorum fails! The active flags were cleared and no new pings arrived.
+    raft_core_step(r, &chk);
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_FOLLOWER);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_leader_stepdown_on_self_removal) {
+    uint64_t peers[] = {2};
+    raft_core_t* r = raft_core_create(1, peers, 1);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &vote);
+    raft_core_advance_all(r);
+
+    uint64_t rm_node = 1; // Leader votes itself out
+    raft_entry_t e = { .term = 1, .index = 2, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+    raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+    raft_core_step(r, &p);
+
+    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_core_step(r, &ack2);
+
+    raft_core_advance_all(r); // Conf processes natively on advance
+
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_FOLLOWER);
+
+    raft_core_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1678,6 +1801,10 @@ int main(void) {
     MACRO_ADD(tests, raft_follower_tick_does_nothing);
     MACRO_ADD(tests, raft_leader_tick_sends_pending_entries_to_lagging_peer);
     MACRO_ADD(tests, raft_pre_vote_prevents_disruption);
+    MACRO_ADD(tests, raft_learner_does_not_vote_or_count_in_quorum);
+    MACRO_ADD(tests, raft_read_index_success_on_heartbeat_quorum);
+    MACRO_ADD(tests, raft_check_quorum_steps_down_stale_leader);
+    MACRO_ADD(tests, raft_leader_stepdown_on_self_removal);
 
     macro_run_all("raft_core", tests, test_count);
     return 0;

@@ -57,10 +57,6 @@ static void on_test_check(uv_timer_t* handle) {
 
             // Kill its networking logically without destroying the memory bounds
             servers[2].network_isolated = true;
-            for(uint32_t i = 0; i < servers[2].active_peer_count; i++) {
-                uv_close((uv_handle_t*)&servers[2].active_peers[i]->handle, NULL);
-            }
-            servers[2].active_peer_count = 0;
 
             // Propose new data while it is isolated
             raft_node_propose(leader, (const uint8_t*)"PAYLOAD_2", 9);
