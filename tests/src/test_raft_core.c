@@ -1750,6 +1750,9 @@ MACRO_TEST(raft_fault_duplicate_snapshot_install_is_safe) {
     raft_ready_t rd1 = raft_core_get_ready(r);
     MACRO_ASSERT_TRUE(rd1.install_snapshot);
     MACRO_ASSERT_EQ_INT(rd1.snapshot_index, 100);
+
+    // PHASE 13 FIX: Actively ACK the snapshot to officially commit it to core memory!
+    raft_core_snapshot_acked(r, true);
     raft_core_advance_all(r);
 
     // Simulate network duplication: Same snapshot arrives again!
@@ -1761,10 +1764,13 @@ MACRO_TEST(raft_fault_duplicate_snapshot_install_is_safe) {
 
     raft_ready_t rd2 = raft_core_get_ready(r);
 
-    // Engine must aggressively REJECT redundant snapshots without corrupting state
+    // Engine must aggressively ignore redundant snapshots locally
     MACRO_ASSERT_FALSE(rd2.install_snapshot);
     MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 100);
-    MACRO_ASSERT_TRUE(rd2.messages[0].reject); // Responds with failure to stop transmission
+
+    // PHASE 13 FIX: It MUST reply with a successful ACK to tell the leader to stop sending it
+    MACRO_ASSERT_FALSE(rd2.messages[0].reject);
+    MACRO_ASSERT_EQ_INT(rd2.messages[0].index, 100);
 
     raft_core_destroy(r);
 }
