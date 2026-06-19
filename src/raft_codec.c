@@ -8,14 +8,15 @@
 #include <string.h>
 
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
-    if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1; // PHASE 5
+    if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
 
-    uint64_t len = 1 + 8*6 + 1 + 8; // Phase 5: uint64_t to prevent overflow wrap
+    // Base Frame: type(1) + to(8) + from(8) + term(8) + log_term(8) +
+    // index(8) + commit(8) + conflict_term(8) + conflict_index(8) +
+    // reject(1) + num_entries(8) = 74 bytes
+    uint64_t len = 74;
 
     for (size_t i = 0; i < m->num_entries; i++) {
         uint64_t entry_size = 8 + 8 + 1 + 4 + (uint64_t)m->entries[i].data_len;
-
-        // PHASE 5: Strict overflow check before accumulation
         if (len > RAFT_MAX_FRAME_SIZE - entry_size) return -1;
         len += entry_size;
     }
@@ -31,6 +32,11 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
     memcpy(buf+pos, &m->log_term, 8); pos += 8;
     memcpy(buf+pos, &m->index, 8); pos += 8;
     memcpy(buf+pos, &m->commit, 8); pos += 8;
+
+    // PHASE 3 (Gap 9): Conflict Hints
+    memcpy(buf+pos, &m->conflict_term, 8); pos += 8;
+    memcpy(buf+pos, &m->conflict_index, 8); pos += 8;
+
     buf[pos++] = m->reject ? 1 : 0;
 
     uint64_t num_e = m->num_entries;
@@ -54,7 +60,7 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
 
 int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) {
     memset(m, 0, sizeof(raft_msg_t));
-    if (!buf || len < 58) return -1;
+    if (!buf || len < 74) return -1;
 
     uint32_t pos = 0;
     m->type = buf[pos++];
@@ -64,6 +70,10 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     memcpy(&m->log_term, buf+pos, 8); pos += 8;
     memcpy(&m->index, buf+pos, 8); pos += 8;
     memcpy(&m->commit, buf+pos, 8); pos += 8;
+
+    memcpy(&m->conflict_term, buf+pos, 8); pos += 8;
+    memcpy(&m->conflict_index, buf+pos, 8); pos += 8;
+
     m->reject = buf[pos++] == 1;
 
     uint64_t num_e;

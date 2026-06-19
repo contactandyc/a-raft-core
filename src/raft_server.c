@@ -13,6 +13,7 @@
 
 // Forward declarations
 void raft_node_pump(raft_node_t* node);
+static void attempt_reconnect(uv_timer_t* handle);
 
 // PHASE 2: Added 'applied' to HardState persistence
 static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t term, uint64_t vote, uint64_t commit, uint64_t applied) {
@@ -27,7 +28,7 @@ static bool save_hardstate(raft_server_t* server, uint64_t group_id, uint64_t te
     if (fwrite(&term, sizeof(uint64_t), 1, f) != 1 ||
         fwrite(&vote, sizeof(uint64_t), 1, f) != 1 ||
         fwrite(&commit, sizeof(uint64_t), 1, f) != 1 ||
-        fwrite(&applied, sizeof(uint64_t), 1, f) != 1) { // <-- NEW
+        fwrite(&applied, sizeof(uint64_t), 1, f) != 1) {
         fclose(f);
         return false;
     }
@@ -58,6 +59,13 @@ static void on_write_done(uv_write_t* req, int status) {
 
 static void on_client_close(uv_handle_t* handle) {
     peer_connection_t* peer = (peer_connection_t*)handle;
+
+    // PHASE 3 (Gap 11): Trigger reconnect sequence if an active peer drops
+    if (peer->kp) {
+        peer->kp->conn = NULL;
+        uv_timer_start(&peer->kp->reconnect_timer, (uv_timer_cb)attempt_reconnect, 1000, 0);
+    }
+
     if (peer->buffer) free(peer->buffer);
     free(peer);
 }
@@ -83,29 +91,68 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     else buf->len = suggested_size;
 }
 
+// PHASE 3 (Gap 11): Drain the queue directly into the newly healed socket
+static void flush_outbound(known_peer_t* kp) {
+    if (!kp->conn || kp->out_queue_len == 0) return;
+
+    uv_buf_t buf = uv_buf_init((char*)kp->out_queue, kp->out_queue_len);
+    uv_write_t* req = malloc(sizeof(uv_write_t));
+    req->data = kp->out_queue;
+
+    uv_write(req, (uv_stream_t*)&kp->conn->handle, &buf, 1, on_write_done);
+
+    kp->out_queue_cap = 65536;
+    kp->out_queue = malloc(kp->out_queue_cap);
+    kp->out_queue_len = 0;
+}
+
 static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t target_node_id, uint8_t* payload, uint32_t len) {
     if (server->network_isolated) {
         free(payload);
         return;
     }
 
+    uint32_t frame_size = sizeof(raft_net_header_t) + len;
+    uint8_t* frame = malloc(frame_size);
+    raft_net_header_t* h = (raft_net_header_t*)frame;
+    h->payload_len = len;
+    h->group_id = group_id;
+    h->sender_id = server->physical_node_id;
+    memcpy(frame + sizeof(raft_net_header_t), payload, len);
+
+    // Try routing to persistent known peers first
+    for (uint32_t i = 0; i < server->known_peer_count; i++) {
+        known_peer_t* kp = server->known_peers[i];
+        if (kp->node_id == target_node_id) {
+
+            // Queue the data natively
+            if (kp->out_queue_len + frame_size > kp->out_queue_cap) {
+                // Drop old bytes or restrict queue size if overwhelmed
+                if (kp->out_queue_cap > 5 * 1024 * 1024) {
+                    free(frame); free(payload); return; // 5MB Soft Limit Reached
+                }
+                kp->out_queue_cap *= 2;
+                kp->out_queue = realloc(kp->out_queue, kp->out_queue_cap);
+            }
+            memcpy(kp->out_queue + kp->out_queue_len, frame, frame_size);
+            kp->out_queue_len += frame_size;
+
+            // If the connection is currently alive, drain the queue
+            if (kp->conn) {
+                flush_outbound(kp);
+            }
+            free(frame); free(payload);
+            return;
+        }
+    }
+
+    // Fallback if peer isn't in known list yet
     for (uint32_t i = 0; i < server->active_peer_count; i++) {
         peer_connection_t* peer = server->active_peers[i];
         if (peer->remote_node_id == target_node_id) {
-            uint32_t frame_size = sizeof(raft_net_header_t) + len;
-            uint8_t* frame = malloc(frame_size);
-
-            raft_net_header_t* h = (raft_net_header_t*)frame;
-            h->payload_len = len;
-            h->group_id = group_id;
-            h->sender_id = server->physical_node_id;
-
-            memcpy(frame + sizeof(raft_net_header_t), payload, len);
-
             uv_buf_t buf = uv_buf_init((char*)frame, frame_size);
             uv_write_t* req = malloc(sizeof(uv_write_t));
             req->data = frame;
-
             uv_write(req, (uv_stream_t*)&peer->handle, &buf, 1, on_write_done);
             break;
         }
@@ -140,7 +187,7 @@ void raft_node_pump(raft_node_t* node) {
     uint64_t commit_idx = raft_core_commit_index(node->core);
     uint64_t last_applied = raft_core_last_applied(node->core);
 
-    // Track the new application bounds securely
+    // Track the application bounds securely (Phase 2)
     if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > actual_applied_idx || last_applied > node->saved_applied) {
         if (!save_hardstate(node->server, node->group_id, current_term, voted_for, commit_idx, last_applied)) {
             fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump to prevent amnesia.\n");
@@ -186,6 +233,7 @@ void raft_node_pump(raft_node_t* node) {
         }
     }
 
+    // Explicit state decoupling (Phase 1)
     raft_core_advance(node->core, actual_saved_idx, actual_applied_idx);
 }
 
@@ -308,11 +356,38 @@ static void on_connect(uv_connect_t* req, int status) {
     peer_connection_t* peer = (peer_connection_t*)req->data;
     if (status == 0 && !peer->server->network_isolated) {
         register_peer(peer->server, peer);
+        if (peer->kp) {
+            peer->kp->conn = peer;
+            flush_outbound(peer->kp);
+        }
         uv_read_start((uv_stream_t*)&peer->handle, alloc_cb, on_read);
     } else {
         uv_close((uv_handle_t*)&peer->handle, on_client_close);
     }
     free(req);
+}
+
+// PHASE 3 (Gap 11): Active Reconnect Manager Loop
+static void attempt_reconnect(uv_timer_t* handle) {
+    known_peer_t* kp = (known_peer_t*)handle->data;
+
+    if (kp->server->network_isolated || kp->conn) return;
+
+    peer_connection_t* peer = calloc(1, sizeof(peer_connection_t));
+    peer->buffer_cap = 65536;
+    peer->buffer = malloc(peer->buffer_cap);
+
+    uv_tcp_init(kp->server->loop, &peer->handle);
+    peer->server = kp->server;
+    peer->remote_node_id = kp->node_id;
+    peer->kp = kp;
+
+    struct sockaddr_in dest;
+    uv_ip4_addr(kp->ip, kp->port, &dest);
+
+    uv_connect_t* req = malloc(sizeof(uv_connect_t));
+    req->data = peer;
+    uv_tcp_connect(req, &peer->handle, (const struct sockaddr*)&dest, on_connect);
 }
 
 int raft_server_init(raft_server_t* server, uv_loop_t* loop, uint64_t node_id, uint32_t max_groups, const char* data_dir) {
@@ -338,22 +413,24 @@ int raft_server_listen(raft_server_t* server, const char* ip, int port) {
 }
 
 void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64_t target_node_id) {
-    if (server->network_isolated) return;
+    if (server->network_isolated || server->known_peer_count >= RAFT_MAX_PEERS) return;
 
-    peer_connection_t* peer = calloc(1, sizeof(peer_connection_t));
-    peer->buffer_cap = 65536;
-    peer->buffer = malloc(peer->buffer_cap);
+    known_peer_t* kp = calloc(1, sizeof(known_peer_t));
+    kp->server = server;
+    kp->node_id = target_node_id;
+    strncpy(kp->ip, ip, 63);
+    kp->port = port;
 
-    uv_tcp_init(server->loop, &peer->handle);
-    peer->server = server;
-    peer->remote_node_id = target_node_id;
+    kp->out_queue_cap = 65536;
+    kp->out_queue = malloc(kp->out_queue_cap);
 
-    struct sockaddr_in dest;
-    uv_ip4_addr(ip, port, &dest);
+    uv_timer_init(server->loop, &kp->reconnect_timer);
+    kp->reconnect_timer.data = kp; // <-- MUST ADD THIS!
 
-    uv_connect_t* req = malloc(sizeof(uv_connect_t));
-    req->data = peer;
-    uv_tcp_connect(req, &peer->handle, (const struct sockaddr*)&dest, on_connect);
+    server->known_peers[server->known_peer_count++] = kp;
+
+    // We must pass the timer handle to attempt_reconnect now, not the raw struct!
+    attempt_reconnect(&kp->reconnect_timer);
 }
 
 void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers) {

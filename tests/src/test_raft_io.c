@@ -35,6 +35,11 @@ MACRO_TEST(io_save_and_boot) {
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(core, &hup);
 
+    // PHASE 3: Satisfy the Pre-Vote phase first
+    raft_msg_t pv_res = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(core, &pv_res);
+    raft_core_advance_all(core);
+
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(core, &vote);
 

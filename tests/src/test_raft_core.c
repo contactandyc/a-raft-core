@@ -26,12 +26,13 @@ MACRO_TEST(raft_campaign_becomes_candidate) {
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
 
-    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_CANDIDATE);
-    MACRO_ASSERT_EQ_INT(raft_core_term(r), 1);
+    // PHASE 3: MSG_HUP now triggers PRE_CANDIDATE, preventing disruptive term bumps!
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_PRE_CANDIDATE);
+    MACRO_ASSERT_EQ_INT(raft_core_term(r), 0);
 
     raft_ready_t ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 2);
-    MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_REQUEST_VOTE);
+    MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_PRE_VOTE);
 
     raft_core_destroy(r);
 }
@@ -42,6 +43,10 @@ MACRO_TEST(raft_win_election_and_noop) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_core_advance_all(r);
+
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_core_advance_all(r);
 
     raft_msg_t vote1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
@@ -108,6 +113,8 @@ MACRO_TEST(raft_leader_steps_down_on_higher_term) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
@@ -154,6 +161,10 @@ MACRO_TEST(raft_figure_8_anomaly_prevention) {
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
     for (int i = 2; i <= 3; i++) {
+        raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = i, .term = 1, .reject = false };
+        raft_core_step(r, &pv);
+    }
+    for (int i = 2; i <= 3; i++) {
         raft_msg_t v = { .type = MSG_REQUEST_VOTE_RES, .from = i, .term = 1, .reject = false };
         raft_core_step(r, &v);
     }
@@ -171,6 +182,10 @@ MACRO_TEST(raft_figure_8_anomaly_prevention) {
 
     raft_msg_t hup2 = { .type = MSG_HUP };
     raft_core_step(r, &hup2);
+    for (int i = 2; i <= 3; i++) {
+        raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = i, .term = 4, .reject = false };
+        raft_core_step(r, &pv);
+    }
     for (int i = 2; i <= 3; i++) {
         raft_msg_t v = { .type = MSG_REQUEST_VOTE_RES, .from = i, .term = 4, .reject = false };
         raft_core_step(r, &v);
@@ -205,6 +220,8 @@ MACRO_TEST(raft_leader_backtracks_next_index_on_reject) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -216,7 +233,8 @@ MACRO_TEST(raft_leader_backtracks_next_index_on_reject) {
     raft_core_step(r, &prop);
     raft_core_advance_all(r);
 
-    raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3 };
+    // PHASE 3 (Gap 9): Injected .conflict_index = 3
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3, .conflict_index = 3 };
     raft_core_step(r, &rej);
 
     raft_ready_t ready = raft_core_get_ready(r);
@@ -234,13 +252,21 @@ MACRO_TEST(raft_leader_ignores_lower_term_append) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-    raft_core_step(r, &hup);
-    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
-    raft_core_step(r, &vote);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+
+    // Do NOT send the real vote yet. It remains a CANDIDATE in Term 1.
+
+    raft_core_step(r, &hup); // Trigger new election. Moves to PRE_CANDIDATE for term 2.
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &pv2);
+    raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &vote2); // NOW it becomes LEADER in Term 2
     raft_core_advance_all(r);
 
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
 
+    // Assert that a message from an old Term 1 leader is rejected
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 3, .term = 1 };
     raft_core_step(r, &app);
 
@@ -262,7 +288,12 @@ MACRO_TEST(raft_candidate_ignores_stale_vote_response) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+
     raft_core_step(r, &hup);
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &pv2);
     raft_core_advance_all(r);
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
@@ -279,6 +310,10 @@ MACRO_TEST(raft_candidate_does_not_double_count_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv1);
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 1, .reject = false };
+    raft_core_step(r, &pv2);
     raft_core_advance_all(r);
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
@@ -363,6 +398,8 @@ MACRO_TEST(raft_leader_backtracks_multiple_times) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -373,23 +410,21 @@ MACRO_TEST(raft_leader_backtracks_multiple_times) {
     raft_core_step(r, &p);
     raft_core_advance_all(r);
 
-    raft_msg_t r1 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3 };
+    raft_msg_t r1 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 3, .conflict_index = 3 };
     raft_core_step(r, &r1);
     raft_ready_t rd1 = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(rd1.messages[0].index, 2);
     raft_core_advance_all(r);
 
-    raft_msg_t r2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 2 };
+    raft_msg_t r2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 2, .conflict_index = 2 };
     raft_core_step(r, &r2);
     raft_ready_t rd2 = raft_core_get_ready(r);
-    // The previous index sent was 2, it decremented next_index to 2, so the NEW prev_index is 1.
     MACRO_ASSERT_EQ_INT(rd2.messages[0].index, 1);
     raft_core_advance_all(r);
 
-    raft_msg_t r3 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 1 };
+    raft_msg_t r3 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 1, .conflict_index = 1 };
     raft_core_step(r, &r3);
     raft_ready_t rd3 = raft_core_get_ready(r);
-    // Decremented next_index to 1, so the NEW prev_index is 0 (the dummy anchor).
     MACRO_ASSERT_EQ_INT(rd3.messages[0].index, 0);
 
     raft_core_destroy(r);
@@ -418,6 +453,8 @@ MACRO_TEST(raft_candidate_steps_down_on_same_term_append) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_CANDIDATE);
 
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
@@ -521,6 +558,8 @@ MACRO_TEST(raft_candidate_does_not_count_rejected_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_core_advance_all(r);
 
     raft_msg_t rej = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = true };
@@ -542,6 +581,8 @@ MACRO_TEST(raft_leader_ignores_unknown_peer_append_res) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t v1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &v1);
     raft_core_advance_all(r);
@@ -565,7 +606,12 @@ MACRO_TEST(raft_leader_ignores_stale_append_res) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv1);
+
     raft_core_step(r, &hup);
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &pv2);
     raft_msg_t v1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
     raft_core_step(r, &v1);
     raft_core_advance_all(r);
@@ -589,6 +635,8 @@ MACRO_TEST(raft_candidate_steps_down_on_higher_term_vote_res) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
 
     raft_msg_t v1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
     raft_core_step(r, &v1);
@@ -684,7 +732,8 @@ MACRO_TEST(raft_leader_ignores_hup) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
 
@@ -708,6 +757,8 @@ MACRO_TEST(raft_candidate_steps_down_on_higher_term_request_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_core_advance_all(r);
 
     raft_msg_t req = { .type = MSG_REQUEST_VOTE, .from = 2, .term = 2, .index = 0, .log_term = 0 };
@@ -730,7 +781,8 @@ MACRO_TEST(raft_leader_steps_down_on_higher_term_request_vote) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -750,7 +802,8 @@ MACRO_TEST(raft_leader_steps_down_on_higher_term_append_res) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
-
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
@@ -787,6 +840,8 @@ MACRO_TEST(raft_leader_rejects_empty_proposal) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -805,6 +860,8 @@ MACRO_TEST(raft_ready_populates_entries_to_save) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
 
@@ -867,6 +924,8 @@ MACRO_TEST(raft_leader_ignores_zero_entry_proposal_even_with_entries_pointer) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -886,6 +945,8 @@ MACRO_TEST(raft_leader_appends_multiple_proposed_entries) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -992,7 +1053,8 @@ MACRO_TEST(raft_append_reject_reports_last_index) {
 
     raft_ready_t ready = raft_core_get_ready(r);
     MACRO_ASSERT_TRUE(ready.messages[0].reject);
-    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 2);
+    // NEW CONTRACT: Follower reports conflict_index!
+    MACRO_ASSERT_EQ_INT(ready.messages[0].conflict_index, 3);
 
     raft_core_destroy(r);
 }
@@ -1014,6 +1076,8 @@ MACRO_TEST(raft_candidate_ignores_unknown_peer_vote_response) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_core_advance_all(r);
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 99, .term = 1, .reject = false };
@@ -1052,11 +1116,13 @@ MACRO_TEST(raft_leader_backoff_floor) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
 
-    raft_msg_t rj = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 99 };
+    raft_msg_t rj = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = true, .index = 99, .conflict_index = 0 };
     raft_core_step(r, &rj);
     raft_core_step(r, &rj);
     raft_core_step(r, &rj);
@@ -1074,6 +1140,8 @@ MACRO_TEST(raft_leader_ignores_out_of_bounds_match_index) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -1121,9 +1189,15 @@ MACRO_TEST(raft_candidate_split_vote_recampaign) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv1);
     MACRO_ASSERT_EQ_INT(raft_core_term(r), 1);
 
     raft_core_step(r, &hup);
+    MACRO_ASSERT_EQ_INT(raft_core_term(r), 1);
+
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &pv2);
     MACRO_ASSERT_EQ_INT(raft_core_term(r), 2);
 
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
@@ -1140,6 +1214,8 @@ MACRO_TEST(raft_leader_requires_peer_ack_to_commit_noop) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
 
@@ -1167,7 +1243,7 @@ MACRO_TEST(raft_multi_node_smoke_test) {
 
     bool active = true;
     int cycles = 0;
-    while (active && cycles < 10) {
+    while (active && cycles < 20) {
         active = false;
         cycles++;
 
@@ -1289,6 +1365,8 @@ MACRO_TEST(raft_conf_add_node_applies_on_commit) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -1320,6 +1398,11 @@ MACRO_TEST(raft_conf_remove_node_applies_on_commit) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv1);
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 1, .reject = false };
+    raft_core_step(r, &pv2);
+
     raft_msg_t vote1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .from = 3, .term = 1, .reject = false };
     raft_core_step(r, &vote1);
@@ -1357,6 +1440,8 @@ MACRO_TEST(raft_leader_ignores_append_res_beyond_log_end) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -1416,6 +1501,8 @@ MACRO_TEST(raft_leader_tick_sends_heartbeat_to_all_peers) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -1450,6 +1537,8 @@ MACRO_TEST(raft_leader_tick_sends_pending_entries_to_lagging_peer) {
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
     raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(r, &vote);
     raft_core_advance_all(r);
@@ -1473,12 +1562,48 @@ MACRO_TEST(raft_leader_tick_sends_pending_entries_to_lagging_peer) {
     uint64_t hb_prev_index = to_node_3->index;
     raft_core_advance_all(r);
 
-    raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = true, .index = hb_prev_index };
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = true, .index = hb_prev_index, .conflict_index = 1 };
     raft_core_step(r, &rej);
 
     ready = raft_core_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_TRUE(ready.messages[0].num_entries > 0);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_pre_vote_prevents_disruption) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    // Initial leader election
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    // Node 1 becomes Pre-Candidate, sends Pre-Votes.
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_PRE_CANDIDATE);
+
+    // Peer 2 grants Pre-Vote
+    raft_msg_t pv_res = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv_res);
+
+    // Now it's a real Candidate
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_CANDIDATE);
+
+    // Peer 2 grants real Vote
+    raft_msg_t v_res = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &v_res);
+
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
+    raft_core_advance_all(r);
+
+    // Isolated Node 3 comes back from a network partition and spammed its election timer
+    // It sends a Pre-Vote with term 100.
+    raft_msg_t rogue_pv = { .type = MSG_PRE_VOTE, .from = 3, .term = 100, .index = 0, .log_term = 0 };
+    raft_core_step(r, &rogue_pv);
+
+    // Node 1 (Leader) should process the Pre-Vote without stepping down or advancing its term!
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_LEADER);
+    MACRO_ASSERT_EQ_INT(raft_core_term(r), 1); // Stayed stable!
 
     raft_core_destroy(r);
 }
@@ -1552,6 +1677,7 @@ int main(void) {
     MACRO_ADD(tests, raft_leader_tick_sends_heartbeat_to_all_peers);
     MACRO_ADD(tests, raft_follower_tick_does_nothing);
     MACRO_ADD(tests, raft_leader_tick_sends_pending_entries_to_lagging_peer);
+    MACRO_ADD(tests, raft_pre_vote_prevents_disruption);
 
     macro_run_all("raft_core", tests, test_count);
     return 0;

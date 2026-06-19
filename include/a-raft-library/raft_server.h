@@ -26,14 +26,30 @@ typedef struct {
 typedef struct raft_node_s raft_node_t;
 typedef struct raft_server_s raft_server_t;
 typedef struct peer_connection_s peer_connection_t;
+typedef struct known_peer_s known_peer_t;
 
 struct peer_connection_s {
     uv_tcp_t handle;
     raft_server_t* server;
-    uint8_t* buffer;      // PHASE 1: Dynamic buffer to handle large frames safely
+    known_peer_t* kp; // PHASE 3: Link back to persistent anchor
+    uint8_t* buffer;
     size_t buffer_len;
     size_t buffer_cap;
     uint64_t remote_node_id;
+};
+
+// PHASE 3 (Gap 11): Persistent peer anchors for reconnections & outbound queues
+struct known_peer_s {
+    raft_server_t* server;
+    uint64_t node_id;
+    char ip[64];
+    int port;
+    peer_connection_t* conn; // NULL if disconnected
+    uv_timer_t reconnect_timer;
+
+    uint8_t* out_queue;
+    size_t out_queue_len;
+    size_t out_queue_cap;
 };
 
 struct raft_server_s {
@@ -44,6 +60,9 @@ struct raft_server_s {
 
     uint32_t max_groups;
     raft_node_t** groups;
+
+    known_peer_t* known_peers[RAFT_MAX_PEERS]; // PHASE 3
+    uint32_t known_peer_count;
 
     peer_connection_t* active_peers[RAFT_MAX_PEERS];
     uint32_t active_peer_count;
@@ -60,7 +79,7 @@ struct raft_node_s {
 
     uint64_t saved_term;
     uint64_t saved_vote;
-    uint64_t saved_applied; // PHASE 2: Application bounds
+    uint64_t saved_applied;
 
     uv_timer_t election_timer;
     uv_timer_t heartbeat_timer;

@@ -301,14 +301,21 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         } else if (msg->type == MSG_REQUEST_VOTE) {
             raft_msg_t res = { .type = MSG_REQUEST_VOTE_RES, .to = msg->from, .term = r->current_term, .reject = true };
             send_msg(r, res);
+        } else if (msg->type == MSG_PRE_VOTE) {
+            // PHASE 3 (Gap 10): Reject stale pre-votes
+            raft_msg_t res = { .type = MSG_PRE_VOTE_RES, .to = msg->from, .term = r->current_term, .reject = true };
+            send_msg(r, res);
         }
         return;
     }
 
     if (msg->term > r->current_term) {
-        r->current_term = msg->term;
-        r->voted_for = 0;
-        r->state = RAFT_STATE_FOLLOWER;
+        // PHASE 3 (Gap 10): Do NOT advance term for Pre-Votes or Pre-Vote Responses!
+        if (msg->type != MSG_PRE_VOTE && msg->type != MSG_PRE_VOTE_RES) {
+            r->current_term = msg->term;
+            r->voted_for = 0;
+            r->state = RAFT_STATE_FOLLOWER;
+        }
     }
 
     if (msg->type == MSG_TICK) {
@@ -318,22 +325,67 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
     if (msg->type == MSG_HUP) {
         if (r->state == RAFT_STATE_LEADER) return;
-        r->state = RAFT_STATE_CANDIDATE;
-        r->current_term++;
-        r->voted_for = r->id;
+
+        // PHASE 3 (Gap 10): PRE_CANDIDATE Phase. Do not increment term yet.
+        r->state = RAFT_STATE_PRE_CANDIDATE;
         r->votes_received = 1;
         memset(r->voted_for_me, 0, sizeof(r->voted_for_me));
 
         if (r->num_peers == 0) {
+            r->state = RAFT_STATE_CANDIDATE;
+            r->current_term++;
+            r->voted_for = r->id;
             become_leader(r);
             return;
         }
 
         uint64_t last_idx = raft_core_last_index(r);
         for (size_t i = 0; i < r->num_peers; i++) {
-            raft_msg_t req = { .type = MSG_REQUEST_VOTE, .to = r->peers[i], .term = r->current_term,
+            raft_msg_t req = { .type = MSG_PRE_VOTE, .to = r->peers[i], .term = r->current_term + 1,
                                .index = last_idx, .log_term = log_term(r, last_idx) };
             send_msg(r, req);
+        }
+    }
+    else if (msg->type == MSG_PRE_VOTE) {
+        raft_msg_t res = { .type = MSG_PRE_VOTE_RES, .to = msg->from, .term = r->current_term, .reject = true };
+        uint64_t my_last_idx = raft_core_last_index(r);
+        uint64_t my_last_term = log_term(r, my_last_idx);
+        bool log_ok = (msg->log_term > my_last_term) || (msg->log_term == my_last_term && msg->index >= my_last_idx);
+
+        if (msg->term > r->current_term && log_ok) {
+            res.reject = false;
+            res.term = msg->term; // Echo back the proposed future term
+        }
+        send_msg(r, res);
+    }
+    else if (msg->type == MSG_PRE_VOTE_RES && r->state == RAFT_STATE_PRE_CANDIDATE) {
+        if (msg->reject && msg->term > r->current_term) {
+            r->current_term = msg->term;
+            r->voted_for = 0;
+            r->state = RAFT_STATE_FOLLOWER;
+        } else if (!msg->reject && msg->term == r->current_term + 1) {
+            for (size_t i = 0; i < r->num_peers; i++) {
+                if (r->peers[i] == msg->from && !r->voted_for_me[i]) {
+                    r->voted_for_me[i] = true;
+                    r->votes_received++;
+                    if (r->votes_received >= (r->num_peers + 1) / 2 + 1) {
+                        // Won Pre-Vote! Transition to Candidate and officially increment term.
+                        r->state = RAFT_STATE_CANDIDATE;
+                        r->current_term++;
+                        r->voted_for = r->id;
+                        r->votes_received = 1;
+                        memset(r->voted_for_me, 0, sizeof(r->voted_for_me));
+
+                        uint64_t last_idx = raft_core_last_index(r);
+                        for (size_t j = 0; j < r->num_peers; j++) {
+                            raft_msg_t req = { .type = MSG_REQUEST_VOTE, .to = r->peers[j], .term = r->current_term,
+                                               .index = last_idx, .log_term = log_term(r, last_idx) };
+                            send_msg(r, req);
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
     else if (msg->type == MSG_REQUEST_VOTE) {
@@ -421,6 +473,20 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
             } else if (msg->index < r->snapshot_index) {
                 res.reject = true;
                 res.index = r->snapshot_index;
+            } else {
+                // PHASE 3 (Gap 9): Build Conflict Hints
+                res.reject = true;
+                if (msg->index > my_last_idx) {
+                    res.conflict_index = my_last_idx + 1;
+                    res.conflict_term = 0;
+                } else {
+                    res.conflict_term = log_term(r, msg->index);
+                    uint64_t first_idx = msg->index;
+                    while (first_idx > r->snapshot_index && log_term(r, first_idx - 1) == res.conflict_term) {
+                        first_idx--;
+                    }
+                    res.conflict_index = first_idx;
+                }
             }
         }
         send_msg(r, res);
@@ -463,19 +529,29 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
                 if (msg->reject) {
-                    // FAST BACKTRACKING (Gap 9): Jump next_index to the exact index the follower said it rejected
-                    uint64_t new_next = msg->index;
-                    if (new_next == 0) new_next = 1;
-
-                    // Only jump backward. If the pipelining pushed next_index way ahead, safely reset it.
-                    if (new_next < r->next_index[i]) {
-                        r->next_index[i] = new_next;
+                    // PHASE 3 (Gap 9): O(1) Fast Backtracking using Conflict Hints
+                    if (msg->conflict_term == 0) {
+                        r->next_index[i] = msg->conflict_index;
                     } else {
-                        // Fallback if the follower didn't provide a useful hint
-                        r->next_index[i] = (r->next_index[i] > 1) ? r->next_index[i] - 1 : 1;
+                        uint64_t last_idx = 0;
+                        bool found = false;
+                        for (uint64_t idx = my_last_idx; idx >= r->snapshot_index; idx--) {
+                            if (log_term(r, idx) == msg->conflict_term) {
+                                last_idx = idx;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) {
+                            r->next_index[i] = last_idx + 1;
+                        } else {
+                            r->next_index[i] = msg->conflict_index;
+                        }
                     }
+                    if (r->next_index[i] < 1) r->next_index[i] = 1;
                     send_append(r, i);
-                } else {                    uint64_t safe_idx = msg->index < my_last_idx ? msg->index : my_last_idx;
+                } else {
+                    uint64_t safe_idx = msg->index < my_last_idx ? msg->index : my_last_idx;
                     if (safe_idx >= r->match_index[i]) {
                         r->match_index[i] = safe_idx;
                         r->next_index[i] = safe_idx + 1;
@@ -487,7 +563,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
                     qsort(matches, r->num_peers + 1, sizeof(uint64_t), cmp_u64);
 
-                    // PHASE 1: Explicit Quorum Math prevents even-node cluster bug
                     size_t total = r->num_peers + 1;
                     size_t quorum = total / 2 + 1;
                     uint64_t candidate = matches[total - quorum];
