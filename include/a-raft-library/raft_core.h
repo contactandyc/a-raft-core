@@ -10,6 +10,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+// PHASE 5: Standardized API Error Codes
+#define RAFT_OK 0
+#define RAFT_ERR_NOT_LEADER -1
+#define RAFT_ERR_QUEUE_FULL -2
+
 typedef enum {
     RAFT_STATE_FOLLOWER,
     RAFT_STATE_PRE_CANDIDATE,
@@ -28,8 +33,8 @@ typedef enum {
     MSG_PRE_VOTE,
     MSG_PRE_VOTE_RES,
     MSG_INSTALL_SNAPSHOT,
-    MSG_CHECK_QUORUM,     // PHASE 4 (Gap 14): Stale Leader Guard
-    MSG_READ_INDEX,       // PHASE 4 (Gap 13): Linearizable Reads
+    MSG_CHECK_QUORUM,
+    MSG_READ_INDEX,
     MSG_READ_INDEX_RES
 } msg_type_t;
 
@@ -37,13 +42,18 @@ typedef enum {
     ENTRY_NORMAL = 0,
     ENTRY_CONF_ADD = 1,
     ENTRY_CONF_REMOVE = 2,
-    ENTRY_CONF_ADD_LEARNER = 3 // PHASE 4 (Gap 12): Non-Voting Ingestion
+    ENTRY_CONF_ADD_LEARNER = 3
 } entry_type_t;
 
 typedef struct {
     uint64_t term;
     uint64_t index;
     entry_type_t type;
+
+    // PHASE 5 (Gap 16): Explicit Sequence Deduplication
+    uint64_t client_id;
+    uint64_t client_seq;
+
     uint8_t* data;
     size_t   data_len;
 } raft_entry_t;
@@ -60,7 +70,6 @@ typedef struct {
     uint64_t conflict_term;
     uint64_t conflict_index;
 
-    // PHASE 4 (Gap 13): Sequence tracker for Safe Reads
     uint64_t read_seq;
 
     raft_entry_t* entries;
@@ -72,7 +81,6 @@ typedef struct {
     bool reject;
 } raft_msg_t;
 
-// PHASE 4 (Gap 13): Notifies host application exactly when a local read is linearizable
 typedef struct {
     uint64_t index;
     uint64_t read_seq;
@@ -88,7 +96,7 @@ typedef struct {
     raft_entry_t* committed_entries;
     size_t num_committed_entries;
 
-    raft_read_state_t* read_states; // PHASE 4 (Gap 13)
+    raft_read_state_t* read_states;
     size_t num_read_states;
 } raft_ready_t;
 
@@ -119,7 +127,9 @@ bool         raft_core_activity_accepted(raft_core_t* r);
 
 size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
 
-// PHASE 4 (Gap 12): Learner APIs
+// PHASE 5 (Gap 17): Network Redirection
+uint64_t     raft_core_leader_id(raft_core_t* r);
+
 void         raft_core_add_learner(raft_core_t* r, uint64_t peer_id);
 void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
 

@@ -89,9 +89,10 @@ int  raft_server_listen(raft_server_t* server, const char* ip, int port);
 void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64_t target_node_id);
 
 void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers);
-void raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len);
 
-// PHASE 4 (Gap 13): Expose safe linearizable read interface
+// PHASE 5: Expose rich write interface
+int  raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id);
+
 void raft_node_read_index(raft_node_t* node, uint64_t read_seq);
 
 #endif // RAFT_SERVER_H

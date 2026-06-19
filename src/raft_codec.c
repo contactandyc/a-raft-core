@@ -10,13 +10,12 @@
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
     if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
 
-    // Base Frame: type(1) + to(8) + from(8) + term(8) + log_term(8) +
-    // index(8) + commit(8) + conflict_term(8) + conflict_index(8) +
-    // read_seq(8) + reject(1) + num_entries(8) = 82 bytes
+    // Base Frame: 82 bytes
     uint64_t len = 82;
 
     for (size_t i = 0; i < m->num_entries; i++) {
-        uint64_t entry_size = 8 + 8 + 1 + 4 + (uint64_t)m->entries[i].data_len;
+        // PHASE 5: Frame bounds expand to 37 bytes per entry to pack the 16-byte dedup headers
+        uint64_t entry_size = 8 + 8 + 1 + 8 + 8 + 4 + (uint64_t)m->entries[i].data_len;
         if (len > RAFT_MAX_FRAME_SIZE - entry_size) return -1;
         len += entry_size;
     }
@@ -36,7 +35,6 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
     memcpy(buf+pos, &m->conflict_term, 8); pos += 8;
     memcpy(buf+pos, &m->conflict_index, 8); pos += 8;
 
-    // PHASE 4 (Gap 13): Safe Reads Context
     memcpy(buf+pos, &m->read_seq, 8); pos += 8;
 
     buf[pos++] = m->reject ? 1 : 0;
@@ -48,6 +46,11 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         memcpy(buf+pos, &m->entries[i].term, 8); pos += 8;
         memcpy(buf+pos, &m->entries[i].index, 8); pos += 8;
         buf[pos++] = m->entries[i].type;
+
+        // PHASE 5
+        memcpy(buf+pos, &m->entries[i].client_id, 8); pos += 8;
+        memcpy(buf+pos, &m->entries[i].client_seq, 8); pos += 8;
+
         uint32_t dlen = m->entries[i].data_len;
         memcpy(buf+pos, &dlen, 4); pos += 4;
         if (dlen > 0 && m->entries[i].data != NULL) {
@@ -62,7 +65,7 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
 
 int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) {
     memset(m, 0, sizeof(raft_msg_t));
-    if (!buf || len < 82) return -1; // PHASE 4 boundary
+    if (!buf || len < 82) return -1;
 
     uint32_t pos = 0;
     m->type = buf[pos++];
@@ -76,7 +79,6 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     memcpy(&m->conflict_term, buf+pos, 8); pos += 8;
     memcpy(&m->conflict_index, buf+pos, 8); pos += 8;
 
-    // PHASE 4: Safe Reads Context
     memcpy(&m->read_seq, buf+pos, 8); pos += 8;
 
     m->reject = buf[pos++] == 1;
@@ -88,17 +90,23 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     m->num_entries = num_e;
 
     if (num_e > 0) {
-        if (pos + (num_e * 21) > len) return -1;
+        // PHASE 5 boundary validation (37 bytes per entry header)
+        if (pos + (num_e * 37) > len) return -1;
 
         m->entries = calloc(num_e, sizeof(raft_entry_t));
         if (!m->entries) return -1;
 
         for (size_t i = 0; i < num_e; i++) {
-            if (pos + 21 > len) goto cleanup_error;
+            if (pos + 37 > len) goto cleanup_error;
 
             memcpy(&m->entries[i].term, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
             m->entries[i].type = buf[pos++];
+
+            // PHASE 5
+            memcpy(&m->entries[i].client_id, buf+pos, 8); pos += 8;
+            memcpy(&m->entries[i].client_seq, buf+pos, 8); pos += 8;
+
             uint32_t dlen;
             memcpy(&dlen, buf+pos, 4); pos += 4;
             m->entries[i].data_len = dlen;

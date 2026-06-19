@@ -94,10 +94,19 @@
 
 ---
 
-### **Phase 5: API, Limits, and Polish (Pending)**
+### **Phase 5 Summary: API, Limits, and Polish**
 
-*This is the final phase! These gaps involve exposing the library to end-users safely.*
+#### 15. Backpressure Mechanisms (Gap 15)
 
-* **15. No Backpressure Mechanisms:** `raft_node_propose` accepts unbounded payloads. There are no limits on in-flight append bytes or client queues, risking OOM if clients push data faster than the disks can sync.
-* **16. Client Retry Deduplication:** If the leader crashes after committing a write but before responding to the client, the client will retry. Without a sequence/ID deduplicator, the write executes twice.
-* **17. Unhandled Follower Proposals:** `raft_node_propose` silently drops proposals if called on a follower. It needs to return a structured redirect pointing the client to the active leader.
+* **The Bug:** The core previously accepted unbounded payloads via `raft_node_propose`. Without limits, a fast client could push data into the leader's memory exponentially faster than the physical disks could sync it, inevitably leading to an Out-Of-Memory (OOM) crash under heavy load.
+* **The Fix:** We implemented a strict in-flight queue depth check. If the difference between the leader's `last_index` and `commit_index` exceeds a safe threshold (e.g., 2,000 entries), the engine actively rejects new proposals and returns `RAFT_ERR_QUEUE_FULL`, natively enforcing backpressure onto the client application.
+
+#### 16. Client Retry Deduplication (Gap 16)
+
+* **The Bug:** If a leader successfully committed a write to disk but crashed immediately before replying to the client, the client would naturally retry the exact same write against the newly elected leader. Without idempotency tracking, this would cause the Raft state machine to double-execute the transaction.
+* **The Fix:** We expanded the binary codec to include `client_id` and `client_seq` metadata. The Raft core now maintains an $O(1)$ session tracker array. If it receives a proposal with a `client_seq` less than or equal to the highest sequence already processed for that `client_id`, it silently drops the duplicate, guaranteeing Exactly-Once execution semantics.
+
+#### 17. Follower Redirects (Gap 17)
+
+* **The Bug:** If a client blindly sent a proposal to a Follower, the node would silently drop it on the floor, forcing the client to eventually timeout and guess another node.
+* **The Fix:** We implemented a passive leader tracking mechanism (`raft_core_leader_id()`). Now, `raft_node_propose` intercepts misrouted requests immediately, returns `RAFT_ERR_NOT_LEADER`, and populates an `out_leader_id` pointer. This allows the host application to instantly issue an HTTP 307 Redirect (or equivalent gRPC reroute) to gracefully guide the client to the active leader.

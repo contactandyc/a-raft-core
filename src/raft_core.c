@@ -9,16 +9,23 @@
 
 #define MAX_PEERS 64
 #define MAX_PENDING_READS 128
+#define MAX_CLIENT_SESSIONS 256
 
 typedef struct {
-    uint64_t read_seq;      // Internal monotonic heartbeat sequence
-    uint64_t client_ctx;    // The original sequence/ID requested by the client
+    uint64_t read_seq;
+    uint64_t client_ctx;
     uint64_t index;
     uint64_t from;
     size_t acks;
     bool acked_by[MAX_PEERS];
     bool active;
 } pending_read_t;
+
+// PHASE 5: O(1) Deduplication Tracker
+typedef struct {
+    uint64_t client_id;
+    uint64_t client_seq;
+} client_session_t;
 
 struct raft_core_s {
     uint64_t id;
@@ -66,6 +73,10 @@ struct raft_core_s {
     size_t num_read_states;
 
     uint64_t term_start_index;
+
+    // PHASE 5
+    uint64_t leader_id;
+    client_session_t sessions[MAX_CLIENT_SESSIONS];
 };
 
 // -----------------------------------------------------------------------------
@@ -99,7 +110,7 @@ static raft_entry_t* log_get(raft_core_t* r, uint64_t index) {
     return &r->log[index - r->snapshot_index];
 }
 
-static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, const uint8_t* data, size_t data_len) {
+static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len) {
     if (r->log_len >= r->log_cap) {
         r->log_cap = r->log_cap == 0 ? 16 : r->log_cap * 2;
         r->log = realloc(r->log, r->log_cap * sizeof(raft_entry_t));
@@ -109,6 +120,8 @@ static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, const u
     e->term = term;
     e->index = next_idx;
     e->type = type;
+    e->client_id = cid;
+    e->client_seq = cseq;
     e->data_len = data_len;
     e->data = data_len > 0 ? malloc(data_len) : NULL;
     if (data_len > 0) memcpy(e->data, data, data_len);
@@ -154,6 +167,8 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
         msg.entries[i].term = src->term;
         msg.entries[i].index = src->index;
         msg.entries[i].type = src->type;
+        msg.entries[i].client_id = src->client_id;
+        msg.entries[i].client_seq = src->client_seq;
         msg.entries[i].data_len = src->data_len;
         msg.entries[i].data = src->data_len > 0 ? malloc(src->data_len) : NULL;
         if (src->data_len > 0) memcpy(msg.entries[i].data, src->data, src->data_len);
@@ -170,9 +185,10 @@ static void bcast_append(raft_core_t* r) {
 static void become_leader(raft_core_t* r) {
     r->state = RAFT_STATE_LEADER;
     r->activity_accepted = true;
+    r->leader_id = r->id;
 
     uint8_t dummy = 0;
-    log_append(r, r->current_term, ENTRY_NORMAL, &dummy, 0);
+    log_append(r, r->current_term, ENTRY_NORMAL, 0, 0, &dummy, 0);
     r->term_start_index = raft_core_last_index_internal(r);
 
     for (size_t i = 0; i < r->num_peers; i++) {
@@ -343,6 +359,8 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
     r->log[0].index = r->snapshot_index;
     r->log[0].term = r->snapshot_term;
     r->log[0].type = ENTRY_NORMAL;
+    r->log[0].client_id = 0;
+    r->log[0].client_seq = 0;
     r->log[0].data = NULL;
     r->log[0].data_len = 0;
     r->log_len = 1;
@@ -352,6 +370,8 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
         e->term = entries[i].term;
         e->index = entries[i].index;
         e->type = entries[i].type;
+        e->client_id = entries[i].client_id;
+        e->client_seq = entries[i].client_seq;
         e->data_len = entries[i].data_len;
         e->data = entries[i].data_len > 0 ? malloc(entries[i].data_len) : NULL;
         if (e->data_len > 0) memcpy(e->data, entries[i].data, e->data_len);
@@ -417,6 +437,11 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         }
     }
 
+    // PHASE 5: Automatically track authoritative leader
+    if (msg->term >= r->current_term && (msg->type == MSG_APPEND_ENTRIES || msg->type == MSG_INSTALL_SNAPSHOT)) {
+        r->leader_id = msg->from;
+    }
+
     if (msg->term > 0 && msg->term < r->current_term) {
         if (msg->type == MSG_APPEND_ENTRIES) {
             raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
@@ -472,7 +497,7 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
             if (!r->pending_reads[pr].active) {
                 r->pending_reads[pr].active = true;
                 r->pending_reads[pr].read_seq = r->current_read_seq;
-                r->pending_reads[pr].client_ctx = msg->read_seq; // <-- Preserve the client's context!
+                r->pending_reads[pr].client_ctx = msg->read_seq;
                 r->pending_reads[pr].index = r->commit_index;
                 r->pending_reads[pr].from = msg->from != 0 ? msg->from : r->id;
                 r->pending_reads[pr].acks = 1;
@@ -495,7 +520,7 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                                 r->read_states = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
                             }
                             r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx; // Output client context
+                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
                             r->num_read_states++;
                         } else {
                             raft_msg_t res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
@@ -627,9 +652,24 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         if (msg->num_entries == 0 || msg->entries == NULL) return;
         uint64_t old_last_idx = raft_core_last_index_internal(r);
 
+        bool appended = false;
         for (size_t i = 0; i < msg->num_entries; i++) {
-            log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].data, msg->entries[i].data_len);
+            // PHASE 5: O(1) Exactly-Once Sequence Deduplication Tracker
+            if (msg->entries[i].client_id != 0) {
+                uint32_t slot = msg->entries[i].client_id % MAX_CLIENT_SESSIONS;
+                if (r->sessions[slot].client_id == msg->entries[i].client_id &&
+                    r->sessions[slot].client_seq >= msg->entries[i].client_seq) {
+                    continue; // Skip silently if already proposed!
+                }
+                r->sessions[slot].client_id = msg->entries[i].client_id;
+                r->sessions[slot].client_seq = msg->entries[i].client_seq;
+            }
+            log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
+            appended = true;
         }
+
+        if (!appended) return; // Completely dropped!
+
         if (r->num_peers == 0) {
             advance_commit_index(r, raft_core_last_index_internal(r));
             return;
@@ -669,7 +709,9 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                             break;
                         }
                         if (new_idx <= my_last_idx) log_truncate(r, new_idx);
-                        log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].data, msg->entries[i].data_len);
+
+                        // PHASE 5
+                        log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
                     }
                 }
 
@@ -733,7 +775,7 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
         uint64_t my_last_idx = raft_core_last_index_internal(r);
 
-        for (int i = 0; i < r->num_peers; i++) {
+        for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
                 if (msg->read_seq > r->peer_read_seq[i]) r->peer_read_seq[i] = msg->read_seq;
 
@@ -918,6 +960,9 @@ uint64_t raft_core_commit_index(raft_core_t* r) { return r->commit_index; }
 uint64_t raft_core_last_index(raft_core_t* r) { return raft_core_last_index_internal(r); }
 uint64_t raft_core_last_applied(raft_core_t* r) { return r->last_applied; }
 bool raft_core_activity_accepted(raft_core_t* r) { return r->activity_accepted; }
+
+// PHASE 5 (Gap 17): Helper
+uint64_t raft_core_leader_id(raft_core_t* r) { return r->leader_id; }
 
 size_t raft_core_peers(raft_core_t* r, uint64_t* out_peers) {
     if (out_peers) {

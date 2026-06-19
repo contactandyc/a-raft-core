@@ -35,10 +35,13 @@ MACRO_TEST(codec_rejects_missing_entry_payload_bytes) {
     memcpy(buf + 74, &num_entries, 8);
 
     uint32_t fake_payload_len = 10000;
-    memcpy(buf + 82 + 8 + 8 + 1, &fake_payload_len, 4);
+
+    // (Header + term + index + type) + Phase 5 Headers (client_id + client_seq)
+    // 82 + 8 + 8 + 1 + 8 + 8 = 115
+    memcpy(buf + 115, &fake_payload_len, 4);
 
     raft_msg_t m;
-    int res = raft_codec_deserialize_msg(buf, 108, &m);
+    int res = raft_codec_deserialize_msg(buf, 120, &m);
 
     MACRO_ASSERT_EQ_INT(res, -1);
 }

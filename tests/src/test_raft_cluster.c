@@ -47,7 +47,8 @@ static void on_test_check(uv_timer_t* handle) {
     // STATE 0: Wait for Leader -> Propose Payload 1
     if (cluster_state == 0 && leader) {
         printf("\n[Stage 1] Leader elected! Proposing payload 1...\n");
-        raft_node_propose(leader, (const uint8_t*)"PAYLOAD_1", 9);
+        // Added Phase 5 args: client_id=1, client_seq=1
+        raft_node_propose(leader, (const uint8_t*)"PAYLOAD_1", 9, 1, 1, NULL);
         cluster_state = 1;
     }
     // STATE 1: Wait for Commit -> Isolate Node 3 logically -> Propose Payload 2
@@ -55,11 +56,10 @@ static void on_test_check(uv_timer_t* handle) {
         if (c1 >= 2 && c2 >= 2 && c3 >= 2) {
             printf("[Stage 2] Payload 1 committed. Logically isolating Node 3...\n");
 
-            // Kill its networking logically without destroying the memory bounds
             servers[2].network_isolated = true;
 
-            // Propose new data while it is isolated
-            raft_node_propose(leader, (const uint8_t*)"PAYLOAD_2", 9);
+            // Added Phase 5 args: client_id=1, client_seq=2
+            raft_node_propose(leader, (const uint8_t*)"PAYLOAD_2", 9, 1, 2, NULL);
             cluster_state = 2;
         }
     }

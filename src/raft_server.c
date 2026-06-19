@@ -469,12 +469,25 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     reset_election_timer(node);
 }
 
-void raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len) {
-    raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)payload, .data_len = len };
+// PHASE 5 (Gaps 15, 16, 17): Secure Proposal Routing with Backpressure
+int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id) {
+
+    if (raft_core_state(node->core) != RAFT_STATE_LEADER) {
+        if (out_leader_id) *out_leader_id = raft_core_leader_id(node->core);
+        return RAFT_ERR_NOT_LEADER;
+    }
+
+    if (raft_core_last_index(node->core) - raft_core_commit_index(node->core) > 2000) {
+        return RAFT_ERR_QUEUE_FULL;
+    }
+
+    raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = client_id, .client_seq = client_seq, .data = (uint8_t*)payload, .data_len = len };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
 
     raft_core_step(node->core, &prop);
     raft_node_pump(node);
+
+    return RAFT_OK;
 }
 
 // PHASE 4 (Gap 13): Expose safe linearizable read interface
