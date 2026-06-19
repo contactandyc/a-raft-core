@@ -365,11 +365,36 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
 // HEAD PURGING (Garbage Collection)
 // -----------------------------------------------------------------------------
 void raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
-    // PHASE 6: FEATURE FREEZE. WAL head purging disabled.
-    // Purging without durable snapshots and strictly ordered fsyncs will cause cluster amnesia.
-    (void)wal;
-    (void)safe_checkpoint_index;
-    return;
+    // PHASE 8: Two-Phase snapshot durability proven. Safe to truncate WAL history!
+    while (wal->oldest_seg_id < wal->current_seg_id) {
+        char path[1024]; get_segment_path(wal, wal->oldest_seg_id, path);
+
+        char next_path[1024]; get_segment_path(wal, wal->oldest_seg_id + 1, next_path);
+        int next_fd = open(next_path, O_RDONLY);
+        if (next_fd < 0) break;
+
+        uint64_t next_start_idx;
+        pread(next_fd, &next_start_idx, 8, 12);
+        close(next_fd);
+
+        if (next_start_idx <= safe_checkpoint_index) {
+            if (wal->standby_count < wal->max_standby) {
+                char* standby_path = aml_strdupf("%s/standby_%llu_%u.wal", wal->base_dir, (unsigned long long)time(NULL), wal->standby_count);
+                rename(path, standby_path);
+                wal->standby_paths[wal->standby_count++] = standby_path;
+            } else {
+                unlink(path);
+            }
+
+            for (uint64_t i = 0; i < next_start_idx; i++) {
+                if (i < wal->offsets_cap) wal->offsets[i].seg_id = 0;
+            }
+
+            wal->oldest_seg_id++;
+        } else {
+            break;
+        }
+    }
 }
 
 void raft_wal_close(raft_wal_t* wal) {

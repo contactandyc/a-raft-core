@@ -69,6 +69,10 @@ struct raft_core_s {
 
     // PHASE 6: Volatile deduplication removed. State machine handles durable deduplication in Phase 7.
     uint64_t leader_id;
+
+    bool pending_snapshot;
+    uint8_t* pending_snapshot_data;
+    size_t pending_snapshot_len;
 };
 
 // -----------------------------------------------------------------------------
@@ -326,6 +330,7 @@ void raft_core_destroy(raft_core_t* r) {
         free(r->msg_queue);
     }
     if (r->read_states) free(r->read_states);
+    if (r->pending_snapshot_data) free(r->pending_snapshot_data);
     free(r);
 }
 
@@ -698,10 +703,57 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         send_msg(r, res);
     }
     else if (msg->type == MSG_INSTALL_SNAPSHOT) {
-        // PHASE 6: Freeze snapshots
         raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
+
+        if (msg->term >= r->current_term) {
+            r->state = RAFT_STATE_FOLLOWER;
+            r->activity_accepted = true;
+
+            if (msg->index > r->snapshot_index) {
+                // PHASE 8: Strict Suffix Preservation Check!
+                bool suffix_match = false;
+                uint64_t my_last_idx = raft_core_last_index_internal(r);
+                if (msg->index <= my_last_idx && log_term(r, msg->index) == msg->log_term) {
+                    suffix_match = true;
+                }
+
+                if (suffix_match) {
+                    // Safe overlap: Slice the prefix off, but keep our valid uncommitted tail!
+                    size_t keep_len = my_last_idx - msg->index + 1;
+                    for (uint64_t i = r->snapshot_index + 1; i <= msg->index; i++) {
+                        raft_entry_t* e = log_get(r, i);
+                        if (e && e->data) free(e->data);
+                    }
+                    memmove(&r->log[1], &r->log[msg->index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
+                    r->log_len = keep_len;
+                } else {
+                    // Fatal mismatch: Wipe the entire invalid local history
+                    for (size_t i = 0; i < r->log_len; i++) {
+                        if (r->log[i].data) free(r->log[i].data);
+                    }
+                    r->log_len = 1;
+                }
+
+                r->snapshot_index = msg->index;
+                r->snapshot_term = msg->log_term;
+                r->log[0].index = msg->index;
+                r->log[0].term = msg->log_term;
+                r->log[0].data = NULL;
+                r->log[0].data_len = 0;
+
+                // Load payload into pending state for the pump to safely extract
+                r->pending_snapshot = true;
+                if (r->pending_snapshot_data) free(r->pending_snapshot_data);
+                r->pending_snapshot_data = msg->snapshot_len > 0 ? malloc(msg->snapshot_len) : NULL;
+                if (msg->snapshot_len > 0 && r->pending_snapshot_data) {
+                    memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
+                }
+                r->pending_snapshot_len = msg->snapshot_len;
+            }
+            res.reject = false;
+            res.index = msg->index;
+        }
         send_msg(r, res);
-        return;
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
@@ -810,10 +862,30 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     ready.read_states = r->read_states;
     ready.num_read_states = r->num_read_states;
 
+    // PHASE 8: Export snapshot to pump
+    ready.install_snapshot = r->pending_snapshot;
+    ready.snapshot_index = r->snapshot_index;
+    ready.snapshot_term = r->snapshot_term;
+    ready.snapshot_data = r->pending_snapshot_data;
+    ready.snapshot_len = r->pending_snapshot_len;
+
     return ready;
 }
 
 void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index) {
+
+    // PHASE 8: Enforce that tracking pointers never desync behind a snapshot boundary
+    if (r->pending_snapshot) {
+        if (r->last_saved_index < r->snapshot_index) r->last_saved_index = r->snapshot_index;
+        if (r->commit_index < r->snapshot_index) r->commit_index = r->snapshot_index;
+        if (r->last_applied < r->snapshot_index) r->last_applied = r->snapshot_index;
+
+        if (r->pending_snapshot_data) free(r->pending_snapshot_data);
+        r->pending_snapshot_data = NULL;
+        r->pending_snapshot_len = 0;
+        r->pending_snapshot = false;
+    }
+
     if (saved_index > r->last_saved_index) r->last_saved_index = saved_index;
 
     for(uint64_t i = r->last_applied + 1; i <= applied_index; i++) {
@@ -854,10 +926,27 @@ void raft_core_advance_all(raft_core_t* r) {
 }
 
 void raft_core_compact(raft_core_t* r, uint64_t compact_index) {
-    // PHASE 6: Feature freeze compaction
-    (void)r;
-    (void)compact_index;
-    return;
+    if (compact_index <= r->snapshot_index || compact_index > r->last_applied) return;
+
+    r->snapshot_term = log_term(r, compact_index);
+    size_t keep_len = r->log_len - (compact_index - r->snapshot_index);
+
+    for (uint64_t i = r->snapshot_index + 1; i <= compact_index; i++) {
+        raft_entry_t* e = log_get(r, i);
+        if (e && e->data) free(e->data);
+    }
+
+    memmove(&r->log[1], &r->log[compact_index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
+    r->log_len = keep_len;
+    r->snapshot_index = compact_index;
+
+    r->log[0].index = compact_index;
+    r->log[0].term = r->snapshot_term;
+    r->log[0].type = ENTRY_NORMAL;
+    r->log[0].client_id = 0;
+    r->log[0].client_seq = 0;
+    r->log[0].data = NULL;
+    r->log[0].data_len = 0;
 }
 
 raft_state_t raft_core_state(raft_core_t* r) { return r->state; }

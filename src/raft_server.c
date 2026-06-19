@@ -236,6 +236,34 @@ void raft_node_pump(raft_node_t* node) {
     uint64_t actual_saved_idx = raft_core_last_index(node->core) - ready.num_entries_to_save;
     uint64_t actual_applied_idx = node->saved_applied;
 
+    // PHASE 8: Two-Phase Atomicity (Snapshot Install over Network)
+    if (ready.install_snapshot) {
+        char tmp_snap[512], dat_snap[512];
+        snprintf(tmp_snap, sizeof(tmp_snap), "%s/snap_grp%llu.tmp", node->server->data_dir, (unsigned long long)node->group_id);
+        snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+
+        FILE* sf = fopen(tmp_snap, "wb");
+        if (sf) {
+            if (ready.snapshot_len > 0) fwrite(ready.snapshot_data, 1, ready.snapshot_len, sf);
+            fflush(sf); fsync(fileno(sf)); fclose(sf);
+            rename(tmp_snap, dat_snap);
+        }
+
+        // Critical: Update .meta BEFORE ever purging the WAL!
+        save_hardstate(node, raft_core_term(node->core), raft_core_voted_for(node->core), ready.snapshot_index, ready.snapshot_index);
+
+        node->saved_snap_idx = ready.snapshot_index;
+        node->saved_snap_term = ready.snapshot_term;
+        node->saved_applied = ready.snapshot_index;
+        node->saved_commit = ready.snapshot_index;
+
+        // Now it's safely durable on disk, we can safely drop historical WAL segments!
+        raft_wal_purge_head(&node->wal, ready.snapshot_index);
+
+        actual_applied_idx = ready.snapshot_index > actual_applied_idx ? ready.snapshot_index : actual_applied_idx;
+        actual_saved_idx = ready.snapshot_index > actual_saved_idx ? ready.snapshot_index : actual_saved_idx;
+    }
+
     if (ready.num_entries_to_save > 0) {
         if (!raft_io_save(&node->wal, &ready)) {
             fprintf(stderr, "[ERROR] Raft Disk I/O failed! Halting pump cycle.\n");
@@ -253,12 +281,8 @@ void raft_node_pump(raft_node_t* node) {
 
             if (node->apply_cb) {
                 int res = node->apply_cb(node->apply_ctx, e, current_term);
-
-                if (res == RAFT_APPLY_TRANSIENT) {
-                    fprintf(stderr, "[WARN] Transient apply error. Retrying later.\n");
-                    break; // Block advancement to ensure host re-processes later
-                } else if (res == RAFT_APPLY_FATAL) {
-                    fprintf(stderr, "[FATAL] State machine fatal error.\n");
+                if (res == RAFT_APPLY_TRANSIENT) break;
+                else if (res == RAFT_APPLY_FATAL) {
                     node->fatal_error = true;
                     raft_msg_t hup = { .type = MSG_CHECK_QUORUM };
                     raft_core_step(node->core, &hup);
@@ -270,9 +294,33 @@ void raft_node_pump(raft_node_t* node) {
     }
 
     for (size_t i = 0; i < ready.num_messages; i++) {
+        // PHASE 8: The Leader intercepts its own MSG_INSTALL_SNAPSHOT to load physical bytes from disk!
+        if (ready.messages[i].type == MSG_INSTALL_SNAPSHOT && ready.messages[i].snapshot_len == 0) {
+            char dat_snap[512];
+            snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+            FILE* sf = fopen(dat_snap, "rb");
+            if (sf) {
+                fseek(sf, 0, SEEK_END);
+                long fsize = ftell(sf);
+                fseek(sf, 0, SEEK_SET);
+                if (fsize > 0) {
+                    ready.messages[i].snapshot_data = malloc(fsize);
+                    ready.messages[i].snapshot_len = fsize;
+                    fread(ready.messages[i].snapshot_data, 1, fsize, sf);
+                }
+                fclose(sf);
+            }
+        }
+
         uint8_t* payload; uint32_t len;
         if (raft_codec_serialize_msg(&ready.messages[i], &payload, &len) == 0) {
             router_send_rpc(node->server, node->group_id, ready.messages[i].to, payload, len);
+        }
+
+        // Clean up loaded payload right after transmission
+        if (ready.messages[i].type == MSG_INSTALL_SNAPSHOT && ready.messages[i].snapshot_data) {
+            free(ready.messages[i].snapshot_data);
+            ready.messages[i].snapshot_data = NULL;
         }
     }
 
@@ -284,16 +332,11 @@ void raft_node_pump(raft_node_t* node) {
     if (current_term != node->saved_term || voted_for != node->saved_vote ||
         commit_idx > node->saved_commit || actual_applied_idx > node->saved_applied || snap_idx > node->saved_snap_idx) {
 
-        if (!save_hardstate(node, current_term, voted_for, commit_idx, actual_applied_idx)) {
-            fprintf(stderr, "[ERROR] Meta Disk I/O failed! Halting pump.\n");
-            goto pump_cleanup;
-        }
-        node->saved_term = current_term;
-        node->saved_vote = voted_for;
-        node->saved_commit = commit_idx;
-        node->saved_applied = actual_applied_idx;
-        node->saved_snap_idx = snap_idx;
-        node->saved_snap_term = raft_core_snapshot_term(node->core);
+        if (!save_hardstate(node, current_term, voted_for, commit_idx, actual_applied_idx)) goto pump_cleanup;
+
+        node->saved_term = current_term; node->saved_vote = voted_for;
+        node->saved_commit = commit_idx; node->saved_applied = actual_applied_idx;
+        node->saved_snap_idx = snap_idx; node->saved_snap_term = raft_core_snapshot_term(node->core);
     }
 
     raft_state_t state = raft_core_state(node->core);

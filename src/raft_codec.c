@@ -10,14 +10,18 @@
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
     if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
 
-    // Base Frame: 82 bytes
-    uint64_t len = 82;
+    // Base Frame (82) + 4 bytes for Phase 8 snapshot lengths
+    uint64_t len = 86;
 
     for (size_t i = 0; i < m->num_entries; i++) {
-        // PHASE 5: Frame bounds expand to 37 bytes per entry to pack the 16-byte dedup headers
         uint64_t entry_size = 8 + 8 + 1 + 8 + 8 + 4 + (uint64_t)m->entries[i].data_len;
         if (len > RAFT_MAX_FRAME_SIZE - entry_size) return -1;
         len += entry_size;
+    }
+
+    if (m->snapshot_len > 0) {
+        if (len > RAFT_MAX_FRAME_SIZE - m->snapshot_len) return -1;
+        len += m->snapshot_len;
     }
 
     uint8_t* buf = malloc((size_t)len);
@@ -47,7 +51,6 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         memcpy(buf+pos, &m->entries[i].index, 8); pos += 8;
         buf[pos++] = m->entries[i].type;
 
-        // PHASE 5
         memcpy(buf+pos, &m->entries[i].client_id, 8); pos += 8;
         memcpy(buf+pos, &m->entries[i].client_seq, 8); pos += 8;
 
@@ -58,6 +61,13 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         }
     }
 
+    // PHASE 8: Pack physical snapshot bytes
+    uint32_t snap_len = (uint32_t)m->snapshot_len;
+    memcpy(buf+pos, &snap_len, 4); pos += 4;
+    if (snap_len > 0 && m->snapshot_data != NULL) {
+        memcpy(buf+pos, m->snapshot_data, snap_len); pos += snap_len;
+    }
+
     *out_buf = buf;
     *out_len = (uint32_t)len;
     return 0;
@@ -65,7 +75,7 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
 
 int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) {
     memset(m, 0, sizeof(raft_msg_t));
-    if (!buf || len < 82) return -1;
+    if (!buf || len < 86) return -1;
 
     uint32_t pos = 0;
     m->type = buf[pos++];
@@ -90,7 +100,6 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     m->num_entries = num_e;
 
     if (num_e > 0) {
-        // PHASE 5 boundary validation (37 bytes per entry header)
         if (pos + (num_e * 37) > len) return -1;
 
         m->entries = calloc(num_e, sizeof(raft_entry_t));
@@ -103,7 +112,6 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
             memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
             m->entries[i].type = buf[pos++];
 
-            // PHASE 5
             memcpy(&m->entries[i].client_id, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].client_seq, buf+pos, 8); pos += 8;
 
@@ -119,6 +127,20 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
             }
         }
     }
+
+    // PHASE 8: Rehydrate Snapshot Bytes Safely
+    if (pos + 4 <= len) {
+        uint32_t slen;
+        memcpy(&slen, buf+pos, 4); pos += 4;
+        m->snapshot_len = slen;
+        if (slen > 0) {
+            if (pos + slen > len) goto cleanup_error;
+            m->snapshot_data = malloc(slen);
+            if (!m->snapshot_data) goto cleanup_error;
+            memcpy(m->snapshot_data, buf+pos, slen); pos += slen;
+        }
+    }
+
     return 0;
 
 cleanup_error:
@@ -134,5 +156,10 @@ void raft_codec_free_msg_entries(raft_msg_t* m) {
         free(m->entries);
         m->entries = NULL;
         m->num_entries = 0;
+    }
+    if (m->snapshot_data) {
+        free(m->snapshot_data);
+        m->snapshot_data = NULL;
+        m->snapshot_len = 0;
     }
 }

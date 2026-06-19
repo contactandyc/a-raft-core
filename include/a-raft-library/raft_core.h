@@ -49,11 +49,8 @@ typedef struct {
     uint64_t term;
     uint64_t index;
     entry_type_t type;
-
-    // PHASE 7: Sequence numbers passed to Host Machine for Durable Deduplication
     uint64_t client_id;
     uint64_t client_seq;
-
     uint8_t* data;
     size_t   data_len;
 } raft_entry_t;
@@ -66,15 +63,13 @@ typedef struct {
     uint64_t log_term;
     uint64_t index;
     uint64_t commit;
-
     uint64_t conflict_term;
     uint64_t conflict_index;
-
     uint64_t read_seq;
-
     raft_entry_t* entries;
     size_t num_entries;
 
+    // PHASE 8: Snapshot networking support
     uint8_t* snapshot_data;
     size_t snapshot_len;
 
@@ -98,6 +93,13 @@ typedef struct {
 
     raft_read_state_t* read_states;
     size_t num_read_states;
+
+    // PHASE 8: Hand off verified snapshot payloads for Two-Phase installation
+    bool install_snapshot;
+    uint64_t snapshot_index;
+    uint64_t snapshot_term;
+    uint8_t* snapshot_data;
+    size_t snapshot_len;
 } raft_ready_t;
 
 typedef struct raft_core_s raft_core_t;
@@ -105,7 +107,6 @@ typedef struct raft_core_s raft_core_t;
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers);
 void         raft_core_destroy(raft_core_t* r);
 
-// PHASE 7: Restorer securely ingests absolute snapshot and membership topologies
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index, uint64_t applied_index,
                                uint64_t snapshot_index, uint64_t snapshot_term,
@@ -133,7 +134,6 @@ uint64_t     raft_core_leader_id(raft_core_t* r);
 void         raft_core_add_learner(raft_core_t* r, uint64_t peer_id);
 void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
 
-// PHASE 7: Internal Extractor APIs for safe .meta snapshots
 size_t       raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners);
 uint64_t     raft_core_snapshot_index(raft_core_t* r);
 uint64_t     raft_core_snapshot_term(raft_core_t* r);
