@@ -114,9 +114,9 @@ MACRO_TEST(cluster_tcp_crash_recovery_and_resync) {
     uint64_t peers1[] = {2, 3};
     uint64_t peers2[] = {1, 3};
     uint64_t peers3[] = {1, 2};
-    raft_node_init(nodes[0], &servers[0], 0, peers1, 2, dummy_apply_cb, NULL);
-    raft_node_init(nodes[1], &servers[1], 0, peers2, 2, dummy_apply_cb, NULL);
-    raft_node_init(nodes[2], &servers[2], 0, peers3, 2, dummy_apply_cb, NULL);
+    raft_node_init(nodes[0], &servers[0], 0, peers1, 2, dummy_apply_cb, NULL, NULL, NULL);
+    raft_node_init(nodes[1], &servers[1], 0, peers2, 2, dummy_apply_cb, NULL, NULL, NULL);
+    raft_node_init(nodes[2], &servers[2], 0, peers3, 2, dummy_apply_cb, NULL, NULL, NULL);
 
     raft_server_connect(&servers[0], "127.0.0.1", 18082, 2);
     raft_server_connect(&servers[0], "127.0.0.1", 18083, 3);

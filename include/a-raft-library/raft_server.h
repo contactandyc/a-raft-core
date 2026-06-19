@@ -23,12 +23,14 @@ typedef struct {
 } raft_net_header_t;
 #pragma pack(pop)
 
-// PHASE 7: Strict application progress tracking
 #define RAFT_APPLY_OK 0
-#define RAFT_APPLY_TRANSIENT 1 // Triggers a retry on next pump cycle
-#define RAFT_APPLY_FATAL 2     // Permanent state corruption, triggers fatal stepdown
+#define RAFT_APPLY_TRANSIENT 1
+#define RAFT_APPLY_FATAL 2
 
 typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
+
+// PHASE 9: Callback for linearizable read resolution
+typedef void (*raft_read_cb)(void* ctx, uint64_t read_seq);
 
 typedef struct raft_node_s raft_node_t;
 typedef struct raft_server_s raft_server_t;
@@ -83,7 +85,6 @@ struct raft_node_s {
     raft_core_t* core;
     raft_wal_t wal;
 
-    // PHASE 7: Bounding context expanded strictly to prevent compacted log amnesia
     uint64_t saved_term;
     uint64_t saved_vote;
     uint64_t saved_commit;
@@ -96,6 +97,14 @@ struct raft_node_s {
 
     raft_apply_fn apply_cb;
     void* apply_ctx;
+
+    raft_read_cb read_cb;
+    void* read_ctx;
+
+    // PHASE 9: Blocked ReadIndex queue waiting for actual_applied_idx >= barrier
+    raft_read_state_t pending_reads[128];
+    size_t num_pending_reads;
+
     bool fatal_error;
 };
 
@@ -103,9 +112,10 @@ int  raft_server_init(raft_server_t* server, uv_loop_t* loop, uint64_t node_id, 
 int  raft_server_listen(raft_server_t* server, const char* ip, int port);
 void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64_t target_node_id);
 
-void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers, raft_apply_fn apply_cb, void* apply_ctx);
+void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers,
+                    raft_apply_fn apply_cb, void* apply_ctx, raft_read_cb read_cb, void* read_ctx);
 
 int  raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id);
-void raft_node_read_index(raft_node_t* node, uint64_t read_seq);
+int  raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_leader_id);
 
 #endif // RAFT_SERVER_H
