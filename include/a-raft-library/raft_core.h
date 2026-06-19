@@ -10,10 +10,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// PHASE 5: Standardized API Error Codes
 #define RAFT_OK 0
 #define RAFT_ERR_NOT_LEADER -1
 #define RAFT_ERR_QUEUE_FULL -2
+#define RAFT_ERR_NOMEM -3
 
 typedef enum {
     RAFT_STATE_FOLLOWER,
@@ -50,7 +50,7 @@ typedef struct {
     uint64_t index;
     entry_type_t type;
 
-    // PHASE 5 (Gap 16): Explicit Sequence Deduplication
+    // PHASE 7: Sequence numbers passed to Host Machine for Durable Deduplication
     uint64_t client_id;
     uint64_t client_seq;
 
@@ -105,8 +105,10 @@ typedef struct raft_core_s raft_core_t;
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers);
 void         raft_core_destroy(raft_core_t* r);
 
-raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
+// PHASE 7: Restorer securely ingests absolute snapshot and membership topologies
+raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index, uint64_t applied_index,
+                               uint64_t snapshot_index, uint64_t snapshot_term,
                                raft_entry_t* entries, size_t num_entries);
 
 void         raft_core_step(raft_core_t* r, raft_msg_t* msg);
@@ -126,11 +128,14 @@ uint64_t     raft_core_last_applied(raft_core_t* r);
 bool         raft_core_activity_accepted(raft_core_t* r);
 
 size_t       raft_core_peers(raft_core_t* r, uint64_t* out_peers);
-
-// PHASE 5 (Gap 17): Network Redirection
 uint64_t     raft_core_leader_id(raft_core_t* r);
 
 void         raft_core_add_learner(raft_core_t* r, uint64_t peer_id);
 void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
+
+// PHASE 7: Internal Extractor APIs for safe .meta snapshots
+size_t       raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners);
+uint64_t     raft_core_snapshot_index(raft_core_t* r);
+uint64_t     raft_core_snapshot_term(raft_core_t* r);
 
 #endif // RAFT_CORE_H

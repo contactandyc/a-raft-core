@@ -66,7 +66,6 @@ static void ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
 // -----------------------------------------------------------------------------
 // LIFECYCLE & RECOVERY
 // -----------------------------------------------------------------------------
-
 int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, uint32_t max_standby) {
     memset(wal, 0, sizeof(raft_wal_t));
     strncpy(wal->base_dir, dir, sizeof(wal->base_dir) - 1);
@@ -83,7 +82,6 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
     DIR *dp = opendir(dir);
     struct dirent *ep;
 
-    // 1. Scan Directory
     if (dp) {
         while ((ep = readdir(dp))) {
             if (strncmp(ep->d_name, "standby_", 8) == 0) {
@@ -95,7 +93,7 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
                 }
             } else if (strstr(ep->d_name, ".wal")) {
                 uint64_t seg_id;
-                if (sscanf(ep->d_name, "%llu.wal", &seg_id) == 1) {
+                if (sscanf(ep->d_name, "%llu.wal", (unsigned long long*)&seg_id) == 1) {
                     if (seg_id < min_seg) min_seg = seg_id;
                     if (seg_id > max_seg) max_seg = seg_id;
                 }
@@ -104,7 +102,6 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
         closedir(dp);
     }
 
-    // 2. Format Fresh
     if (max_seg == 0) {
         wal->oldest_seg_id = 1;
         wal->current_seg_id = 1;
@@ -122,7 +119,6 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
         return 0;
     }
 
-    // 3. Recover Existing Timeline
     wal->oldest_seg_id = min_seg;
     wal->current_seg_id = max_seg;
 
@@ -144,7 +140,7 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
             type = header[24];
             (void)type;
 
-            if (len == 0 && index == 0) break; // End of written data
+            if (len == 0 && index == 0) break;
 
             uint8_t* payload = len > 0 ? aml_malloc(len) : NULL;
             if (len > 0 && pread(fd, payload, len, offset + RAFT_WAL_FRAME_HEADER_SIZE) != len) {
@@ -153,8 +149,8 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
                 break;
             }
 
-            // PHASE 2 (Gap 6): Full Frame CRC Verification on Boot
-            uint32_t computed_crc = crc32_update(~0U, header + 4, 21);
+            // PHASE 7 FIX: Calculate CRC over the new 37-byte metadata slice!
+            uint32_t computed_crc = crc32_update(~0U, header + 4, 37);
             if (len > 0) computed_crc = crc32_update(computed_crc, payload, len);
             computed_crc = ~computed_crc;
 
@@ -177,7 +173,7 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
             wal->current_seg_id = seg;
             wal->active_fd = fd;
             wal->file_offset = offset;
-            ftruncate(fd, offset); // Slice off dead bytes
+            ftruncate(fd, offset);
 
             for (uint64_t bad_seg = seg + 1; bad_seg <= max_seg; bad_seg++) {
                 char bad_path[1024]; get_segment_path(wal, bad_seg, bad_path);
@@ -219,7 +215,7 @@ static void raft_wal_rotate(raft_wal_t* wal, uint64_t next_seq) {
     wal->file_offset = RAFT_WAL_SEG_HEADER_SIZE;
 }
 
-int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type, const uint8_t* payload, uint32_t len) {
+int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type, uint64_t client_id, uint64_t client_seq, const uint8_t* payload, uint32_t len) {
     uint32_t total_size = RAFT_WAL_FRAME_HEADER_SIZE + len;
 
     if (wal->file_offset + wal->batch_len + total_size > wal->segment_size_bytes) {
@@ -228,21 +224,24 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
     }
 
     if (wal->batch_len + total_size > wal->batch_cap) {
-        wal->batch_cap = (wal->batch_len + total_size) * 2;
-        wal->batch_buf = aml_realloc(wal->batch_buf, wal->batch_cap);
+        size_t new_cap = (wal->batch_len + total_size) * 2;
+        uint8_t *new_buf = aml_realloc(wal->batch_buf, new_cap);
+        if (!new_buf) return -1;
+        wal->batch_buf = new_buf;
+        wal->batch_cap = new_cap;
     }
 
     uint8_t* ptr = wal->batch_buf + wal->batch_len;
 
-    // Pack Metadata
     memcpy(ptr + 4, &len, 4);
     memcpy(ptr + 8, &term, 8);
     memcpy(ptr + 16, &index, 8);
     ptr[24] = type;
+    memcpy(ptr + 25, &client_id, 8);
+    memcpy(ptr + 33, &client_seq, 8);
     if (len > 0) memcpy(ptr + RAFT_WAL_FRAME_HEADER_SIZE, payload, len);
 
-    // PHASE 2 (Gap 6): Full Frame CRC Generation
-    uint32_t crc = crc32_update(~0U, ptr + 4, 21);
+    uint32_t crc = crc32_update(~0U, ptr + 4, 37);
     if (len > 0) crc = crc32_update(crc, payload, len);
     crc = ~crc;
 
@@ -251,7 +250,6 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
     ensure_offset_capacity(wal, index);
     wal->offsets[index].seg_id = wal->current_seg_id;
     wal->offsets[index].offset = wal->file_offset + wal->batch_len;
-
     wal->max_disk_index = index;
     wal->batch_len += total_size;
     return 0;
@@ -273,12 +271,11 @@ int raft_wal_flush_batch(raft_wal_t* wal) {
 // -----------------------------------------------------------------------------
 // READ CACHE
 // -----------------------------------------------------------------------------
-
-int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint8_t** out_payload, uint32_t* out_len) {
+int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint64_t* out_cid, uint64_t* out_cseq, uint8_t** out_payload, uint32_t* out_len) {
     if (target_index == 0 || target_index > wal->max_disk_index) return 0;
 
     raft_wal_loc_t loc = wal->offsets[target_index];
-    if (loc.seg_id == 0) return 0; // Truncated or purged
+    if (loc.seg_id == 0) return 0;
 
     if (wal->read_seg_id != loc.seg_id) {
         if (wal->read_fd >= 0) close(wal->read_fd);
@@ -295,10 +292,13 @@ int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_te
     memcpy(&len, header + 4, 4);
     memcpy(out_term, header + 8, 8);
     *out_type = header[24];
+    memcpy(out_cid, header + 25, 8);
+    memcpy(out_cseq, header + 33, 8);
     *out_len = len;
 
     if (len > 0) {
         *out_payload = aml_malloc(len);
+        if (!*out_payload) return 0;
         if (pread(wal->read_fd, *out_payload, len, loc.offset + RAFT_WAL_FRAME_HEADER_SIZE) != len) {
             aml_free(*out_payload);
             *out_payload = NULL;
@@ -308,20 +308,18 @@ int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_te
         *out_payload = NULL;
     }
 
-    // PHASE 2 (Gap 7): Read-time Full Frame CRC Validation
-    uint32_t computed_crc = crc32_update(~0U, header + 4, 21);
+    uint32_t computed_crc = crc32_update(~0U, header + 4, 37);
     if (len > 0) computed_crc = crc32_update(computed_crc, *out_payload, len);
     computed_crc = ~computed_crc;
 
     if (stored_crc != computed_crc) {
         if (*out_payload) aml_free(*out_payload);
         *out_payload = NULL;
-        return 0; // Data corrupted, throw away safely
+        return 0;
     }
 
     return 1;
 }
-
 // -----------------------------------------------------------------------------
 // TAIL TRUNCATION (Raft Conflicts)
 // -----------------------------------------------------------------------------
@@ -366,37 +364,12 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
 // -----------------------------------------------------------------------------
 // HEAD PURGING (Garbage Collection)
 // -----------------------------------------------------------------------------
-
 void raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
-    while (wal->oldest_seg_id < wal->current_seg_id) {
-        char path[1024]; get_segment_path(wal, wal->oldest_seg_id, path);
-
-        char next_path[1024]; get_segment_path(wal, wal->oldest_seg_id + 1, next_path);
-        int next_fd = open(next_path, O_RDONLY);
-        if (next_fd < 0) break;
-
-        uint64_t next_start_idx;
-        pread(next_fd, &next_start_idx, 8, 12);
-        close(next_fd);
-
-        if (next_start_idx <= safe_checkpoint_index) {
-            if (wal->standby_count < wal->max_standby) {
-                char* standby_path = aml_strdupf("%s/standby_%llu_%u.wal", wal->base_dir, (unsigned long long)time(NULL), wal->standby_count);
-                rename(path, standby_path);
-                wal->standby_paths[wal->standby_count++] = standby_path;
-            } else {
-                unlink(path);
-            }
-
-            for (uint64_t i = 0; i < next_start_idx; i++) {
-                if (i < wal->offsets_cap) wal->offsets[i].seg_id = 0;
-            }
-
-            wal->oldest_seg_id++;
-        } else {
-            break;
-        }
-    }
+    // PHASE 6: FEATURE FREEZE. WAL head purging disabled.
+    // Purging without durable snapshots and strictly ordered fsyncs will cause cluster amnesia.
+    (void)wal;
+    (void)safe_checkpoint_index;
+    return;
 }
 
 void raft_wal_close(raft_wal_t* wal) {

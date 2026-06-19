@@ -24,12 +24,13 @@ MACRO_TEST(io_save_and_boot) {
     cleanup_wal_files(wal_path);
 
     uint64_t peers[] = {2, 3};
+    bool learners[] = {false, false};
     raft_wal_t wal;
 
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
     // Add 0 for applied bounds
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 0, 0, 0, 0);
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 2, 0, 0, 0, 0, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
     raft_msg_t hup = { .type = MSG_HUP };
@@ -62,7 +63,7 @@ MACRO_TEST(io_save_and_boot) {
 
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
-    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, 2, saved_term, 1, saved_commit, 0);
+    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, learners, 2, saved_term, 1, saved_commit, 0, 0, 0);
 
     MACRO_ASSERT_TRUE(recovered_core != NULL);
     MACRO_ASSERT_EQ_INT(raft_core_term(recovered_core), saved_term);
@@ -87,7 +88,7 @@ MACRO_TEST(io_boot_with_purged_wal) {
 
     uint8_t dummy[1024] = {0};
     for (uint64_t i = 1; i <= 2000; i++) {
-        raft_wal_append(&wal, 1, i, 0, dummy, 1024); // Spills into multiple 1MB files
+        raft_wal_append(&wal, 1, i, 0, 0, 0, dummy, 1024);
     }
     raft_wal_flush_batch(&wal);
 
@@ -98,7 +99,8 @@ MACRO_TEST(io_boot_with_purged_wal) {
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 2), 0);
 
     uint64_t peers[] = {2, 3};
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, 2, 1, 0, 1000, 1000);
+    bool learners[] = {false, false};
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 2, 1, 0, 1000, 1000, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
     // The WAL safely anchored itself at the first valid, un-purged index!

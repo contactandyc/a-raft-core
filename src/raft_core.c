@@ -9,7 +9,6 @@
 
 #define MAX_PEERS 64
 #define MAX_PENDING_READS 128
-#define MAX_CLIENT_SESSIONS 256
 
 typedef struct {
     uint64_t read_seq;
@@ -20,12 +19,6 @@ typedef struct {
     bool acked_by[MAX_PEERS];
     bool active;
 } pending_read_t;
-
-// PHASE 5: O(1) Deduplication Tracker
-typedef struct {
-    uint64_t client_id;
-    uint64_t client_seq;
-} client_session_t;
 
 struct raft_core_s {
     uint64_t id;
@@ -74,9 +67,8 @@ struct raft_core_s {
 
     uint64_t term_start_index;
 
-    // PHASE 5
+    // PHASE 6: Volatile deduplication removed. State machine handles durable deduplication in Phase 7.
     uint64_t leader_id;
-    client_session_t sessions[MAX_CLIENT_SESSIONS];
 };
 
 // -----------------------------------------------------------------------------
@@ -87,8 +79,21 @@ static void advance_commit_index(raft_core_t* r, uint64_t new_commit);
 
 static void send_msg(raft_core_t* r, raft_msg_t msg) {
     if (r->msg_queue_len >= r->msg_queue_cap) {
-        r->msg_queue_cap = r->msg_queue_cap == 0 ? 16 : r->msg_queue_cap * 2;
-        r->msg_queue = realloc(r->msg_queue, r->msg_queue_cap * sizeof(raft_msg_t));
+        size_t new_cap = r->msg_queue_cap == 0 ? 16 : r->msg_queue_cap * 2;
+        raft_msg_t* new_q = realloc(r->msg_queue, new_cap * sizeof(raft_msg_t));
+        if (!new_q) {
+            // PHASE 6: Prevent payload memory leak if realloc fails
+            if (msg.entries) {
+                for (size_t i = 0; i < msg.num_entries; i++) {
+                    if (msg.entries[i].data) free(msg.entries[i].data);
+                }
+                free(msg.entries);
+            }
+            if (msg.snapshot_data) free(msg.snapshot_data);
+            return;
+        }
+        r->msg_queue = new_q;
+        r->msg_queue_cap = new_cap;
     }
     msg.from = r->id;
     r->msg_queue[r->msg_queue_len++] = msg;
@@ -112,8 +117,11 @@ static raft_entry_t* log_get(raft_core_t* r, uint64_t index) {
 
 static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len) {
     if (r->log_len >= r->log_cap) {
-        r->log_cap = r->log_cap == 0 ? 16 : r->log_cap * 2;
-        r->log = realloc(r->log, r->log_cap * sizeof(raft_entry_t));
+        size_t new_cap = r->log_cap == 0 ? 16 : r->log_cap * 2;
+        raft_entry_t* new_log = realloc(r->log, new_cap * sizeof(raft_entry_t));
+        if (!new_log) return; // PHASE 6: Safe OOM Guard
+        r->log = new_log;
+        r->log_cap = new_cap;
     }
     uint64_t next_idx = raft_core_last_index_internal(r) + 1;
     raft_entry_t* e = &r->log[r->log_len++];
@@ -124,7 +132,7 @@ static void log_append(raft_core_t* r, uint64_t term, entry_type_t type, uint64_
     e->client_seq = cseq;
     e->data_len = data_len;
     e->data = data_len > 0 ? malloc(data_len) : NULL;
-    if (data_len > 0) memcpy(e->data, data, data_len);
+    if (data_len > 0 && e->data) memcpy(e->data, data, data_len);
 }
 
 static void log_truncate(raft_core_t* r, uint64_t index) {
@@ -146,9 +154,7 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
     uint64_t last = raft_core_last_index_internal(r);
 
     if (next <= r->snapshot_index) {
-        raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
-                           .index = r->snapshot_index, .log_term = r->snapshot_term };
-        send_msg(r, msg);
+        // PHASE 6: Feature Freeze - Snapshots disabled until Phase 8
         return;
     }
 
@@ -171,7 +177,7 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
         msg.entries[i].client_seq = src->client_seq;
         msg.entries[i].data_len = src->data_len;
         msg.entries[i].data = src->data_len > 0 ? malloc(src->data_len) : NULL;
-        if (src->data_len > 0) memcpy(msg.entries[i].data, src->data, src->data_len);
+        if (src->data_len > 0 && msg.entries[i].data) memcpy(msg.entries[i].data, src->data, src->data_len);
     }
 
     r->next_index[peer_idx] = next + num_entries;
@@ -199,9 +205,7 @@ static void become_leader(raft_core_t* r) {
     size_t total_voters = r->is_learner_self ? 0 : 1;
     for (size_t i = 0; i < r->num_peers; i++) if (!r->is_learner[i]) total_voters++;
 
-    if (total_voters <= 1 && !r->is_learner_self) {
-        advance_commit_index(r, r->term_start_index);
-    }
+    if (total_voters <= 1 && !r->is_learner_self) advance_commit_index(r, r->term_start_index);
 
     bcast_append(r);
 }
@@ -225,9 +229,7 @@ static void apply_config_changes(raft_core_t* r, uint64_t old_commit, uint64_t n
         uint64_t node_id = *(uint64_t*)e->data;
 
         if (type == ENTRY_CONF_ADD || type == ENTRY_CONF_ADD_LEARNER) {
-            if (node_id == r->id) {
-                r->is_learner_self = (type == ENTRY_CONF_ADD_LEARNER);
-            }
+            if (node_id == r->id) r->is_learner_self = (type == ENTRY_CONF_ADD_LEARNER);
 
             bool found = false;
             for (size_t j = 0; j < r->num_peers; j++) {
@@ -275,10 +277,6 @@ static void advance_commit_index(raft_core_t* r, uint64_t new_commit) {
     r->commit_index = new_commit;
 }
 
-// -----------------------------------------------------------------------------
-// PUBLIC API
-// -----------------------------------------------------------------------------
-
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers) {
     if (num_peers > MAX_PEERS || (num_peers > 0 && !peers)) return NULL;
     for (size_t i = 0; i < num_peers; i++) {
@@ -313,48 +311,59 @@ void raft_core_destroy(raft_core_t* r) {
         if (r->log[i].data) free(r->log[i].data);
     }
     free(r->log);
-    for (size_t i = 0; i < r->msg_queue_len; i++) {
-        if (r->msg_queue[i].entries) {
-            for (size_t j = 0; j < r->msg_queue[i].num_entries; j++) {
-                if (r->msg_queue[i].entries[j].data) free(r->msg_queue[i].entries[j].data);
+
+    // PHASE 6: Strict cleanup prevents memory leaks during node destruction
+    if (r->msg_queue) {
+        for (size_t i = 0; i < r->msg_queue_len; i++) {
+            if (r->msg_queue[i].entries) {
+                for (size_t j = 0; j < r->msg_queue[i].num_entries; j++) {
+                    if (r->msg_queue[i].entries[j].data) free(r->msg_queue[i].entries[j].data);
+                }
+                free(r->msg_queue[i].entries);
             }
-            free(r->msg_queue[i].entries);
+            if (r->msg_queue[i].snapshot_data) free(r->msg_queue[i].snapshot_data);
         }
+        free(r->msg_queue);
     }
-    if (r->msg_queue) free(r->msg_queue);
     if (r->read_states) free(r->read_states);
     free(r);
 }
 
-raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
+raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index, uint64_t applied_index,
+                               uint64_t snapshot_index, uint64_t snapshot_term,
                                raft_entry_t* entries, size_t num_entries) {
-    if (num_entries == 0 || entries == NULL) return NULL;
+    if (num_peers > MAX_PEERS) return NULL;
+    if (num_entries > 0 && entries == NULL) return NULL;
 
     for (size_t i = 1; i < num_entries; i++) {
         if (entries[i].index <= entries[i-1].index) return NULL;
         if (entries[i].term < entries[i-1].term) return NULL;
     }
 
-    raft_core_t* r = raft_core_create(id, peers, num_peers);
+    raft_core_t* r = raft_core_create(id, NULL, 0);
     if (!r) return NULL;
+
+    r->num_peers = num_peers;
+    for (size_t i = 0; i < num_peers; i++) {
+        r->peers[i] = peers[i];
+        r->is_learner[i] = is_learners ? is_learners[i] : false;
+        r->next_index[i] = snapshot_index + 1;
+        if (peers[i] == id) r->is_learner_self = r->is_learner[i];
+    }
 
     r->current_term = term;
     r->voted_for = voted_for;
-
-    if (entries[0].index == 0) {
-        r->snapshot_index = 0;
-        r->snapshot_term = 0;
-    } else {
-        r->snapshot_index = entries[0].index - 1;
-        r->snapshot_term = 0;
-    }
+    r->snapshot_index = snapshot_index;
+    r->snapshot_term = snapshot_term;
 
     if (r->log[0].data) free(r->log[0].data);
     r->log_len = 0;
 
     r->log_cap = num_entries > 16 ? num_entries * 2 : 16;
-    r->log = realloc(r->log, r->log_cap * sizeof(raft_entry_t));
+    raft_entry_t* new_log = realloc(r->log, r->log_cap * sizeof(raft_entry_t));
+    if (!new_log) { raft_core_destroy(r); return NULL; }
+    r->log = new_log;
 
     r->log[0].index = r->snapshot_index;
     r->log[0].term = r->snapshot_term;
@@ -365,7 +374,9 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
     r->log[0].data_len = 0;
     r->log_len = 1;
 
-    for (size_t i = 1; i < num_entries; i++) {
+    for (size_t i = 0; i < num_entries; i++) {
+        if (entries[i].index <= r->snapshot_index) continue;
+
         raft_entry_t* e = &r->log[r->log_len++];
         e->term = entries[i].term;
         e->index = entries[i].index;
@@ -374,13 +385,14 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, size_t num_peers,
         e->client_seq = entries[i].client_seq;
         e->data_len = entries[i].data_len;
         e->data = entries[i].data_len > 0 ? malloc(entries[i].data_len) : NULL;
-        if (e->data_len > 0) memcpy(e->data, entries[i].data, e->data_len);
+        if (e->data_len > 0 && e->data) memcpy(e->data, entries[i].data, e->data_len);
     }
 
     r->last_saved_index = raft_core_last_index_internal(r);
     r->commit_index = commit_index;
     r->last_applied = applied_index;
 
+    // Process initial configurations seamlessly
     apply_config_changes(r, 0, r->commit_index);
 
     return r;
@@ -437,7 +449,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         }
     }
 
-    // PHASE 5: Automatically track authoritative leader
     if (msg->term >= r->current_term && (msg->type == MSG_APPEND_ENTRIES || msg->type == MSG_INSTALL_SNAPSHOT)) {
         r->leader_id = msg->from;
     }
@@ -487,63 +498,9 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         return;
     }
 
-    if (msg->type == MSG_READ_INDEX) {
-        if (r->state != RAFT_STATE_LEADER) return;
-        if (r->commit_index < r->term_start_index || log_term(r, r->commit_index) != r->current_term) return;
-
-        r->current_read_seq++;
-        bool slot_found = false;
-        for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-            if (!r->pending_reads[pr].active) {
-                r->pending_reads[pr].active = true;
-                r->pending_reads[pr].read_seq = r->current_read_seq;
-                r->pending_reads[pr].client_ctx = msg->read_seq;
-                r->pending_reads[pr].index = r->commit_index;
-                r->pending_reads[pr].from = msg->from != 0 ? msg->from : r->id;
-                r->pending_reads[pr].acks = 1;
-                memset(r->pending_reads[pr].acked_by, 0, sizeof(r->pending_reads[pr].acked_by));
-                slot_found = true;
-                break;
-            }
-        }
-
-        if (slot_found) {
-            size_t total_voters = r->is_learner_self ? 0 : 1;
-            for(size_t v=0; v < r->num_peers; v++) if (!r->is_learner[v]) total_voters++;
-
-            if (total_voters <= 1) {
-                for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-                    if (r->pending_reads[pr].active && r->pending_reads[pr].read_seq == r->current_read_seq) {
-                        if (r->pending_reads[pr].from == r->id) {
-                            if (r->num_read_states >= r->read_states_cap) {
-                                r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-                                r->read_states = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
-                            }
-                            r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
-                            r->num_read_states++;
-                        } else {
-                            raft_msg_t res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
-                                               .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
-                            send_msg(r, res);
-                        }
-                        r->pending_reads[pr].active = false;
-                    }
-                }
-            } else {
-                bcast_append(r);
-            }
-        }
+    if (msg->type == MSG_READ_INDEX || msg->type == MSG_READ_INDEX_RES) {
+        // PHASE 6: Feature Freeze. ReadIndex logic disabled.
         return;
-    }
-    else if (msg->type == MSG_READ_INDEX_RES) {
-        if (r->num_read_states >= r->read_states_cap) {
-            r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-            r->read_states = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
-        }
-        r->read_states[r->num_read_states].index = msg->index;
-        r->read_states[r->num_read_states].read_seq = msg->read_seq;
-        r->num_read_states++;
     }
 
     if (msg->type == MSG_HUP) {
@@ -654,21 +611,12 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
         bool appended = false;
         for (size_t i = 0; i < msg->num_entries; i++) {
-            // PHASE 5: O(1) Exactly-Once Sequence Deduplication Tracker
-            if (msg->entries[i].client_id != 0) {
-                uint32_t slot = msg->entries[i].client_id % MAX_CLIENT_SESSIONS;
-                if (r->sessions[slot].client_id == msg->entries[i].client_id &&
-                    r->sessions[slot].client_seq >= msg->entries[i].client_seq) {
-                    continue; // Skip silently if already proposed!
-                }
-                r->sessions[slot].client_id = msg->entries[i].client_id;
-                r->sessions[slot].client_seq = msg->entries[i].client_seq;
-            }
+            // PHASE 6: Volatile memory deduplication removed. Handled cleanly by host application state machine.
             log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
             appended = true;
         }
 
-        if (!appended) return; // Completely dropped!
+        if (!appended) return;
 
         if (r->num_peers == 0) {
             advance_commit_index(r, raft_core_last_index_internal(r));
@@ -710,7 +658,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                         }
                         if (new_idx <= my_last_idx) log_truncate(r, new_idx);
 
-                        // PHASE 5
                         log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
                     }
                 }
@@ -732,7 +679,16 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                 } else {
                     res.conflict_term = log_term(r, msg->index);
                     uint64_t first_idx = msg->index;
-                    while (first_idx > r->snapshot_index && log_term(r, first_idx - 1) == res.conflict_term) {
+
+                    // PHASE 6: Safe backward scan logic
+                    while (first_idx >= r->snapshot_index) {
+                        if (log_term(r, first_idx) == res.conflict_term) {
+                            while (first_idx > r->snapshot_index && log_term(r, first_idx - 1) == res.conflict_term) {
+                                first_idx--;
+                            }
+                            break;
+                        }
+                        if (first_idx == r->snapshot_index || first_idx == 0) break;
                         first_idx--;
                     }
                     res.conflict_index = first_idx;
@@ -742,33 +698,10 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         send_msg(r, res);
     }
     else if (msg->type == MSG_INSTALL_SNAPSHOT) {
+        // PHASE 6: Freeze snapshots
         raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
-
-        if (msg->term >= r->current_term) {
-            r->state = RAFT_STATE_FOLLOWER;
-            r->activity_accepted = true;
-
-            if (msg->index > r->snapshot_index) {
-                for (size_t i = 0; i < r->log_len; i++) {
-                    if (r->log[i].data) free(r->log[i].data);
-                }
-
-                r->log_len = 1;
-                r->snapshot_index = msg->index;
-                r->snapshot_term = msg->log_term;
-
-                r->log[0].index = msg->index;
-                r->log[0].term = msg->log_term;
-                r->log[0].data = NULL;
-                r->log[0].data_len = 0;
-
-                if (r->commit_index < msg->index) advance_commit_index(r, msg->index);
-                if (r->last_applied < msg->index) r->last_applied = msg->index;
-            }
-            res.reject = false;
-            res.index = msg->index;
-        }
         send_msg(r, res);
+        return;
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
@@ -777,36 +710,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
 
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
-                if (msg->read_seq > r->peer_read_seq[i]) r->peer_read_seq[i] = msg->read_seq;
-
-                for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-                    if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[i]) {
-                        if (r->peer_read_seq[i] >= r->pending_reads[pr].read_seq) {
-                            r->pending_reads[pr].acked_by[i] = true;
-                            if (!r->is_learner[i]) r->pending_reads[pr].acks++;
-
-                            size_t voters = r->is_learner_self ? 0 : 1;
-                            for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
-
-                            if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
-                                if (r->pending_reads[pr].from == r->id) {
-                                    if (r->num_read_states >= r->read_states_cap) {
-                                        r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-                                        r->read_states = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
-                                    }
-                                    r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                                    r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
-                                    r->num_read_states++;
-                                } else {
-                                    raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
-                                                          .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
-                                    send_msg(r, rd_res);
-                                }
-                                r->pending_reads[pr].active = false;
-                            }
-                        }
-                    }
-                }
 
                 if (!msg->reject && msg->index > my_last_idx) return;
 
@@ -816,13 +719,19 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                     } else {
                         uint64_t last_idx = 0;
                         bool found = false;
-                        for (uint64_t idx = my_last_idx; idx >= r->snapshot_index; idx--) {
+
+                        // PHASE 6: Safe backward scan
+                        uint64_t idx = my_last_idx;
+                        while (idx >= r->snapshot_index) {
                             if (log_term(r, idx) == msg->conflict_term) {
                                 last_idx = idx;
                                 found = true;
                                 break;
                             }
+                            if (idx == r->snapshot_index || idx == 0) break;
+                            idx--;
                         }
+
                         if (found) {
                             r->next_index[i] = last_idx + 1;
                         } else {
@@ -877,21 +786,25 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     if (last_idx > r->last_saved_index) {
         size_t count = last_idx - r->last_saved_index;
         ready.entries_to_save = malloc(count * sizeof(raft_entry_t));
-        for (size_t i = 0; i < count; i++) {
-            raft_entry_t* src = log_get(r, r->last_saved_index + 1 + i);
-            ready.entries_to_save[i] = *src;
+        if (ready.entries_to_save) {
+            for (size_t i = 0; i < count; i++) {
+                raft_entry_t* src = log_get(r, r->last_saved_index + 1 + i);
+                ready.entries_to_save[i] = *src;
+            }
+            ready.num_entries_to_save = count;
         }
-        ready.num_entries_to_save = count;
     }
 
     if (r->commit_index > r->last_applied) {
         size_t count = r->commit_index - r->last_applied;
         ready.committed_entries = malloc(count * sizeof(raft_entry_t));
-        for (size_t i = 0; i < count; i++) {
-            raft_entry_t* src = log_get(r, r->last_applied + 1 + i);
-            ready.committed_entries[i] = *src;
+        if (ready.committed_entries) {
+            for (size_t i = 0; i < count; i++) {
+                raft_entry_t* src = log_get(r, r->last_applied + 1 + i);
+                ready.committed_entries[i] = *src;
+            }
+            ready.num_committed_entries = count;
         }
-        ready.num_committed_entries = count;
     }
 
     ready.read_states = r->read_states;
@@ -915,8 +828,16 @@ void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_in
     if (r->msg_queue) {
         for (size_t i = 0; i < r->msg_queue_len; i++) {
             if (r->msg_queue[i].entries) {
+                // PHASE 6: Deep free memory leak fix
+                for (size_t j = 0; j < r->msg_queue[i].num_entries; j++) {
+                    if (r->msg_queue[i].entries[j].data) free(r->msg_queue[i].entries[j].data);
+                }
                 free(r->msg_queue[i].entries);
                 r->msg_queue[i].entries = NULL;
+            }
+            if (r->msg_queue[i].snapshot_data) {
+                free(r->msg_queue[i].snapshot_data);
+                r->msg_queue[i].snapshot_data = NULL;
             }
         }
     }
@@ -933,24 +854,10 @@ void raft_core_advance_all(raft_core_t* r) {
 }
 
 void raft_core_compact(raft_core_t* r, uint64_t compact_index) {
-    if (compact_index <= r->snapshot_index || compact_index > r->last_applied) return;
-
-    r->snapshot_term = log_term(r, compact_index);
-    size_t keep_len = r->log_len - (compact_index - r->snapshot_index);
-
-    for (uint64_t i = r->snapshot_index + 1; i <= compact_index; i++) {
-        raft_entry_t* e = log_get(r, i);
-        if (e && e->data) free(e->data);
-    }
-
-    memmove(&r->log[1], &r->log[compact_index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
-    r->log_len = keep_len;
-    r->snapshot_index = compact_index;
-
-    r->log[0].index = compact_index;
-    r->log[0].term = r->snapshot_term;
-    r->log[0].data = NULL;
-    r->log[0].data_len = 0;
+    // PHASE 6: Feature freeze compaction
+    (void)r;
+    (void)compact_index;
+    return;
 }
 
 raft_state_t raft_core_state(raft_core_t* r) { return r->state; }
@@ -961,7 +868,6 @@ uint64_t raft_core_last_index(raft_core_t* r) { return raft_core_last_index_inte
 uint64_t raft_core_last_applied(raft_core_t* r) { return r->last_applied; }
 bool raft_core_activity_accepted(raft_core_t* r) { return r->activity_accepted; }
 
-// PHASE 5 (Gap 17): Helper
 uint64_t raft_core_leader_id(raft_core_t* r) { return r->leader_id; }
 
 size_t raft_core_peers(raft_core_t* r, uint64_t* out_peers) {
@@ -996,4 +902,15 @@ void raft_core_promote_learner(raft_core_t* r, uint64_t peer_id) {
             return;
         }
     }
+}
+
+uint64_t raft_core_snapshot_index(raft_core_t* r) { return r->snapshot_index; }
+uint64_t raft_core_snapshot_term(raft_core_t* r) { return r->snapshot_term; }
+
+size_t raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners) {
+    for (size_t i = 0; i < r->num_peers; i++) {
+        if (out_peers) out_peers[i] = r->peers[i];
+        if (out_is_learners) out_is_learners[i] = r->is_learner[i];
+    }
+    return r->num_peers;
 }

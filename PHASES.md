@@ -120,88 +120,102 @@
 * **The Bug:** When a follower rejected an `AppendEntries` payload, the leader scanned backward through its log using an unsigned 64-bit integer (`uint64_t idx`). If the node had not yet created a snapshot (`snapshot_index == 0`), the loop condition `idx >= 0` evaluated to unconditionally true. Upon hitting zero, the decrement wrapped the index to `UINT64_MAX`, creating an infinite loop that permanently locked the CPU thread.
 * **The Fix:** We implemented safe underflow boundaries. The backward-scanning loop now explicitly breaks if `idx == 0` or `idx == r->snapshot_index`, cleanly yielding control and preventing the livelock.
 
-#### 19. Heap Buffer Overflow in Router
+#### 19. Heap Buffer Overflow & Allocation Failures
 
-* **The Bug:** The `router_send_rpc` function attempted to handle large frames by checking if the outbound queue needed more space and applying a single multiplier (`kp->out_queue_cap *= 2`). If a massive batch or snapshot arrived, doubling the buffer once was insufficient, causing the subsequent `memcpy` to write out of bounds and corrupt the heap.
-* **The Fix:** We replaced the single multiplier with a bounded `while` loop that dynamically scales the queue capacity until it securely fits the incoming frame size, capped safely by `RAFT_MAX_FRAME_SIZE`.
+* **The Bug:** The `router_send_rpc` function attempted to handle large frames by multiplying capacity once (`kp->out_queue_cap *= 2`), causing heap corruption on massive payloads. Furthermore, the core lacked explicit `SIZE_MAX` overflow checks and assumed `malloc`/`realloc` would never fail.
+* **The Fix:** We replaced single multipliers with safe bounded `while` loops. All capacity growth now checks for `SIZE_MAX` overflow. If an allocation fails, the core returns a controlled `RAFT_ERR_NOMEM` error rather than silently corrupting state or crashing.
 
-#### 20. Unbounded Memory Leaks
+#### 20. Unbounded Memory Leaks & Ownership Contracts
 
-* **The Bug:** The core suffered from three major leaks: (1) `raft_core_advance` freed the outer message arrays but abandoned dynamically allocated `entries[j].data` payloads. (2) Unrouted network frames allocated in the router were leaked if no matching peer was found. (3) The `raft_node_pump` failed to free the dynamically allocated `ready.entries_to_save` arrays after processing.
-* **The Fix:** We established strict lifecycle ownership. Unrouted frames are now tracked and freed, `raft_core_advance` executes a deep-free on all nested payloads, and the pump cycle guarantees a cleanup block is executed before yielding.
+* **The Bug:** The core leaked memory across three boundaries: abandoned `entries[j].data` payloads during `raft_core_advance`, unrouted network frames in the router, and un-freed `ready.entries_to_save` arrays in the pump.
+* **The Fix:** We established a strict, documented ownership table. Unrouted frames are tracked and freed immediately. `raft_core_advance` executes a deep-free on all nested payloads, and the pump cycle guarantees a mandatory cleanup block before yielding.
 
 ---
 
 ### **Phase 7 Summary: Apply & Persistence Integrity**
 
-#### 21. Volatile Deduplication Amnesia
+#### 21. Volatile Deduplication & State Machine Watermarks
 
-* **The Bug:** Client sequence deduplication was tracked using an $O(1)$ array stored in volatile memory inside the leader's proposal handler. If the leader crashed, the new leader booted with an empty array. Retried client commands were treated as brand new, breaking exactly-once execution semantics and duplicating transactions on the state machine.
-* **The Fix:** We moved deduplication out of the consensus core. `client_seq` metadata is now passed directly through the replicated log. The host state machine maintains a durable, crash-safe session table and inherently deduplicates commands during the apply phase.
+* **The Bug:** Deduplication was handled by a volatile array in the leader, meaning retried commands were duplicated on leader crashes. Additionally, Raft advanced its internal `last_applied` index independently of the host's physical persistence, causing double-execution on reboot.
+* **The Fix:** Deduplication was moved into the host state machine. The application must now persist `last_applied` and the session deduplication table *atomically* alongside the actual state-machine mutation, guaranteeing true idempotency.
 
-#### 22. Phantom Application Progress
+#### 22. Strict Application Semantics
 
-* **The Bug:** The core blindly advanced `last_applied` to match the `commit_index` internally, regardless of whether the physical state machine had finished processing the data. If the application layer crashed while ingesting a large batch, Raft would incorrectly believe the data was applied.
-* **The Fix:** We implemented a strict `raft_apply_fn` synchronous callback. The core is no longer permitted to advance `last_applied` until the host application explicitly confirms successful execution.
+* **The Bug:** The core blindly advanced `last_applied` to match `commit_index`, ignoring whether the host application had successfully ingested the data.
+* **The Fix:** We implemented a strict `raft_apply_fn` synchronous callback with defined failure semantics. If the apply fails transiently, the core retries without advancing `last_applied`. If it fails permanently, the node transitions to a fatal state and steps down. It will never silently skip failed committed entries.
 
-#### 23. Incomplete Boot Metadata
+#### 23. Complete Boot Metadata
 
-* **The Bug:** Restarting a node with a compacted WAL synthesized a `snapshot_term = 0` and lost its dynamic membership context, as the `.meta` file only saved `term` and `voted_for`. This caused the recovered node to be violently rejected by healthy peers.
-* **The Fix:** We expanded the atomic `.meta` footprint to explicitly include `snapshot_index`, `snapshot_term`, and active membership arrays. Bootloaders now perfectly rehydrate their context directly from disk.
+* **The Bug:** Restarting a node with a compacted WAL synthesized a `snapshot_term = 0` and lost its dynamic membership context because the `.meta` file only saved `term` and `voted_for`.
+* **The Fix:** We expanded the atomic `.meta` footprint to explicitly include `snapshot_index`, `snapshot_term`, and active membership arrays. Bootloaders now accurately rehydrate their context directly from disk.
 
 ---
 
 ### **Phase 8 Summary: Snapshot & Recovery Correctness**
 
-#### 24. Destructive Snapshot Installation
+#### 24. Two-Phase Snapshot Atomicity & WAL Truncation
 
-* **The Bug:** When a follower received `MSG_INSTALL_SNAPSHOT`, the handler blindly executed `r->log_len = 1;`, wiping the entire log memory. This illegally destroyed valid, uncommitted log suffixes that existed ahead of the snapshot, breaking the leader's ability to commit those entries.
-* **The Fix:** We rewrote snapshot installation to enforce strict suffix preservation. The core now only drops the covered prefix, gracefully preserving log entries if they match the snapshot boundary or exist strictly after it.
+* **The Bug:** Snapshot generation and WAL truncation were loosely ordered, meaning a hard crash could leave the `.meta` file pointing to a missing, partial, or stale snapshot file, bricking the node.
+* **The Fix:** We enforced a strict two-phase write protocol. A snapshot is written to `.tmp`, `fsync`ed, atomically renamed, and the directory is `fsync`ed before the `.meta` file is updated. The core will *never* delete WAL entries `<= snapshot_index` until the snapshot bytes and metadata are fully durable and the node is proven capable of restarting from that snapshot alone.
 
-#### 25. Null-Pointer Dereference Post-Snapshot
+#### 25. Strict Suffix Preservation & Log Matching
 
-* **The Bug:** Snapshot installation correctly advanced `snapshot_index`, but failed to synchronize `last_saved_index`. In the next pump cycle, `raft_core_get_ready` attempted to fetch logs between the lagging saved index and the new boundary, pulling `NULL` pointers and immediately segfaulting.
-* **The Fix:** We enforced strict pointer synchronization. `last_saved_index`, `commit_index`, and `last_applied` are now safely bounded and advanced `>= snapshot_index` atomically after physical state installation.
+* **The Bug:** `MSG_INSTALL_SNAPSHOT` blindly wiped the entire log memory, illegally destroying valid uncommitted suffixes.
+* **The Fix:** The core now executes strict log matching. It preserves an existing suffix *only* if the local log contains an entry at `snapshot_index` with an exact `snapshot_term` match, or if the entries strictly after `snapshot_index` are proven compatible. Conflicting prefixes are cleanly discarded.
 
-#### 26. Blind Compacted Reboots
+#### 26. Null-Pointer Dereference Post-Snapshot
 
-* **The Bug:** The recovery bootloader attempted to synthesize its snapshot parameters from the oldest surviving WAL file. If the WAL was completely purged up to the snapshot point, this logic failed.
-* **The Fix:** The bootloader no longer guesses. It explicitly reads the true `snapshot_index` and `snapshot_term` from the fortified `.meta` file, ensuring seamless reboots even with zero historical WAL files on disk.
+* **The Bug:** Snapshot installation failed to synchronize internal pointers, causing `raft_core_get_ready` to fetch `NULL` logs and segfault.
+* **The Fix:** We enforced strict pointer synchronization. `last_saved_index`, `commit_index`, and `last_applied` are bounded and atomically advanced `>= snapshot_index` strictly *after* the physical state installation succeeds.
 
 ---
 
 ### **Phase 9 Summary: Advanced Protocol Semantics**
 
-#### 27. Unsafe Overlapping Configurations
+#### 27. Safe Single-Node Membership Transitions
 
-* **The Bug:** While `LEARNER` staging was implemented, there was no protection against the host application proposing multiple topology changes simultaneously. Overlapping configuration changes could mathematically split the cluster brain.
-* **The Fix:** We implemented a pending-config guard. The core now actively rejects new topology proposals if an uncommitted `ENTRY_CONF_*` entry currently exists anywhere between `commit_index + 1` and `last_index`.
+* **The Bug:** The architecture permitted overlapping configuration proposals and instant, uncommitted topology mutations, mathematically splitting the cluster brain.
+* **The Fix:** We instituted strict single-node-at-a-time transitions. Topology arrays are exclusively updated during the apply phase. The core actively rejects new topology proposals if any uncommitted `ENTRY_CONF_*` entry exists. Arbitrary multi-node replacements without joint consensus are explicitly forbidden.
 
-#### 28. Premature Configuration Mutation
+#### 28. ReadIndex Freshness & Applied Barriers
 
-* **The Bug:** Topology arrays (peers/learners) were mutated instantly when an `ENTRY_CONF_*` log entry was appended. This meant uncommitted configuration data was dictating quorum math, which violates Raft safety properties.
-* **The Fix:** Topology array mutation was centralized. Configuration entries are proposed normally, but internal peer arrays are exclusively updated during the apply phase, strictly after the entry is globally committed.
+* **The Bug:** Followers echoed `read_seq` context on append rejections, and the leader served reads without confirming the state machine had actually applied the data up to the commit index.
+* **The Fix:** A leader may now satisfy a `ReadIndex` request only after confirming it still holds a quorum lease in its current term. Furthermore, the read is explicitly blocked and served *only* after the local `applied_index` reaches or exceeds the read's `barrier_index`.
 
-#### 29. Loose ReadIndex Validation
+#### 29. Follower Read Redirection
 
-* **The Bug:** Followers echoed `read_seq` context on append *rejections*, and the leader accepted read ACKs without validating terms. This allowed an old, deposed leader to falsely fulfill a linearizable read.
-* **The Fix:** We hardened the `ReadIndex` pipeline. Followers only echo `read_seq` upon a successful append. The leader strictly validates `MSG_READ_INDEX_RES` against its current term and actively pending request barriers.
+* **The Bug:** Followers silently dropped incoming client proposals and reads.
+* **The Fix:** Followers now use terms and heartbeats to track the active leader. Misrouted requests return a definitive `RAFT_ERR_NOT_LEADER` along with the known `leader_id`, allowing the client to issue an instant redirect.
 
 ---
 
-### **Phase 10 Summary: Scale, Hardening, and Conformance**
+### **Phase 10 Summary: Scale & Storage Hardening**
 
-#### 30. Unbounded Payload Batching
+#### 30. Byte-Bounded Batching & Holistic Backpressure
 
-* **The Bug:** The core limited `AppendEntries` solely by an entry count threshold (500). If a client proposed 500 massive payloads, it resulted in single RPC frames exceeding several megabytes, choking network throughput.
-* **The Fix:** We implemented byte-bounded batching. `AppendEntries` is now capped by both entry count and maximum encoded frame size, ensuring consistent, high-velocity network pipelining.
+* **The Bug:** The core lacked true backpressure, leading to OOM crashes under heavy load, and `AppendEntries` were capped only by entry count rather than memory size.
+* **The Fix:** We implemented holistic limits. Proposals are actively rejected based on uncommitted log bytes, per-follower in-flight bytes, and state-machine apply backlogs. `AppendEntries` payloads are now safely byte-bounded.
 
 #### 31. Deep Conflict Infinite Loops
 
-* **The Bug:** If a follower rejected an append at an index older than its `snapshot_index`, it returned a generic rejection without a useful `conflict_index`. The leader defaulted to `1`, retried, and was rejected again, causing an infinite network ping-pong.
-* **The Fix:** Followers now accurately report `r->snapshot_index + 1` for deep conflicts, instantly signaling the leader to switch from `AppendEntries` to `InstallSnapshot` routing.
+* **The Bug:** Followers rejecting an append older than their `snapshot_index` returned a generic rejection without a `conflict_index`, causing an infinite network ping-pong.
+* **The Fix:** Followers accurately report `r->snapshot_index + 1` for deep conflicts, instantly signaling the leader to switch to `InstallSnapshot` routing.
 
-#### 32. Storage Sync Ordering & Conformance
+#### 32. Storage Sync Ordering & Corruption Recovery
 
-* **The Bug:** The disk engine was committing data but lacked structured POSIX sync ordering, making it susceptible to corrupted boundaries during a hard power loss.
-* **The Fix:** We enforced a strict `fsync` hierarchy (WAL -> Meta -> Snapshot). We then validated the entire architecture against a massive conformance suite, proving resilience against simulated partition delays, leader crashes during replication, torn WAL headers, and dynamic membership reboots.
+* **The Bug:** The disk engine lacked structured POSIX sync ordering.
+* **The Fix:** We enforced a strict `fsync` hierarchy (WAL -> Meta -> Snapshot). We implemented full-frame CRCs on every read to detect torn headers, dropped checksums, and disk rot dynamically.
+
+---
+
+### **Phase 11 Summary: Invariant & Fault-Injection Validation**
+
+#### 33. State Machine & Consensus Invariants
+
+* **The Goal:** Prove mathematically that the refactor maintains strict Raft safety properties under chaotic execution.
+* **The Validation:** Test suites now explicitly assert that `commit_index` never decreases, `last_applied <= commit_index`, `last_saved_index <= last_index`, `current_term` never decreases, and `voted_for` is completely durable before a vote response is dispatched. We assert that no client command is applied twice unless explicit state-machine deduplication suppresses it.
+
+#### 34. Extreme Fault-Injection Matrix
+
+* **The Goal:** Ensure the node handles catastrophic system and network failures gracefully without silent data corruption.
+* **The Validation:** We integrated AddressSanitizer (ASAN), UndefinedBehaviorSanitizer (UBSAN), and ThreadSanitizer (TSAN) runs against deterministic fault injections. The suite actively triggers crashes before/after WAL `fsync`, meta renames, and snapshot renames. It simulates duplicate `InstallSnapshot` payloads, learner promotions during leader failover, and rejected `ReadIndex` responses from stale terms.

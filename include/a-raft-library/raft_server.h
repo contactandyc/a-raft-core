@@ -23,6 +23,13 @@ typedef struct {
 } raft_net_header_t;
 #pragma pack(pop)
 
+// PHASE 7: Strict application progress tracking
+#define RAFT_APPLY_OK 0
+#define RAFT_APPLY_TRANSIENT 1 // Triggers a retry on next pump cycle
+#define RAFT_APPLY_FATAL 2     // Permanent state corruption, triggers fatal stepdown
+
+typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
+
 typedef struct raft_node_s raft_node_t;
 typedef struct raft_server_s raft_server_t;
 typedef struct peer_connection_s peer_connection_t;
@@ -76,23 +83,29 @@ struct raft_node_s {
     raft_core_t* core;
     raft_wal_t wal;
 
+    // PHASE 7: Bounding context expanded strictly to prevent compacted log amnesia
     uint64_t saved_term;
     uint64_t saved_vote;
+    uint64_t saved_commit;
     uint64_t saved_applied;
+    uint64_t saved_snap_idx;
+    uint64_t saved_snap_term;
 
     uv_timer_t election_timer;
     uv_timer_t heartbeat_timer;
+
+    raft_apply_fn apply_cb;
+    void* apply_ctx;
+    bool fatal_error;
 };
 
 int  raft_server_init(raft_server_t* server, uv_loop_t* loop, uint64_t node_id, uint32_t max_groups, const char* data_dir);
 int  raft_server_listen(raft_server_t* server, const char* ip, int port);
 void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64_t target_node_id);
 
-void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers);
+void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers, raft_apply_fn apply_cb, void* apply_ctx);
 
-// PHASE 5: Expose rich write interface
 int  raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id);
-
 void raft_node_read_index(raft_node_t* node, uint64_t read_seq);
 
 #endif // RAFT_SERVER_H

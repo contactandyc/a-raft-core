@@ -26,7 +26,7 @@ MACRO_TEST(raft_wal_truncation_tail) {
     // Append 5 entries
     uint8_t data[] = "data";
     for (uint64_t i = 1; i <= 5; i++) {
-        raft_wal_append(&wal, 1, i, 0, data, 4);
+        raft_wal_append(&wal, 1, i, 0, 0, 0, data, 4);
     }
     raft_wal_flush_batch(&wal);
 
@@ -54,7 +54,7 @@ MACRO_TEST(raft_wal_segment_rotation_and_purge) {
     // to guarantee it spills over into 00002.wal and 00003.wal
     uint8_t dummy[80] = {0};
     for (uint64_t i = 1; i <= 20000; i++) {
-        raft_wal_append(&wal, 1, i, 0, dummy, 80);
+        raft_wal_append(&wal, 1, i, 0, 0, 0, dummy, 80);
     }
     raft_wal_flush_batch(&wal);
 
