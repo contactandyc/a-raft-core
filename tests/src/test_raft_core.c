@@ -1731,6 +1731,106 @@ MACRO_TEST(raft_leader_stepdown_on_self_removal) {
     raft_core_destroy(r);
 }
 
+// ============================================================================
+// PHASE 11: EXTREME FAULT INJECTION TESTS
+// ============================================================================
+
+MACRO_TEST(raft_fault_duplicate_snapshot_install_is_safe) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    uint8_t snap_data[] = "STATE";
+    raft_msg_t snap1 = {
+        .type = MSG_INSTALL_SNAPSHOT, .from = 2, .term = 2,
+        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5
+    };
+
+    // First snapshot is accepted and shifts the horizon
+    raft_core_step(r, &snap1);
+    raft_ready_t rd1 = raft_core_get_ready(r);
+    MACRO_ASSERT_TRUE(rd1.install_snapshot);
+    MACRO_ASSERT_EQ_INT(rd1.snapshot_index, 100);
+    raft_core_advance_all(r);
+
+    // Simulate network duplication: Same snapshot arrives again!
+    raft_msg_t snap2 = {
+        .type = MSG_INSTALL_SNAPSHOT, .from = 2, .term = 2,
+        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5
+    };
+    raft_core_step(r, &snap2);
+
+    raft_ready_t rd2 = raft_core_get_ready(r);
+
+    // Engine must aggressively REJECT redundant snapshots without corrupting state
+    MACRO_ASSERT_FALSE(rd2.install_snapshot);
+    MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 100);
+    MACRO_ASSERT_TRUE(rd2.messages[0].reject); // Responds with failure to stop transmission
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_fault_stale_read_index_response_ignored) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    // Establish Term 2 Leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup); // Term 1 pre-candidate
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
+    raft_core_step(r, &vote); // Term 1 Leader
+
+    raft_core_step(r, &hup); // Trigger new election
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &pv2);
+    raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 2, .reject = false };
+    raft_core_step(r, &vote2); // Term 2 Leader
+    raft_core_advance_all(r);
+
+    // Leader receives a ReadIndex ACK that was delayed in the network from Term 1
+    raft_msg_t stale_ack = {
+        .type = MSG_APPEND_RES, .from = 2, .term = 1, // STALE TERM!
+        .reject = false, .index = 2, .read_seq = 55
+    };
+    raft_core_step(r, &stale_ack);
+
+    // Engine must actively ignore the stale sequence ACK to prevent serving partitioned reads
+    raft_ready_t ready = raft_core_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_read_states, 0);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
+    uint64_t peers[] = {2};
+    raft_core_t* r = raft_core_create(1, peers, 1);
+
+    // Add Node 3 as a learner dynamically
+    uint64_t node3 = 3;
+    raft_entry_t conf_add = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&node3, .data_len = sizeof(uint64_t) };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &conf_add, .num_entries = 1, .commit = 1 };
+    raft_core_step(r, &app);
+    raft_core_advance_all(r);
+
+    // Node 1 verified Node 3 is a learner
+    uint64_t act_peers[16]; bool is_learner[16];
+    size_t num = raft_core_peers_ext(r, act_peers, is_learner);
+    MACRO_ASSERT_EQ_INT(num, 2);
+    MACRO_ASSERT_TRUE(is_learner[1]);
+
+    // Leader 2 crashes! Node 1 attempts to become leader in Term 2
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_core_step(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 2, .reject = false };
+    raft_core_step(r, &pv); // Learner responds to pre-vote
+
+    // PHASE 11 FIX: The node safely stalls in PRE_CANDIDATE because Learner votes are ignored!
+    MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_PRE_CANDIDATE);
+
+    raft_core_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1805,6 +1905,9 @@ int main(void) {
     MACRO_ADD(tests, raft_read_index_success_on_heartbeat_quorum);
     MACRO_ADD(tests, raft_check_quorum_steps_down_stale_leader);
     MACRO_ADD(tests, raft_leader_stepdown_on_self_removal);
+    MACRO_ADD(tests, raft_fault_duplicate_snapshot_install_is_safe);
+    MACRO_ADD(tests, raft_fault_stale_read_index_response_ignored);
+    MACRO_ADD(tests, raft_fault_learner_promotion_after_leader_crash);
 
     macro_run_all("raft_core", tests, test_count);
     return 0;

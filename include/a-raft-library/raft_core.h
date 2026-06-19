@@ -68,11 +68,8 @@ typedef struct {
     uint64_t read_seq;
     raft_entry_t* entries;
     size_t num_entries;
-
-    // PHASE 8: Snapshot networking support
     uint8_t* snapshot_data;
     size_t snapshot_len;
-
     bool reject;
 } raft_msg_t;
 
@@ -84,17 +81,12 @@ typedef struct {
 typedef struct {
     raft_msg_t* messages;
     size_t num_messages;
-
     raft_entry_t* entries_to_save;
     size_t num_entries_to_save;
-
     raft_entry_t* committed_entries;
     size_t num_committed_entries;
-
     raft_read_state_t* read_states;
     size_t num_read_states;
-
-    // PHASE 8: Hand off verified snapshot payloads for Two-Phase installation
     bool install_snapshot;
     uint64_t snapshot_index;
     uint64_t snapshot_term;
@@ -137,5 +129,8 @@ void         raft_core_promote_learner(raft_core_t* r, uint64_t peer_id);
 size_t       raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners);
 uint64_t     raft_core_snapshot_index(raft_core_t* r);
 uint64_t     raft_core_snapshot_term(raft_core_t* r);
+
+// PHASE 10: Holistic backpressure byte extractor
+uint64_t     raft_core_uncommitted_bytes(raft_core_t* r);
 
 #endif // RAFT_CORE_H

@@ -677,6 +677,11 @@ int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, u
         return RAFT_ERR_QUEUE_FULL;
     }
 
+    // PHASE 10: Holistic Byte Backpressure. Reject if > 10MB uncommitted to prevent OOM
+    if (raft_core_uncommitted_bytes(node->core) > 10 * 1024 * 1024) {
+        return RAFT_ERR_QUEUE_FULL;
+    }
+
     raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = client_id, .client_seq = client_seq, .data = (uint8_t*)payload, .data_len = len };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
 

@@ -26,12 +26,21 @@ typedef struct {
     size_t payload_len;
 } applied_entry_t;
 
+// PHASE 11: Strict Invariant Tracker
+typedef struct {
+    uint64_t prev_commit;
+    uint64_t prev_term;
+    uint64_t prev_applied;
+} invariant_tracker_t;
+
 typedef struct {
     raft_core_t* nodes[NUM_NODES];
     in_flight_msg_t network[MAX_INFLIGHT];
     int current_tick;
 
     applied_entry_t state_machines[NUM_NODES][MAX_LOG_SIZE];
+    invariant_tracker_t invariants[NUM_NODES];
+
     uint64_t commit_indices[NUM_NODES];
     uint64_t leaders_in_term[10000];
 } chaos_harness_t;
@@ -46,12 +55,17 @@ static uint32_t fast_rand() {
 
 static void route_messages(chaos_harness_t* h) {
     for (int i = 0; i < NUM_NODES; i++) {
+        // PHASE 11 INVARIANT: Term Monotonicity & Leader Uniqueness
+        uint64_t current_term = raft_core_term(h->nodes[i]);
+        MACRO_ASSERT_TRUE(current_term >= h->invariants[i].prev_term);
+        h->invariants[i].prev_term = current_term;
+
         if (raft_core_state(h->nodes[i]) == RAFT_STATE_LEADER) {
-            uint64_t term = raft_core_term(h->nodes[i]);
-            if (h->leaders_in_term[term] == 0) {
-                h->leaders_in_term[term] = i + 1;
+            if (h->leaders_in_term[current_term] == 0) {
+                h->leaders_in_term[current_term] = i + 1;
             } else {
-                MACRO_ASSERT_EQ_INT(h->leaders_in_term[term], i + 1);
+                // Proof: Only one leader can exist per term
+                MACRO_ASSERT_EQ_INT(h->leaders_in_term[current_term], i + 1);
             }
         }
 
@@ -59,6 +73,8 @@ static void route_messages(chaos_harness_t* h) {
 
         for (size_t m = 0; m < ready.num_messages; m++) {
             raft_msg_t msg = ready.messages[m];
+
+            // 5% chance to drop message entirely (Network Partition Simulation)
             if (fast_rand() % 100 < 5) continue;
 
             int delay = 1 + (fast_rand() % 10);
@@ -78,6 +94,11 @@ static void route_messages(chaos_harness_t* h) {
                             }
                         }
                     }
+                    // PHASE 11: Handle snapshot routing
+                    if (msg.snapshot_len > 0) {
+                        h->network[j].msg.snapshot_data = malloc(msg.snapshot_len);
+                        memcpy(h->network[j].msg.snapshot_data, msg.snapshot_data, msg.snapshot_len);
+                    }
                     break;
                 }
             }
@@ -94,11 +115,23 @@ static void route_messages(chaos_harness_t* h) {
                     memcpy(h->state_machines[i][idx].payload, ready.committed_entries[c].data, ready.committed_entries[c].data_len);
                 }
 
+                // PHASE 11 INVARIANT: Log monotonically applies forward
                 MACRO_ASSERT_TRUE(idx > h->commit_indices[i] || h->commit_indices[i] == 0);
                 h->commit_indices[i] = idx;
             }
         }
         raft_core_advance_all(h->nodes[i]);
+
+        // PHASE 11 INVARIANTS: State boundaries are mathematically sound
+        uint64_t new_commit = raft_core_commit_index(h->nodes[i]);
+        uint64_t new_applied = raft_core_last_applied(h->nodes[i]);
+
+        MACRO_ASSERT_TRUE(new_commit >= h->invariants[i].prev_commit); // Commit index NEVER decreases
+        MACRO_ASSERT_TRUE(new_applied <= new_commit);                  // Cannot apply uncommitted entries
+        MACRO_ASSERT_TRUE(raft_core_last_index(h->nodes[i]) >= new_commit); // Log must contain committed bounds
+
+        h->invariants[i].prev_commit = new_commit;
+        h->invariants[i].prev_applied = new_applied;
     }
 }
 
@@ -115,6 +148,7 @@ static void deliver_due_messages(chaos_harness_t* h) {
                 }
                 free(msg.entries);
             }
+            if (msg.snapshot_data) free(msg.snapshot_data);
             h->network[j].active = false;
         }
     }
@@ -148,7 +182,8 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         if (fast_rand() % 100 < 10) {
             int target = fast_rand() % NUM_NODES;
             uint8_t* payload = (uint8_t*)"DATA";
-            raft_entry_t e = { .type = ENTRY_NORMAL, .data = payload, .data_len = 4 };
+            // PHASE 11: Pass mock sequence IDs to simulate client dedup load
+            raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = 1, .client_seq = h.current_tick, .data = payload, .data_len = 4 };
             raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
             raft_core_step(h.nodes[target], &p);
         }
