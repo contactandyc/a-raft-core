@@ -288,3 +288,154 @@
 
 * **The Bug:** The WAL test suite covered basic truncation and rotation but lacked coverage for deep disk corruption or torn writes.
 * **The Fix:** We introduced the deep corruption matrix to the WAL test suite. The engine now formally verifies its ability to detect and recover from corrupted magic numbers, non-monotonic segment indices, torn frame headers, trailing garbage, and invalid checksums.
+
+---
+
+### **Phase 16: Two-Phase Snapshot Staging**
+
+*(Maps to Review Item 1: Snapshot install mutates core state before durability)*
+
+* **The Gap:** `MSG_INSTALL_SNAPSHOT` currently mutates `snapshot_index`, truncates the log array, and alters core memory *before* the server layer confirms the snapshot bytes were actually written to disk. If the disk write fails, the core cannot undo the memory mutation, permanently breaking the node.
+* **The Fix:** `MSG_INSTALL_SNAPSHOT` must only copy the payload into `pending_snapshot` and expose it to the `Ready` struct. It must NOT truncate the log, advance indices, or send an ACK. All memory mutations and ACK transmissions must be moved entirely into `raft_core_snapshot_acked(true)`. If `raft_core_snapshot_acked(false)` is called, the old state remains untouched.
+* **Tests to Add:**
+* `snapshot_install_failure_does_not_advance_core_snapshot_index`
+* `snapshot_install_failure_does_not_truncate_log`
+* `snapshot_ack_sent_only_after_snapshot_file_and_meta_are_durable`
+
+
+
+### **Phase 17: Snapshot ConfState Integration**
+
+*(Maps to Review Item 2: Snapshot messages do not carry ConfState)*
+
+* **The Gap:** Snapshots currently only carry index, term, and data bytes. A lagging follower installing a snapshot might miss configuration changes that occurred during the compacted period, leaving it with an outdated and dangerous view of the cluster topology.
+* **The Fix:** Extend the binary codec and `MSG_INSTALL_SNAPSHOT` to explicitly include `voters[]`, `learners[]`, and the `removed` status. When a snapshot is successfully applied via `raft_core_snapshot_acked(true)`, the core must atomically overwrite its peer arrays with the ConfState provided in the snapshot.
+* **Tests to Add:**
+* `snapshot_message_contains_confstate`
+* `lagging_follower_installs_snapshot_and_gets_updated_membership`
+
+
+
+### **Phase 18: Durable Compaction Contract**
+
+*(Maps to Review Item 3: Local compaction without proving durable app snapshot)*
+
+* **The Gap:** `raft_node_compact` assumes the application has created a durable snapshot, but does nothing to verify it. Truncating the Raft log without a guaranteed, valid snapshot file can result in permanent data loss.
+* **The Fix:** Update `raft_node_compact` to require explicit proof of durability: `compact(node, index, term, path, len, crc)`. The library must stat the file and verify the CRC before it allows `raft_core_compact` and `raft_wal_purge_head` to execute.
+* **Tests to Add:**
+* `local_compact_requires_existing_durable_snapshot`
+* `compact_then_purge_then_restart_from_snapshot_only`
+
+
+
+### **Phase 19: Contiguous WAL Recovery Enforcement**
+
+*(Maps to Review Item 4: Compacted WAL recovery invalid in-memory indexing)*
+
+* **The Gap:** `raft_core_restore` blindly trusts that the entries provided by the bootloader map cleanly to the array. If the WAL prefix is purged but `snapshot_index` is incorrectly `0`, the array will misalign, causing `log_get` to read out-of-bounds memory.
+* **The Fix:** Add strict contiguous validation in `raft_core_restore`. If `num_entries > 0`, strictly assert that `entries[0].index == snapshot_index + 1`. Furthermore, assert that every subsequent entry increments exactly by 1. Fail closed (return `NULL`) if there are gaps.
+* **Tests to Add:**
+* `boot_rejects_purged_wal_without_snapshot_index`
+* `boot_rejects_noncontiguous_wal_entries_after_snapshot`
+* `boot_rejects_snapshot_index_zero_with_first_wal_index_gt_one`
+
+
+
+### **Phase 20: Strict Membership RPC Filtering**
+
+*(Maps to Review Item 5: Unknown/non-member nodes influencing Raft state)*
+
+* **The Gap:** The engine relies primarily on Term checks. A node that was removed from the cluster (or an unknown rogue node) can still disrupt the cluster by sending `MSG_REQUEST_VOTE` or `MSG_APPEND_ENTRIES`, potentially forcing the leader to step down.
+* **The Fix:** Implement strict `is_known_voter()` and `is_known_member()` checks at the top of `raft_core_step`. Reject role-bearing RPCs from unknown senders. Specifically, removed nodes must instantly drop all outbound and inbound routing logic except for passive replication.
+* **Tests to Add:**
+* `unknown_node_request_vote_rejected`
+* `removed_node_request_vote_rejected`
+* `unknown_node_append_entries_rejected`
+* `removed_leader_append_entries_rejected`
+
+
+
+### **Phase 21: Log-Driven Learner Promotion**
+
+*(Maps to Review Item 6: `raft_core_promote_learner` is public and unsafe)*
+
+* **The Gap:** Exposing `raft_core_promote_learner` allows the host application to mutate quorum math instantly, bypassing the Raft log and breaking linearizability.
+* **The Fix:** Remove `raft_core_promote_learner` from the public API. Promotion must only occur by proposing and committing an `ENTRY_CONF_PROMOTE_LEARNER` log entry. Additionally, the leader must reject this proposal if the learner's `match_index` has not caught up to the leader's `last_index`.
+* **Tests to Add:**
+* `direct_raft_core_promote_learner_not_public_or_noop`
+* `promote_learner_before_catchup_rejected`
+* `promotion_applies_only_after_committed_promotion_entry`
+
+
+
+### **Phase 22: ReadIndex Pending Request Validation**
+
+*(Maps to Review Item 7: ReadIndex still too permissive)*
+
+* **The Gap:** `MSG_READ_INDEX_RES` creates a read state without verifying if the local node actually requested it. Stale responses from previous terms or configurations can bypass the linearizability barrier.
+* **The Fix:** The follower must track its own outbound `read_seq` requests in a pending queue. When `MSG_READ_INDEX_RES` arrives, it must perfectly match an active pending request. Clear the pending queue immediately upon term change, leader stepdown, or configuration change.
+* **Tests to Add:**
+* `read_index_response_without_pending_request_ignored`
+* `pending_reads_cleared_on_stepdown`
+* `pending_reads_cleared_on_term_change`
+
+
+
+### **Phase 23: Defensive Ready Allocation**
+
+*(Maps to Review Item 8: `raft_core_get_ready` uninitialized entry exposure)*
+
+* **The Gap:** `raft_core_get_ready` allocates arrays based on `commit_index - last_applied`. If `log_get()` unexpectedly returns `NULL` due to corrupted state, the array is left with uninitialized memory, which the pump will attempt to serialize or apply.
+* **The Fix:** Make `raft_core_get_ready` defensive. If `log_get()` returns `NULL` when an entry is mathematically expected to exist, immediately free the arrays, clear the `raft_ready_t` struct, flag `r->fatal_error = true`, and halt the core to prevent undefined behavior.
+
+### **Phase 24: Deep WAL Segment Validation**
+
+*(Maps to Review Item 9: WAL recovery needs stricter segment validation)*
+
+* **The Gap:** The bootloader currently trusts the WAL frame boundaries implicitly once the CRC passes. It does not validate segment-level metadata.
+* **The Fix:** Upgrade `raft_wal_init` to validate the segment magic bytes, verify the segment ID matches the filename, enforce frame index monotonicity, and ensure `frame length <= remaining segment bytes` to prevent reading past EOF.
+* **Tests to Add:**
+* `wal_rejects_bad_segment_magic`
+* `wal_rejects_bad_segment_start_index`
+* `wal_rejects_nonmonotonic_frame_index`
+
+
+
+### **Phase 25: WAL OOM Protection**
+
+*(Maps to Review Item 10: WAL allocating huge payloads before CRC)*
+
+* **The Gap:** The bootloader reads `len` from the frame header and calls `malloc(len)` *before* verifying the CRC. A corrupted header with `len = 0xFFFFFFFF` will trigger an immediate Out-Of-Memory (OOM) crash.
+* **The Fix:** Before calling `malloc(len)`, strictly assert that `len <= RAFT_MAX_ENTRY_SIZE` and `len <= wal->segment_size_bytes - offset - RAFT_WAL_FRAME_HEADER_SIZE`. Reject the frame safely if it violates physical bounds.
+* **Tests to Add:**
+* `wal_rejects_frame_len_larger_than_segment_remaining`
+* `wal_rejects_frame_len_uint32_max`
+
+
+
+### **Phase 26: Boot-Time Snapshot Verification**
+
+*(Maps to Review Item 11: Snapshot files need checksum/crash-pair validation)*
+
+* **The Gap:** If the `.meta` file says `snapshot_index = 100`, the system trusts it. It does not check if `snap_grp*.dat` actually exists, if it was partially written, or if its checksum matches.
+* **The Fix:** Add a metadata linkage check during boot. If `snapshot_index > 0`, the bootloader must explicitly `stat()` the snapshot file, verify its length, and validate its CRC before trusting the `.meta` configuration. Fail closed if the snapshot file is missing or corrupted.
+
+### **Phase 27: Hostile Codec Hardening**
+
+*(Maps to Review Item 12: Codec serialization overflow/null edge cases)*
+
+* **The Gap:** The codec still uses addition-form logic (`len + entry_size > MAX`) which can underflow if `entry_size` is maliciously large. Furthermore, it trusts `data_len > 0` without verifying `data != NULL`.
+* **The Fix:** Audit both `raft_codec_serialize_msg` and `raft_codec_deserialize_msg`. Strictly enforce subtraction-form boundary checks. Explicitly reject payloads where length properties claim data exists but the pointer is `NULL`.
+* **Tests to Add:**
+* `codec_rejects_oversized_single_entry`
+* `codec_rejects_data_len_nonzero_with_null_data_on_serialize`
+
+
+
+### **Phase 28: Transport Identity Binding**
+
+*(Maps to Review Item 13: No transport identity/authentication)*
+
+* **The Gap:** The custom `libuv` network layer blindly trusts the `sender_id` parsed from the TCP payload. Any node connecting to the socket can impersonate the leader or a voting peer.
+* **The Fix:** Enforce a strict connection handshake in `raft_server.c`. When a connection is established, the remote must verify its `node_id`. The server must assert this ID against the `known_peers` list and immediately sever the socket if the ID is unknown, spoofed, or belongs to a different cluster group.
+

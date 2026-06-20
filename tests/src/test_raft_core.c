@@ -1840,6 +1840,116 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
     raft_core_destroy(r);
 }
 
+// ============================================================================
+// PHASE 16: SNAPSHOT STAGING TESTS
+// ============================================================================
+
+MACRO_TEST(snapshot_install_failure_leaves_state_intact) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+    raft_core_step(r, &app);
+    MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1);
+
+    uint8_t snap_data[] = "STATE";
+    raft_msg_t snap = {
+        .type = MSG_INSTALL_SNAPSHOT, .from = 2, .term = 2,
+        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5
+    };
+    raft_core_step(r, &snap);
+
+    // Verify memory is strictly untouched during the staging phase!
+    MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 0);
+    MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1);
+
+    raft_ready_t ready = raft_core_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.install_snapshot);
+    MACRO_ASSERT_EQ_INT(ready.snapshot_index, 100);
+
+    // Simulate host application failing to write to the NVMe disk
+    raft_core_snapshot_acked(r, false);
+
+    // Verify memory is STILL perfectly untouched
+    MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 0);
+    MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 1);
+
+    // Verify a network rejection was actively queued to the leader
+    ready = raft_core_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 1);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(snapshot_ack_sent_only_after_acked_true) {
+    uint64_t peers[] = {2, 3};
+    raft_core_t* r = raft_core_create(1, peers, 2);
+
+    uint8_t snap_data[] = "STATE";
+    raft_msg_t snap = {
+        .type = MSG_INSTALL_SNAPSHOT, .from = 2, .term = 2,
+        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5
+    };
+    raft_core_step(r, &snap);
+
+    raft_ready_t ready1 = raft_core_get_ready(r);
+    MACRO_ASSERT_TRUE(ready1.install_snapshot);
+
+    // Verify NO messages are queued yet! The network ACK is strictly deferred.
+    MACRO_ASSERT_EQ_INT(ready1.num_messages, 0);
+
+    // Confirm disk durability
+    raft_core_snapshot_acked(r, true);
+
+    // Now the ACK is queued and the memory is mutated
+    raft_ready_t ready2 = raft_core_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready2.num_messages, 1);
+    MACRO_ASSERT_FALSE(ready2.messages[0].reject);
+    MACRO_ASSERT_EQ_INT(ready2.messages[0].index, 100);
+    MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 100);
+
+    raft_core_destroy(r);
+}
+
+MACRO_TEST(snapshot_install_preserves_valid_suffix) {
+    uint64_t peers[] = {2, 3};
+    // Boot a node at index 99
+    raft_core_t* r = raft_core_restore(1, peers, NULL, 2, 2, 0, 99, 99, 99, 2, NULL, 0);
+
+    raft_entry_t entries[3];
+    for(int i=0; i<3; i++) {
+        entries[i].term = 2;
+        entries[i].index = 100 + i;
+        entries[i].type = ENTRY_NORMAL;
+        entries[i].client_id = 0;
+        entries[i].client_seq = 0;
+        entries[i].data = (uint8_t*)"X";
+        entries[i].data_len = 1;
+    }
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 2, .index = 99, .log_term = 2, .entries = entries, .num_entries = 3, .commit = 99 };
+    raft_core_step(r, &app);
+    MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 102);
+
+    // Receive snapshot covering up to index 100
+    uint8_t snap_data[] = "STATE";
+    raft_msg_t snap = {
+        .type = MSG_INSTALL_SNAPSHOT, .from = 2, .term = 2,
+        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5
+    };
+
+    raft_core_step(r, &snap);
+    raft_core_snapshot_acked(r, true);
+
+    MACRO_ASSERT_EQ_INT(raft_core_snapshot_index(r), 100);
+    // Uncommitted suffix 101 and 102 must be safely preserved!
+    MACRO_ASSERT_EQ_INT(raft_core_last_index(r), 102);
+
+    raft_core_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1917,7 +2027,10 @@ int main(void) {
     MACRO_ADD(tests, raft_fault_duplicate_snapshot_install_is_safe);
     MACRO_ADD(tests, raft_fault_stale_read_index_response_ignored);
     MACRO_ADD(tests, raft_fault_learner_promotion_after_leader_crash);
-
+    MACRO_ADD(tests, snapshot_install_failure_leaves_state_intact);
+    MACRO_ADD(tests, snapshot_ack_sent_only_after_acked_true);
+    MACRO_ADD(tests, snapshot_install_preserves_valid_suffix);
+    
     macro_run_all("raft_core", tests, test_count);
     return 0;
 }

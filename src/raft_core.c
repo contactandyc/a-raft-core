@@ -782,41 +782,14 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         send_msg(r, res);
     }
     else if (msg->type == MSG_INSTALL_SNAPSHOT) {
-        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
-
         if (msg->term >= r->current_term) {
             r->state = RAFT_STATE_FOLLOWER;
             r->activity_accepted = true;
 
+            // PHASE 16: Two-Phase Snapshot Staging
+            // We NO LONGER mutate the log, advance indices, or send ACKs here!
+            // All memory mutations are deferred strictly to `raft_core_snapshot_acked`
             if (msg->index > r->snapshot_index) {
-                bool suffix_match = false;
-                uint64_t my_last_idx = raft_core_last_index_internal(r);
-                if (msg->index <= my_last_idx && log_term(r, msg->index) == msg->log_term) {
-                    suffix_match = true;
-                }
-
-                if (suffix_match) {
-                    size_t keep_len = my_last_idx - msg->index + 1;
-                    for (uint64_t i = r->snapshot_index + 1; i <= msg->index; i++) {
-                        raft_entry_t* e = log_get(r, i);
-                        if (e && e->data) free(e->data);
-                    }
-                    memmove(&r->log[1], &r->log[msg->index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
-                    r->log_len = keep_len;
-                } else {
-                    for (size_t i = 0; i < r->log_len; i++) {
-                        if (r->log[i].data) free(r->log[i].data);
-                    }
-                    r->log_len = 1;
-                }
-
-                r->snapshot_index = msg->index;
-                r->snapshot_term = msg->log_term;
-                r->log[0].index = msg->index;
-                r->log[0].term = msg->log_term;
-                r->log[0].data = NULL;
-                r->log[0].data_len = 0;
-
                 r->pending_snapshot = true;
                 r->pending_snapshot_from = msg->from;
                 r->pending_snapshot_msg_index = msg->index;
@@ -828,15 +801,16 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                     memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
                 }
                 r->pending_snapshot_len = msg->snapshot_len;
-
-                res.reject = false;
-                res.index = msg->index;
             } else {
-                res.reject = false;
-                res.index = msg->index;
+                // If it's an old snapshot, just ACK it instantly to suppress re-transmissions
+                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
+                send_msg(r, res);
             }
+        } else {
+            // Stale Term Rejection
+            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
+            send_msg(r, res);
         }
-        send_msg(r, res);
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
