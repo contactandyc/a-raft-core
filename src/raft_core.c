@@ -71,8 +71,6 @@ struct raft_core_s {
     bool pending_snapshot;
     uint8_t* pending_snapshot_data;
     size_t pending_snapshot_len;
-
-    // PHASE 13: Staged snapshot identifiers awaiting application validation
     uint64_t pending_snapshot_from;
     uint64_t pending_snapshot_msg_index;
     uint64_t pending_snapshot_msg_term;
@@ -150,7 +148,6 @@ static void send_append(raft_core_t* r, size_t peer_idx) {
     uint64_t next = r->next_index[peer_idx];
     uint64_t last = raft_core_last_index_internal(r);
 
-    // PHASE 13: Active Leader Snapshot Rescue Dispatch
     if (next <= r->snapshot_index) {
         raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
                            .index = r->snapshot_index, .log_term = r->snapshot_term };
@@ -238,7 +235,10 @@ static int cmp_u64(const void* a, const void* b) {
 }
 
 raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers) {
+    // 1. Strict API Validation: Reject if too many peers, or if peers array is NULL
     if (num_peers > MAX_PEERS || (num_peers > 0 && !peers)) return NULL;
+
+    // 2. Strict API Validation: Reject if local ID is in the remote list, or if there are duplicates
     for (size_t i = 0; i < num_peers; i++) {
         if (peers[i] == id) return NULL;
         for (size_t j = i + 1; j < num_peers; j++) {
@@ -252,6 +252,7 @@ raft_core_t* raft_core_create(uint64_t id, uint64_t* peers, size_t num_peers) {
     r->id = id;
     r->state = RAFT_STATE_FOLLOWER;
     r->num_peers = num_peers;
+
     for (size_t i = 0; i < num_peers; i++) {
         r->peers[i] = peers[i];
         r->is_learner[i] = false;
@@ -289,6 +290,7 @@ void raft_core_destroy(raft_core_t* r) {
     free(r);
 }
 
+
 raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num_peers,
                                uint64_t term, uint64_t voted_for, uint64_t commit_index, uint64_t applied_index,
                                uint64_t snapshot_index, uint64_t snapshot_term,
@@ -304,12 +306,28 @@ raft_core_t* raft_core_restore(uint64_t id, uint64_t* peers, bool* is_learners, 
     raft_core_t* r = raft_core_create(id, NULL, 0);
     if (!r) return NULL;
 
-    r->num_peers = num_peers;
+    r->num_peers = 0;
+    bool found_self = false;
+
+    // Filter out our own ID from the peer list while verifying our Ephemeral status
     for (size_t i = 0; i < num_peers; i++) {
-        r->peers[i] = peers[i];
-        r->is_learner[i] = is_learners ? is_learners[i] : false;
-        r->next_index[i] = snapshot_index + 1;
-        if (peers[i] == id) r->is_learner_self = r->is_learner[i];
+        if (peers[i] == id) {
+            r->is_learner_self = is_learners ? is_learners[i] : false;
+            found_self = true;
+        } else {
+            if (r->num_peers < MAX_PEERS) {
+                r->peers[r->num_peers] = peers[i];
+                r->is_learner[r->num_peers] = is_learners ? is_learners[i] : false;
+                r->next_index[r->num_peers] = snapshot_index + 1;
+                r->num_peers++;
+            }
+        }
+    }
+
+    if (!found_self && num_peers > 0) {
+        r->removed = true;
+        r->is_learner_self = true;
+        r->state = RAFT_STATE_FOLLOWER;
     }
 
     r->current_term = term;
@@ -363,26 +381,40 @@ static void apply_config_change(raft_core_t* r, uint64_t index) {
     uint8_t* data = r->log[arr_idx].data;
     uint32_t data_len = r->log[arr_idx].data_len;
 
-    if (type == ENTRY_CONF_ADD || type == ENTRY_CONF_ADD_LEARNER) {
+    // PHASE 14: Strict Topology Promotion
+    // Note: ENTRY_CONF_ADD is completely ignored by the state machine to prevent unsafe instant additions
+
+    if (type == ENTRY_CONF_ADD_LEARNER) {
         if (data_len == sizeof(uint64_t)) {
             uint64_t node_id = *(uint64_t*)data;
-            if (node_id == r->id) r->is_learner_self = (type == ENTRY_CONF_ADD_LEARNER);
+            if (node_id == r->id) r->is_learner_self = true; // Hard lock to learner role
 
             bool found = false;
             for (size_t j = 0; j < r->num_peers; j++) {
                 if (r->peers[j] == node_id) {
-                    r->is_learner[j] = (type == ENTRY_CONF_ADD_LEARNER);
+                    r->is_learner[j] = true;
                     found = true;
                     break;
                 }
             }
             if (!found && node_id != r->id && r->num_peers < MAX_PEERS) {
                 r->peers[r->num_peers] = node_id;
-                r->is_learner[r->num_peers] = (type == ENTRY_CONF_ADD_LEARNER);
+                r->is_learner[r->num_peers] = true;
                 r->next_index[r->num_peers] = raft_core_last_index_internal(r) + 1;
                 r->match_index[r->num_peers] = 0;
                 r->recent_active[r->num_peers] = true;
                 r->num_peers++;
+            }
+        }
+    } else if (type == ENTRY_CONF_PROMOTE_LEARNER) {
+        if (data_len == sizeof(uint64_t)) {
+            uint64_t node_id = *(uint64_t*)data;
+            if (node_id == r->id) r->is_learner_self = false;
+            for (size_t j = 0; j < r->num_peers; j++) {
+                if (r->peers[j] == node_id) {
+                    r->is_learner[j] = false;
+                    break;
+                }
             }
         }
     } else if (type == ENTRY_CONF_REMOVE) {
@@ -523,6 +555,11 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         return;
     }
     else if (msg->type == MSG_READ_INDEX_RES) {
+
+        // PHASE 14: Hostile ReadIndex Drop!
+        // Actively filter out stale, rejected, or impersonated responses
+        if (msg->reject || msg->from != r->leader_id || msg->term != r->current_term) return;
+
         if (r->num_read_states >= r->read_states_cap) {
             r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
             raft_read_state_t* new_rs = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
@@ -745,12 +782,41 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         send_msg(r, res);
     }
     else if (msg->type == MSG_INSTALL_SNAPSHOT) {
+        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
+
         if (msg->term >= r->current_term) {
             r->state = RAFT_STATE_FOLLOWER;
             r->activity_accepted = true;
 
-            // PHASE 13: Deferred Snapshot Execution. Mutate memory only after Pump ACKs durability.
             if (msg->index > r->snapshot_index) {
+                bool suffix_match = false;
+                uint64_t my_last_idx = raft_core_last_index_internal(r);
+                if (msg->index <= my_last_idx && log_term(r, msg->index) == msg->log_term) {
+                    suffix_match = true;
+                }
+
+                if (suffix_match) {
+                    size_t keep_len = my_last_idx - msg->index + 1;
+                    for (uint64_t i = r->snapshot_index + 1; i <= msg->index; i++) {
+                        raft_entry_t* e = log_get(r, i);
+                        if (e && e->data) free(e->data);
+                    }
+                    memmove(&r->log[1], &r->log[msg->index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
+                    r->log_len = keep_len;
+                } else {
+                    for (size_t i = 0; i < r->log_len; i++) {
+                        if (r->log[i].data) free(r->log[i].data);
+                    }
+                    r->log_len = 1;
+                }
+
+                r->snapshot_index = msg->index;
+                r->snapshot_term = msg->log_term;
+                r->log[0].index = msg->index;
+                r->log[0].term = msg->log_term;
+                r->log[0].data = NULL;
+                r->log[0].data_len = 0;
+
                 r->pending_snapshot = true;
                 r->pending_snapshot_from = msg->from;
                 r->pending_snapshot_msg_index = msg->index;
@@ -762,16 +828,15 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
                     memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
                 }
                 r->pending_snapshot_len = msg->snapshot_len;
+
+                res.reject = false;
+                res.index = msg->index;
             } else {
-                // If it's an old snapshot, just ACK it instantly to suppress re-transmissions
-                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
-                send_msg(r, res);
+                res.reject = false;
+                res.index = msg->index;
             }
-        } else {
-            // Stale Term Rejection
-            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_core_last_index_internal(r) };
-            send_msg(r, res);
         }
+        send_msg(r, res);
     }
     else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
         if (msg->term != r->current_term) return;
@@ -781,35 +846,38 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
         for (size_t i = 0; i < r->num_peers; i++) {
             if (r->peers[i] == msg->from) {
 
-                if (msg->read_seq > r->peer_read_seq[i]) r->peer_read_seq[i] = msg->read_seq;
+                // PHASE 14: Hostile ReadIndex Responses - Only tally ACKs on success!
+                if (!msg->reject) {
+                    if (msg->read_seq > r->peer_read_seq[i]) r->peer_read_seq[i] = msg->read_seq;
 
-                for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-                    if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[i]) {
-                        if (r->peer_read_seq[i] >= r->pending_reads[pr].read_seq) {
-                            r->pending_reads[pr].acked_by[i] = true;
-                            if (!r->is_learner[i]) r->pending_reads[pr].acks++;
+                    for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
+                        if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[i]) {
+                            if (r->peer_read_seq[i] >= r->pending_reads[pr].read_seq) {
+                                r->pending_reads[pr].acked_by[i] = true;
+                                if (!r->is_learner[i]) r->pending_reads[pr].acks++;
 
-                            size_t voters = r->is_learner_self ? 0 : 1;
-                            for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
+                                size_t voters = r->is_learner_self ? 0 : 1;
+                                for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
 
-                            if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
-                                if (r->pending_reads[pr].from == r->id) {
-                                    if (r->num_read_states >= r->read_states_cap) {
-                                        r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-                                        raft_read_state_t* new_rs = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
-                                        if (new_rs) r->read_states = new_rs;
+                                if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
+                                    if (r->pending_reads[pr].from == r->id) {
+                                        if (r->num_read_states >= r->read_states_cap) {
+                                            r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
+                                            raft_read_state_t* new_rs = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
+                                            if (new_rs) r->read_states = new_rs;
+                                        }
+                                        if (r->read_states) {
+                                            r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
+                                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
+                                            r->num_read_states++;
+                                        }
+                                    } else {
+                                        raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
+                                                              .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
+                                        send_msg(r, rd_res);
                                     }
-                                    if (r->read_states) {
-                                        r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                                        r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
-                                        r->num_read_states++;
-                                    }
-                                } else {
-                                    raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
-                                                          .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
-                                    send_msg(r, rd_res);
+                                    r->pending_reads[pr].active = false;
                                 }
-                                r->pending_reads[pr].active = false;
                             }
                         }
                     }
@@ -878,7 +946,6 @@ void raft_core_step(raft_core_t* r, raft_msg_t* msg) {
     }
 }
 
-// PHASE 13: Safe snapshot integration. Only called by the pump if NVMe fsyncs pass!
 void raft_core_snapshot_acked(raft_core_t* r, bool success) {
     if (!r->pending_snapshot) return;
 
@@ -968,7 +1035,6 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
     ready.read_states = r->read_states;
     ready.num_read_states = r->num_read_states;
 
-    // PHASE 13: Export staged payload to pump for installation
     ready.install_snapshot = r->pending_snapshot;
     ready.snapshot_index = r->pending_snapshot_msg_index;
     ready.snapshot_term = r->pending_snapshot_msg_term;
@@ -979,11 +1045,22 @@ raft_ready_t raft_core_get_ready(raft_core_t* r) {
 }
 
 void raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t applied_index) {
+    if (r->pending_snapshot) {
+        if (r->last_saved_index < r->snapshot_index) r->last_saved_index = r->snapshot_index;
+        if (r->commit_index < r->snapshot_index) r->commit_index = r->snapshot_index;
+        if (r->last_applied < r->snapshot_index) r->last_applied = r->snapshot_index;
+
+        if (r->pending_snapshot_data) free(r->pending_snapshot_data);
+        r->pending_snapshot_data = NULL;
+        r->pending_snapshot_len = 0;
+        r->pending_snapshot = false;
+    }
+
     if (saved_index > r->last_saved_index) r->last_saved_index = saved_index;
 
     for(uint64_t i = r->last_applied + 1; i <= applied_index; i++) {
         raft_entry_t* e = log_get(r, i);
-        if (e && (e->type == ENTRY_CONF_ADD || e->type == ENTRY_CONF_ADD_LEARNER || e->type == ENTRY_CONF_REMOVE)) {
+        if (e && (e->type == ENTRY_CONF_ADD || e->type == ENTRY_CONF_ADD_LEARNER || e->type == ENTRY_CONF_REMOVE || e->type == ENTRY_CONF_PROMOTE_LEARNER)) {
             apply_config_change(r, i);
         }
     }
@@ -1061,11 +1138,21 @@ size_t raft_core_peers(raft_core_t* r, uint64_t* out_peers) {
 }
 
 size_t raft_core_peers_ext(raft_core_t* r, uint64_t* out_peers, bool* out_is_learners) {
+    size_t count = 0;
     for (size_t i = 0; i < r->num_peers; i++) {
-        if (out_peers) out_peers[i] = r->peers[i];
-        if (out_is_learners) out_is_learners[i] = r->is_learner[i];
+        if (out_peers) out_peers[count] = r->peers[i];
+        if (out_is_learners) out_is_learners[count] = r->is_learner[i];
+        count++;
     }
-    return r->num_peers;
+
+    // Explicitly append ourselves to the exported list so save_hardstate writes our role to the .meta file!
+    if (!r->removed) {
+        if (out_peers) out_peers[count] = r->id;
+        if (out_is_learners) out_is_learners[count] = r->is_learner_self;
+        count++;
+    }
+
+    return count;
 }
 
 void raft_core_add_learner(raft_core_t* r, uint64_t peer_id) {

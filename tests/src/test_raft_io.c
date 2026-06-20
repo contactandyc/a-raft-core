@@ -23,20 +23,19 @@ MACRO_TEST(io_save_and_boot) {
     const char* wal_path = "/tmp/raft_test_wal";
     cleanup_wal_files(wal_path);
 
-    uint64_t peers[] = {2, 3};
-    bool learners[] = {false, false};
+    // FIX: Full 3-node topology to allow Node 1 to lead
+    uint64_t peers[] = {1, 2, 3};
+    bool learners[] = {false, false, false};
     raft_wal_t wal;
 
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
-    // Add 0 for applied bounds
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 2, 0, 0, 0, 0, 0, 0);
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 3, 0, 0, 0, 0, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
     raft_msg_t hup = { .type = MSG_HUP };
     raft_core_step(core, &hup);
 
-    // PHASE 3: Satisfy the Pre-Vote phase first
     raft_msg_t pv_res = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
     raft_core_step(core, &pv_res);
     raft_core_advance_all(core);
@@ -63,7 +62,7 @@ MACRO_TEST(io_save_and_boot) {
 
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 16, 4), 0);
 
-    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, learners, 2, saved_term, 1, saved_commit, 0, 0, 0);
+    raft_core_t* recovered_core = raft_io_boot(&wal, 1, peers, learners, 3, saved_term, 1, saved_commit, 0, 0, 0);
 
     MACRO_ASSERT_TRUE(recovered_core != NULL);
     MACRO_ASSERT_EQ_INT(raft_core_term(recovered_core), saved_term);
@@ -77,13 +76,11 @@ MACRO_TEST(io_save_and_boot) {
     cleanup_wal_files(wal_path);
 }
 
-// PHASE 2: Ensure we don't permanently brick a node if we purged historical segments
 MACRO_TEST(io_boot_with_purged_wal) {
     const char* wal_path = "/tmp/raft_test_wal_purged";
     cleanup_wal_files(wal_path);
 
     raft_wal_t wal;
-    // 1MB segments force heavy rotation
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 2), 0);
 
     uint8_t dummy[1024] = {0};
@@ -92,18 +89,17 @@ MACRO_TEST(io_boot_with_purged_wal) {
     }
     raft_wal_flush_batch(&wal);
 
-    // Purge everything up to index 1000
     raft_wal_purge_head(&wal, 1000);
     raft_wal_close(&wal);
 
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 2), 0);
 
-    uint64_t peers[] = {2, 3};
-    bool learners[] = {false, false};
-    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 2, 1, 0, 1000, 1000, 0, 0);
+    // FIX: Full 3-node topology to allow Node 1 to lead
+    uint64_t peers[] = {1, 2, 3};
+    bool learners[] = {false, false, false};
+    raft_core_t* core = raft_io_boot(&wal, 1, peers, learners, 3, 1, 0, 1000, 1000, 0, 0);
     MACRO_ASSERT_TRUE(core != NULL);
 
-    // The WAL safely anchored itself at the first valid, un-purged index!
     MACRO_ASSERT_TRUE(raft_core_last_index(core) == 2000);
 
     raft_core_destroy(core);

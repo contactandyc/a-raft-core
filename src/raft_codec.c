@@ -10,7 +10,6 @@
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
     if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
 
-    // Base Frame (82) + 4 bytes for Phase 8 snapshot lengths
     uint64_t len = 86;
 
     for (size_t i = 0; i < m->num_entries; i++) {
@@ -61,7 +60,6 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         }
     }
 
-    // PHASE 8: Pack physical snapshot bytes
     uint32_t snap_len = (uint32_t)m->snapshot_len;
     memcpy(buf+pos, &snap_len, 4); pos += 4;
     if (snap_len > 0 && m->snapshot_data != NULL) {
@@ -100,13 +98,14 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     m->num_entries = num_e;
 
     if (num_e > 0) {
-        if (pos + (num_e * 37) > len) return -1;
+        // PHASE 15 FIX: Subtraction-form bounds check prevents integer overflow attacks
+        if (num_e * 37 > len - pos) return -1;
 
         m->entries = calloc(num_e, sizeof(raft_entry_t));
         if (!m->entries) return -1;
 
         for (size_t i = 0; i < num_e; i++) {
-            if (pos + 37 > len) goto cleanup_error;
+            if (37 > len - pos) goto cleanup_error;
 
             memcpy(&m->entries[i].term, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
@@ -120,7 +119,8 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
             m->entries[i].data_len = dlen;
 
             if (dlen > 0) {
-                if (pos + dlen > len) goto cleanup_error;
+                // PHASE 15 FIX: Subtraction-form limits
+                if (dlen > len - pos) goto cleanup_error;
                 m->entries[i].data = malloc(dlen);
                 if (!m->entries[i].data) goto cleanup_error;
                 memcpy(m->entries[i].data, buf+pos, dlen); pos += dlen;
@@ -128,13 +128,13 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
         }
     }
 
-    // PHASE 8: Rehydrate Snapshot Bytes Safely
-    if (pos + 4 <= len) {
+    if (4 <= len - pos) {
         uint32_t slen;
         memcpy(&slen, buf+pos, 4); pos += 4;
         m->snapshot_len = slen;
         if (slen > 0) {
-            if (pos + slen > len) goto cleanup_error;
+            // PHASE 15 FIX: Subtraction-form limits
+            if (slen > len - pos) goto cleanup_error;
             m->snapshot_data = malloc(slen);
             if (!m->snapshot_data) goto cleanup_error;
             memcpy(m->snapshot_data, buf+pos, slen); pos += slen;

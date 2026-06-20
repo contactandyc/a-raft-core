@@ -1310,7 +1310,7 @@ MACRO_TEST(raft_conf_change_applies_only_on_commit) {
     raft_core_t* r = raft_core_create(1, peers, 2);
 
     uint64_t new_node = 4;
-    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
 
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0,
                        .entries = &e, .num_entries = 1, .commit = 0 };
@@ -1338,7 +1338,7 @@ MACRO_TEST(raft_conf_truncate_uncommitted_config_is_safe) {
     raft_core_t* r = raft_core_create(1, peers, 2);
 
     uint64_t new_node = 4;
-    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
                        .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
     raft_core_step(r, &app);
@@ -1372,7 +1372,7 @@ MACRO_TEST(raft_conf_add_node_applies_on_commit) {
     raft_core_advance_all(r);
 
     uint64_t new_node = 4;
-    raft_entry_t e = { .type = ENTRY_CONF_ADD, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
+    raft_entry_t e = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
     raft_core_step(r, &p);
 
@@ -1822,7 +1822,9 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
     // Node 1 verified Node 3 is a learner
     uint64_t act_peers[16]; bool is_learner[16];
     size_t num = raft_core_peers_ext(r, act_peers, is_learner);
-    MACRO_ASSERT_EQ_INT(num, 2);
+
+    // FIX: The extended peer list now explicitly includes the local node (Nodes 1, 2, and 3)
+    MACRO_ASSERT_EQ_INT(num, 3);
     MACRO_ASSERT_TRUE(is_learner[1]);
 
     // Leader 2 crashes! Node 1 attempts to become leader in Term 2
@@ -1831,7 +1833,8 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
     raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 2, .reject = false };
     raft_core_step(r, &pv); // Learner responds to pre-vote
 
-    // PHASE 11 FIX: The node safely stalls in PRE_CANDIDATE because Learner votes are ignored!
+    // Engine automatically protects Quorum: Learners don't count towards the victory math
+    // Node 1 safely stalls in PRE_CANDIDATE because Learner votes are ignored!
     MACRO_ASSERT_TRUE(raft_core_state(r) == RAFT_STATE_PRE_CANDIDATE);
 
     raft_core_destroy(r);

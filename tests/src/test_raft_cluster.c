@@ -111,12 +111,11 @@ MACRO_TEST(cluster_tcp_crash_recovery_and_resync) {
     nodes[1] = calloc(1, sizeof(raft_node_t));
     nodes[2] = calloc(1, sizeof(raft_node_t));
 
-    uint64_t peers1[] = {2, 3};
-    uint64_t peers2[] = {1, 3};
-    uint64_t peers3[] = {1, 2};
-    raft_node_init(nodes[0], &servers[0], 0, peers1, 2, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
-    raft_node_init(nodes[1], &servers[1], 0, peers2, 2, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
-    raft_node_init(nodes[2], &servers[2], 0, peers3, 2, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
+    // FIX: Provide the full topology so nodes do not self-depose
+    uint64_t full_cluster[] = {1, 2, 3};
+    raft_node_init(nodes[0], &servers[0], 0, full_cluster, 3, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
+    raft_node_init(nodes[1], &servers[1], 0, full_cluster, 3, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
+    raft_node_init(nodes[2], &servers[2], 0, full_cluster, 3, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
 
     raft_server_connect(&servers[0], "127.0.0.1", 18082, 2);
     raft_server_connect(&servers[0], "127.0.0.1", 18083, 3);

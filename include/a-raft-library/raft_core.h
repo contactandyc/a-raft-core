@@ -40,9 +40,10 @@ typedef enum {
 
 typedef enum {
     ENTRY_NORMAL = 0,
-    ENTRY_CONF_ADD = 1,
+    ENTRY_CONF_ADD = 1,          // PHASE 14: Deprecated/Disabled internally for safety
     ENTRY_CONF_REMOVE = 2,
-    ENTRY_CONF_ADD_LEARNER = 3
+    ENTRY_CONF_ADD_LEARNER = 3,
+    ENTRY_CONF_PROMOTE_LEARNER = 4 // PHASE 14: Strict two-stage promotion
 } entry_type_t;
 
 typedef struct {
@@ -111,8 +112,6 @@ void         raft_core_advance(raft_core_t* r, uint64_t saved_index, uint64_t ap
 void         raft_core_advance_all(raft_core_t* r);
 
 void         raft_core_compact(raft_core_t* r, uint64_t compact_index);
-
-// PHASE 13: Pump-deferred acknowledgement API
 void         raft_core_snapshot_acked(raft_core_t* r, bool success);
 
 raft_state_t raft_core_state(raft_core_t* r);

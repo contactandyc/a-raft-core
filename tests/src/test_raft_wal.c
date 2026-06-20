@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "a-raft-library/raft_wal.h"
 #include "the-macro-library/macro_test.h"
 
@@ -23,7 +24,6 @@ MACRO_TEST(raft_wal_truncation_tail) {
     raft_wal_t wal;
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, path, 16, 2), 0);
 
-    // Append 5 entries
     uint8_t data[] = "data";
     for (uint64_t i = 1; i <= 5; i++) {
         raft_wal_append(&wal, 1, i, 0, 0, 0, data, 4);
@@ -32,10 +32,7 @@ MACRO_TEST(raft_wal_truncation_tail) {
 
     MACRO_ASSERT_EQ_INT(wal.max_disk_index, 5);
 
-    // Truncate from index 3 (Removes 3, 4, 5)
     raft_wal_truncate_tail(&wal, 3);
-
-    // Verify it cleanly truncated
     MACRO_ASSERT_EQ_INT(wal.max_disk_index, 2);
 
     raft_wal_close(&wal);
@@ -47,11 +44,8 @@ MACRO_TEST(raft_wal_segment_rotation_and_purge) {
     cleanup_wal(path);
 
     raft_wal_t wal;
-    // Set segment size ridiculously small (1 MB) to force a rotation
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, path, 1, 2), 0);
 
-    // 1 MB = 1,048,576 bytes. We write 20,000 entries of ~100 bytes each
-    // to guarantee it spills over into 00002.wal and 00003.wal
     uint8_t dummy[80] = {0};
     for (uint64_t i = 1; i <= 20000; i++) {
         raft_wal_append(&wal, 1, i, 0, 0, 0, dummy, 80);
@@ -60,14 +54,45 @@ MACRO_TEST(raft_wal_segment_rotation_and_purge) {
 
     MACRO_ASSERT_TRUE(wal.current_seg_id > 1);
 
-    // Now purge everything up to index 15,000
     raft_wal_purge_head(&wal, 15000);
 
-    // The oldest segment pointer should have advanced, and old files recycled
     MACRO_ASSERT_TRUE(wal.oldest_seg_id > 1);
     MACRO_ASSERT_TRUE(wal.standby_count > 0);
 
     raft_wal_close(&wal);
+    cleanup_wal(path);
+}
+
+// PHASE 15: Extreme Disk Corruption Validation
+MACRO_TEST(raft_wal_rejects_corrupted_crc) {
+    const char* path = "/tmp/raft_test_wal_crc";
+    cleanup_wal(path);
+
+    raft_wal_t wal;
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, path, 1, 2), 0);
+
+    uint8_t data[] = "SAFE_DATA";
+    raft_wal_append(&wal, 1, 1, 0, 0, 0, data, 9);
+    raft_wal_append(&wal, 1, 2, 0, 0, 0, data, 9);
+    raft_wal_flush_batch(&wal);
+    raft_wal_close(&wal);
+
+    // Simulate bit rot: Open file and scramble a payload byte on index 2
+    char seg_path[512];
+    snprintf(seg_path, 512, "%s/0000000001.wal", path);
+    int fd = open(seg_path, O_RDWR);
+    MACRO_ASSERT_TRUE(fd >= 0);
+    uint8_t poison = 0xFF;
+    pwrite(fd, &poison, 1, 80); // Corrupts index 2 payload
+    close(fd);
+
+    raft_wal_t corrupted_wal;
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&corrupted_wal, path, 1, 2), 0);
+
+    // Bootloader detects the bad CRC and forcefully truncates the timeline at index 1!
+    MACRO_ASSERT_EQ_INT(corrupted_wal.max_disk_index, 1);
+
+    raft_wal_close(&corrupted_wal);
     cleanup_wal(path);
 }
 
@@ -76,6 +101,7 @@ int main(void) {
     size_t test_count = 0;
     MACRO_ADD(tests, raft_wal_truncation_tail);
     MACRO_ADD(tests, raft_wal_segment_rotation_and_purge);
+    MACRO_ADD(tests, raft_wal_rejects_corrupted_crc);
     macro_run_all("raft_wal_engine", tests, test_count);
     return 0;
 }

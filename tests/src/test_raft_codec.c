@@ -10,7 +10,7 @@
 #include "the-macro-library/macro_test.h"
 
 MACRO_TEST(codec_rejects_truncated_base_frame) {
-    uint8_t bad_buf[40] = {0}; // Minimum is 82
+    uint8_t bad_buf[40] = {0};
     raft_msg_t m;
     int res = raft_codec_deserialize_msg(bad_buf, 40, &m);
     MACRO_ASSERT_EQ_INT(res, -1);
@@ -20,11 +20,11 @@ MACRO_TEST(codec_rejects_billion_entry_attack) {
     uint8_t buf[128] = {0};
     uint64_t massive_num = 5000000000ULL;
 
-    memset(buf, 0, 82);
-    memcpy(buf + 74, &massive_num, 8); // Inject into num_entries position
+    memset(buf, 0, 86);
+    memcpy(buf + 74, &massive_num, 8);
 
     raft_msg_t m;
-    int res = raft_codec_deserialize_msg(buf, 84, &m);
+    int res = raft_codec_deserialize_msg(buf, 86, &m);
 
     MACRO_ASSERT_EQ_INT(res, -1);
 }
@@ -35,14 +35,28 @@ MACRO_TEST(codec_rejects_missing_entry_payload_bytes) {
     memcpy(buf + 74, &num_entries, 8);
 
     uint32_t fake_payload_len = 10000;
-
-    // (Header + term + index + type) + Phase 5 Headers (client_id + client_seq)
-    // 82 + 8 + 8 + 1 + 8 + 8 = 115
-    memcpy(buf + 115, &fake_payload_len, 4);
+    memcpy(buf + 119, &fake_payload_len, 4);
 
     raft_msg_t m;
-    int res = raft_codec_deserialize_msg(buf, 120, &m);
+    int res = raft_codec_deserialize_msg(buf, 124, &m);
 
+    MACRO_ASSERT_EQ_INT(res, -1);
+}
+
+// PHASE 15: Deep Integer Overflow Attack Validation
+MACRO_TEST(codec_rejects_integer_overflow_attack) {
+    uint8_t buf[256] = {0};
+    uint64_t num_entries = 1;
+    memcpy(buf + 74, &num_entries, 8);
+
+    // Malicious actor passes UINT32_MAX to overflow (pos + dlen > len) math
+    uint32_t fake_payload_len = 0xFFFFFFFF;
+    memcpy(buf + 119, &fake_payload_len, 4);
+
+    raft_msg_t m;
+    int res = raft_codec_deserialize_msg(buf, 124, &m);
+
+    // Engine must safely reject via subtraction checks!
     MACRO_ASSERT_EQ_INT(res, -1);
 }
 
@@ -52,8 +66,9 @@ MACRO_TEST(codec_roundtrips_successfully) {
         .type = MSG_APPEND_ENTRIES,
         .to = 2, .from = 1, .term = 4, .log_term = 3, .index = 4, .commit = 2,
         .conflict_term = 99, .conflict_index = 88,
-        .read_seq = 1005, // Testing Phase 4
-        .reject = false, .entries = &e1, .num_entries = 1
+        .read_seq = 1005,
+        .reject = false, .entries = &e1, .num_entries = 1,
+        .snapshot_len = 0, .snapshot_data = NULL
     };
 
     uint8_t* buf = NULL;
@@ -82,6 +97,7 @@ int main(void) {
     MACRO_ADD(tests, codec_rejects_truncated_base_frame);
     MACRO_ADD(tests, codec_rejects_billion_entry_attack);
     MACRO_ADD(tests, codec_rejects_missing_entry_payload_bytes);
+    MACRO_ADD(tests, codec_rejects_integer_overflow_attack);
     MACRO_ADD(tests, codec_roundtrips_successfully);
     macro_run_all("raft_codec", tests, test_count);
     return 0;
