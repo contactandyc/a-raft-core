@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
+raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                           uint64_t* loaded_peers, bool* loaded_learners, size_t num_peers,
                           uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit, uint64_t saved_applied,
                           uint64_t snapshot_index, uint64_t snapshot_term) {
@@ -61,7 +61,7 @@ raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
         }
     }
 
-    raft_core_t* core = raft_core_restore(node_id, loaded_peers, loaded_learners, num_peers,
+    raft_t* core = raft_restore(node_id, loaded_peers, loaded_learners, num_peers,
                                           saved_term, saved_vote, saved_commit, saved_applied,
                                           snapshot_index, snapshot_term, entries, total_entries);
 

@@ -24,9 +24,6 @@ BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 BUILD_VARIANT="${BUILD_VARIANT:-debug}"
 PREFIX="${PREFIX:-/usr/local}"
 
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export CMAKE_PREFIX_PATH="$PREFIX"
-
 rm -rf "${BUILD_DIR}"
 
 cmake -S . -B "${BUILD_DIR}" \

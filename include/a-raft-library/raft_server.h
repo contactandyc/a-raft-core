@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <uv.h>
-#include "a-raft-library/raft_core.h"
+#include "a-raft-library/raft.h"
 #include "a-raft-library/raft_io.h"
 #include "a-raft-library/raft_wal.h"
 
@@ -86,7 +86,7 @@ struct raft_node_s {
     uint64_t group_id;
     raft_server_t* server;
 
-    raft_core_t* core;
+    raft_t* core;
     raft_wal_t wal;
 
     uint64_t saved_term;

@@ -6,11 +6,11 @@
 #ifndef RAFT_IO_H
 #define RAFT_IO_H
 
-#include "a-raft-library/raft_core.h"
+#include "a-raft-library/raft.h"
 #include "a-raft-library/raft_wal.h"
 
 // PHASE 7: Ingest completely verified snap and membership states
-raft_core_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
+raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                           uint64_t* loaded_peers, bool* loaded_learners, size_t num_peers,
                           uint64_t saved_term, uint64_t saved_vote, uint64_t saved_commit, uint64_t saved_applied,
                           uint64_t snapshot_index, uint64_t snapshot_term);

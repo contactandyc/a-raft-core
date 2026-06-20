@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "a-raft-library/raft_core.h"
+#include "a-raft-library/raft.h"
 
 // Hard limits to prevent memory exhaustion or malicious packet overflow
 #define RAFT_MAX_FRAME_SIZE  (1024 * 1024 * 10) // 10 MB maximum frame

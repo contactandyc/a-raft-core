@@ -57,8 +57,14 @@ find_package(the_lz4_library CONFIG REQUIRED)
 add_library(a_raft_library_debug STATIC
   src/raft_codec.c
   src/raft_core.c
+  src/raft_election.c
   src/raft_io.c
+  src/raft_log.c
+  src/raft_membership.c
+  src/raft_read_index.c
+  src/raft_replication.c
   src/raft_server.c
+  src/raft_snapshot.c
   src/raft_wal.c
 )
 
@@ -92,8 +98,14 @@ install(TARGETS a_raft_library_debug EXPORT a_raft_libraryTargets
 add_library(a_raft_library_memory STATIC
   src/raft_codec.c
   src/raft_core.c
+  src/raft_election.c
   src/raft_io.c
+  src/raft_log.c
+  src/raft_membership.c
+  src/raft_read_index.c
+  src/raft_replication.c
   src/raft_server.c
+  src/raft_snapshot.c
   src/raft_wal.c
 )
 
@@ -130,8 +142,14 @@ install(TARGETS a_raft_library_memory EXPORT a_raft_libraryTargets
 add_library(a_raft_library_static STATIC
   src/raft_codec.c
   src/raft_core.c
+  src/raft_election.c
   src/raft_io.c
+  src/raft_log.c
+  src/raft_membership.c
+  src/raft_read_index.c
+  src/raft_replication.c
   src/raft_server.c
+  src/raft_snapshot.c
   src/raft_wal.c
 )
 
@@ -165,8 +183,14 @@ install(TARGETS a_raft_library_static EXPORT a_raft_libraryTargets
 add_library(a_raft_library_shared SHARED
   src/raft_codec.c
   src/raft_core.c
+  src/raft_election.c
   src/raft_io.c
+  src/raft_log.c
+  src/raft_membership.c
+  src/raft_read_index.c
+  src/raft_replication.c
   src/raft_server.c
+  src/raft_snapshot.c
   src/raft_wal.c
 )
 

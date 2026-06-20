@@ -55,8 +55,14 @@ add_executable(test_raft_chaos
   src/test_raft_chaos.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 
@@ -107,8 +113,14 @@ add_executable(test_raft_cluster
   src/test_raft_cluster.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 
@@ -159,8 +171,14 @@ add_executable(test_raft_codec
   src/test_raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 
@@ -205,57 +223,63 @@ endif()
 
 add_test(NAME test_raft_codec COMMAND $<TARGET_FILE:test_raft_codec>)
 # ==============================================================================
-# test_raft_core Target (Standard Test)
+# test_raft_election Target (Standard Test)
 # ==============================================================================
-add_executable(test_raft_core
-  src/test_raft_core.c
+add_executable(test_raft_election
+  src/test_raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 
-target_include_directories(test_raft_core BEFORE PRIVATE
+target_include_directories(test_raft_election BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../src
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 
-list(APPEND TEST_EXECUTABLES test_raft_core)
+list(APPEND TEST_EXECUTABLES test_raft_election)
 
-set_target_properties(test_raft_core PROPERTIES
+set_target_properties(test_raft_election PROPERTIES
   C_STANDARD 23
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED YES
 )
 
-target_link_libraries(test_raft_core PRIVATE libuv::uv)
-target_link_libraries(test_raft_core PRIVATE h2o_c_library::h2o_c_library)
-target_link_libraries(test_raft_core PRIVATE the_lz4_library::the_lz4_library)
-target_link_libraries(test_raft_core PRIVATE a_raft_library::a_raft_library)
+target_link_libraries(test_raft_election PRIVATE libuv::uv)
+target_link_libraries(test_raft_election PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_election PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_election PRIVATE a_raft_library::a_raft_library)
 
 if(M_LIB)
-  target_link_libraries(test_raft_core PRIVATE ${M_LIB})
+  target_link_libraries(test_raft_election PRIVATE ${M_LIB})
 endif()
 
 if(MSVC)
-  target_compile_options(test_raft_core PRIVATE /W4 ${TEST_COMPILER_OPTS})
+  target_compile_options(test_raft_election PRIVATE /W4 ${TEST_COMPILER_OPTS})
 else()
-  target_compile_options(test_raft_core PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+  target_compile_options(test_raft_election PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
 endif()
 
 if(A_ENABLE_COVERAGE)
   if (CMAKE_C_COMPILER_ID MATCHES "Clang")
-    target_compile_options(test_raft_core PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
-    target_link_options(test_raft_core PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+    target_compile_options(test_raft_election PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_election PRIVATE -fprofile-instr-generate -fcoverage-mapping)
   elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(test_raft_core PRIVATE -O0 -g --coverage)
-    target_link_options(test_raft_core PRIVATE --coverage)
+    target_compile_options(test_raft_election PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_election PRIVATE --coverage)
   endif()
 endif()
 
-add_test(NAME test_raft_core COMMAND $<TARGET_FILE:test_raft_core>)
+add_test(NAME test_raft_election COMMAND $<TARGET_FILE:test_raft_election>)
 # ==============================================================================
 # test_raft_io Target (Standard Test)
 # ==============================================================================
@@ -263,8 +287,14 @@ add_executable(test_raft_io
   src/test_raft_io.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 
@@ -309,14 +339,252 @@ endif()
 
 add_test(NAME test_raft_io COMMAND $<TARGET_FILE:test_raft_io>)
 # ==============================================================================
+# test_raft_membership Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_membership
+  src/test_raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_membership BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_membership)
+
+set_target_properties(test_raft_membership PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_membership PRIVATE libuv::uv)
+target_link_libraries(test_raft_membership PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_membership PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_membership PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_membership PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_membership PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_membership PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_membership PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_membership PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_membership PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_membership PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_membership COMMAND $<TARGET_FILE:test_raft_membership>)
+# ==============================================================================
+# test_raft_read_index Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_read_index
+  src/test_raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_read_index BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_read_index)
+
+set_target_properties(test_raft_read_index PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_read_index PRIVATE libuv::uv)
+target_link_libraries(test_raft_read_index PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_read_index PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_read_index PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_read_index PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_read_index PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_read_index PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_read_index PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_read_index PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_read_index PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_read_index PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_read_index COMMAND $<TARGET_FILE:test_raft_read_index>)
+# ==============================================================================
+# test_raft_replication Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_replication
+  src/test_raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_replication BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_replication)
+
+set_target_properties(test_raft_replication PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_replication PRIVATE libuv::uv)
+target_link_libraries(test_raft_replication PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_replication PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_replication PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_replication PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_replication PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_replication PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_replication PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_replication PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_replication PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_replication PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_replication COMMAND $<TARGET_FILE:test_raft_replication>)
+# ==============================================================================
+# test_raft_snapshot Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_snapshot
+  src/test_raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_snapshot BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_snapshot)
+
+set_target_properties(test_raft_snapshot PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_snapshot PRIVATE libuv::uv)
+target_link_libraries(test_raft_snapshot PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_snapshot PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_snapshot PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_snapshot PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_snapshot PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_snapshot PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_snapshot PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_snapshot PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_snapshot PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_snapshot PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_snapshot COMMAND $<TARGET_FILE:test_raft_snapshot>)
+# ==============================================================================
 # test_raft_wal Target (Standard Test)
 # ==============================================================================
 add_executable(test_raft_wal
   src/test_raft_wal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
 )
 

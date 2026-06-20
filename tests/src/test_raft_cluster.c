@@ -26,64 +26,50 @@ static int dummy_apply_cb(void* ctx, const raft_entry_t* entry, uint64_t current
     (void)ctx;
     (void)entry;
     (void)current_term;
-    return RAFT_APPLY_OK; // Acknowledge the commit immediately
+    return RAFT_APPLY_OK;
 }
 
-// The multi-stage cluster verification engine
 static void on_test_check(uv_timer_t* handle) {
     (void)handle;
 
     static int ticks = 0;
     ticks++;
-    if (ticks > 150) { // 15 second hard timeout
+    if (ticks > 150) {
         uv_stop(uv_default_loop());
         return;
     }
 
-    uint64_t c1 = raft_core_commit_index(nodes[0]->core);
-    uint64_t c2 = raft_core_commit_index(nodes[1]->core);
-    uint64_t c3 = (cluster_state != 2) ? raft_core_commit_index(nodes[2]->core) : 0;
+    uint64_t c1 = raft_commit_index(nodes[0]->core);
+    uint64_t c2 = raft_commit_index(nodes[1]->core);
+    uint64_t c3 = (cluster_state != 2) ? raft_commit_index(nodes[2]->core) : 0;
 
     raft_node_t* leader = NULL;
     for (int i = 0; i < 3; i++) {
-        if (cluster_state != 2 && raft_core_state(nodes[i]->core) == RAFT_STATE_LEADER) {
+        if (cluster_state != 2 && raft_state(nodes[i]->core) == RAFT_STATE_LEADER) {
             leader = nodes[i]; break;
         }
     }
 
-    // STATE 0: Wait for Leader -> Propose Payload 1
     if (cluster_state == 0 && leader) {
         printf("\n[Stage 1] Leader elected! Proposing payload 1...\n");
-        // Added Phase 5 args: client_id=1, client_seq=1
         raft_node_propose(leader, (const uint8_t*)"PAYLOAD_1", 9, 1, 1, NULL);
         cluster_state = 1;
     }
-    // STATE 1: Wait for Commit -> Isolate Node 3 logically -> Propose Payload 2
     else if (cluster_state == 1) {
         if (c1 >= 2 && c2 >= 2 && c3 >= 2) {
             printf("[Stage 2] Payload 1 committed. Logically isolating Node 3...\n");
-
             servers[2].network_isolated = true;
-
-            // Added Phase 5 args: client_id=1, client_seq=2
             raft_node_propose(leader, (const uint8_t*)"PAYLOAD_2", 9, 1, 2, NULL);
             cluster_state = 2;
         }
     }
-    // STATE 2: Wait for Quorum Commit -> Resurrect Node 3
     else if (cluster_state == 2) {
         if (c1 >= 3 && c2 >= 3) {
             printf("[Stage 3] Payload 2 committed by survivors. Healing network for Node 3...\n");
-
-            // Resurrect Node 3 natively by just flipping the isolation flag
             servers[2].network_isolated = false;
-
-            // Notice we do NOT manually re-connect.
-            // The Reconnect Manager timers are firing in the background and will organically heal the TCP pipes!
             cluster_state = 3;
         }
     }
-    // STATE 3: Verify Seamless Catch-up
     else if (cluster_state == 3) {
         if (c3 >= 3) {
             printf("[Stage 4] Node 3 reconnected to the mesh and synced Payload 2! SUCCESS.\n");
@@ -111,7 +97,6 @@ MACRO_TEST(cluster_tcp_crash_recovery_and_resync) {
     nodes[1] = calloc(1, sizeof(raft_node_t));
     nodes[2] = calloc(1, sizeof(raft_node_t));
 
-    // FIX: Provide the full topology so nodes do not self-depose
     uint64_t full_cluster[] = {1, 2, 3};
     raft_node_init(nodes[0], &servers[0], 0, full_cluster, 3, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
     raft_node_init(nodes[1], &servers[1], 0, full_cluster, 3, dummy_apply_cb, NULL, NULL, NULL, NULL, NULL);
@@ -130,7 +115,7 @@ MACRO_TEST(cluster_tcp_crash_recovery_and_resync) {
     uv_run(loop, UV_RUN_DEFAULT);
 
     raft_wal_close(&nodes[0]->wal); raft_wal_close(&nodes[1]->wal); raft_wal_close(&nodes[2]->wal);
-    raft_core_destroy(nodes[0]->core); raft_core_destroy(nodes[1]->core); raft_core_destroy(nodes[2]->core);
+    raft_destroy(nodes[0]->core); raft_destroy(nodes[1]->core); raft_destroy(nodes[2]->core);
 
     free(nodes[0]); free(nodes[1]); free(nodes[2]);
 

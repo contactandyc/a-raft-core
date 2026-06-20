@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "a-raft-library/raft_core.h"
+#include "a-raft-library/raft.h"
 #include "the-macro-library/macro_test.h"
 
 #define NUM_NODES 5
@@ -26,7 +26,6 @@ typedef struct {
     size_t payload_len;
 } applied_entry_t;
 
-// PHASE 11: Strict Invariant Tracker
 typedef struct {
     uint64_t prev_commit;
     uint64_t prev_term;
@@ -34,7 +33,7 @@ typedef struct {
 } invariant_tracker_t;
 
 typedef struct {
-    raft_core_t* nodes[NUM_NODES];
+    raft_t* nodes[NUM_NODES];
     in_flight_msg_t network[MAX_INFLIGHT];
     int current_tick;
 
@@ -55,26 +54,23 @@ static uint32_t fast_rand() {
 
 static void route_messages(chaos_harness_t* h) {
     for (int i = 0; i < NUM_NODES; i++) {
-        // PHASE 11 INVARIANT: Term Monotonicity & Leader Uniqueness
-        uint64_t current_term = raft_core_term(h->nodes[i]);
+        uint64_t current_term = raft_term(h->nodes[i]);
         MACRO_ASSERT_TRUE(current_term >= h->invariants[i].prev_term);
         h->invariants[i].prev_term = current_term;
 
-        if (raft_core_state(h->nodes[i]) == RAFT_STATE_LEADER) {
+        if (raft_state(h->nodes[i]) == RAFT_STATE_LEADER) {
             if (h->leaders_in_term[current_term] == 0) {
                 h->leaders_in_term[current_term] = i + 1;
             } else {
-                // Proof: Only one leader can exist per term
                 MACRO_ASSERT_EQ_INT(h->leaders_in_term[current_term], i + 1);
             }
         }
 
-        raft_ready_t ready = raft_core_get_ready(h->nodes[i]);
+        raft_ready_t ready = raft_get_ready(h->nodes[i]);
 
         for (size_t m = 0; m < ready.num_messages; m++) {
             raft_msg_t msg = ready.messages[m];
 
-            // 5% chance to drop message entirely (Network Partition Simulation)
             if (fast_rand() % 100 < 5) continue;
 
             int delay = 1 + (fast_rand() % 10);
@@ -94,7 +90,6 @@ static void route_messages(chaos_harness_t* h) {
                             }
                         }
                     }
-                    // PHASE 11: Handle snapshot routing
                     if (msg.snapshot_len > 0) {
                         h->network[j].msg.snapshot_data = malloc(msg.snapshot_len);
                         memcpy(h->network[j].msg.snapshot_data, msg.snapshot_data, msg.snapshot_len);
@@ -115,20 +110,18 @@ static void route_messages(chaos_harness_t* h) {
                     memcpy(h->state_machines[i][idx].payload, ready.committed_entries[c].data, ready.committed_entries[c].data_len);
                 }
 
-                // PHASE 11 INVARIANT: Log monotonically applies forward
                 MACRO_ASSERT_TRUE(idx > h->commit_indices[i] || h->commit_indices[i] == 0);
                 h->commit_indices[i] = idx;
             }
         }
-        raft_core_advance_all(h->nodes[i]);
+        raft_advance_all(h->nodes[i]);
 
-        // PHASE 11 INVARIANTS: State boundaries are mathematically sound
-        uint64_t new_commit = raft_core_commit_index(h->nodes[i]);
-        uint64_t new_applied = raft_core_last_applied(h->nodes[i]);
+        uint64_t new_commit = raft_commit_index(h->nodes[i]);
+        uint64_t new_applied = raft_last_applied(h->nodes[i]);
 
-        MACRO_ASSERT_TRUE(new_commit >= h->invariants[i].prev_commit); // Commit index NEVER decreases
-        MACRO_ASSERT_TRUE(new_applied <= new_commit);                  // Cannot apply uncommitted entries
-        MACRO_ASSERT_TRUE(raft_core_last_index(h->nodes[i]) >= new_commit); // Log must contain committed bounds
+        MACRO_ASSERT_TRUE(new_commit >= h->invariants[i].prev_commit);
+        MACRO_ASSERT_TRUE(new_applied <= new_commit);
+        MACRO_ASSERT_TRUE(raft_last_index(h->nodes[i]) >= new_commit);
 
         h->invariants[i].prev_commit = new_commit;
         h->invariants[i].prev_applied = new_applied;
@@ -140,7 +133,7 @@ static void deliver_due_messages(chaos_harness_t* h) {
         if (h->network[j].active && h->current_tick >= h->network[j].deliver_at_tick) {
             raft_msg_t msg = h->network[j].msg;
             int target_idx = msg.to - 1;
-            raft_core_step(h->nodes[target_idx], &msg);
+            raft_step(h->nodes[target_idx], &msg);
 
             if (msg.num_entries > 0) {
                 for (size_t k = 0; k < msg.num_entries; k++) {
@@ -164,11 +157,11 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         for (int j = 0; j < NUM_NODES; j++) {
             if ((uint64_t)(j + 1) != node_id) peers[p_idx++] = j + 1;
         }
-        h.nodes[i] = raft_core_create(node_id, peers, NUM_NODES - 1);
+        h.nodes[i] = raft_create(node_id, peers, NUM_NODES - 1);
     }
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_core_step(h.nodes[0], &hup);
+    raft_step(h.nodes[0], &hup);
 
     for (h.current_tick = 0; h.current_tick < MAX_TICKS; h.current_tick++) {
         route_messages(&h);
@@ -176,21 +169,20 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
 
         if (h.current_tick % 5 == 0) {
             raft_msg_t tick = { .type = MSG_TICK };
-            for (int i = 0; i < NUM_NODES; i++) raft_core_step(h.nodes[i], &tick);
+            for (int i = 0; i < NUM_NODES; i++) raft_step(h.nodes[i], &tick);
         }
 
         if (fast_rand() % 100 < 10) {
             int target = fast_rand() % NUM_NODES;
             uint8_t* payload = (uint8_t*)"DATA";
-            // PHASE 11: Pass mock sequence IDs to simulate client dedup load
             raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = 1, .client_seq = h.current_tick, .data = payload, .data_len = 4 };
             raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-            raft_core_step(h.nodes[target], &p);
+            raft_step(h.nodes[target], &p);
         }
 
         if (fast_rand() % 500 == 0) {
             int target = fast_rand() % NUM_NODES;
-            raft_core_step(h.nodes[target], &hup);
+            raft_step(h.nodes[target], &hup);
         }
     }
 
@@ -226,7 +218,7 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
         }
     }
 
-    for (int i = 0; i < NUM_NODES; i++) raft_core_destroy(h.nodes[i]);
+    for (int i = 0; i < NUM_NODES; i++) raft_destroy(h.nodes[i]);
 }
 
 int main(void) {

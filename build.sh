@@ -43,7 +43,8 @@ case "$COMMAND" in
     rm -rf "$BUILD_DIR" "build-coverage"
     echo "✅ Unboot complete."
     ;;
-  bootstrap)
+
+  bootstrap|bootstrap-test)
     echo "--- Bootstrapping Hermetic Workspace ---"
 
     # --- FAILSAFE: Shield against leaky parent environments ---
@@ -86,8 +87,33 @@ case "$COMMAND" in
     echo ""
     echo "✅ Bootstrap complete! All dependencies are isolated in your workspace."
 
-    # Automatically cascade into a first-party build!
-    "$0" build
+    # Automatically cascade into the correct first-party build or test
+    if [ "$COMMAND" = "bootstrap-test" ]; then
+      "$0" test
+    else
+      "$0" build
+    fi
+    ;;
+
+  test)
+    pick_generator
+    echo "--- Building and Running Tests (Generator: $GENERATOR, Variant: $BUILD_VARIANT) ---"
+
+    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$PREFIX"
+
+    cmake -S . -B "$BUILD_DIR" -G "$GENERATOR" \
+      -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+      -DCMAKE_PREFIX_PATH="$PREFIX" \
+      -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+      -DA_BUILD_VARIANT="$BUILD_VARIANT"
+
+    cmake --build "$BUILD_DIR" -j
+
+    echo "--- Executing Test Suite ---"
+    cd "$BUILD_DIR"
+    ctest --output-on-failure
+    echo "✅ All tests passed."
     ;;
 
   build|install)
@@ -214,7 +240,7 @@ case "$COMMAND" in
     ;;
 
   *)
-    echo "Usage: $0 [bootstrap|unboot|build|install|coverage|clean]" >&2
+    echo "Usage: $0 [bootstrap|bootstrap-test|unboot|build|install|test|coverage|clean]" >&2
     exit 1
     ;;
 esac
