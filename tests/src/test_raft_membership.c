@@ -36,19 +36,19 @@ MACRO_TEST(raft_conf_change_applies_only_on_commit) {
     uint64_t new_node = 4;
     raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
 
-    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0,
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
                        .entries = &e, .num_entries = 1, .commit = 0 };
-    raft_step(r, &app);
+    raft_step_remote(r, &app);
 
     uint64_t active_peers[16];
     size_t num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 2);
 
-    raft_msg_t hb = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 1, .log_term = 1,
+    raft_msg_t hb = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 1, .log_term = 1,
                        .entries = NULL, .num_entries = 0, .commit = 1 };
-    raft_step(r, &hb);
+    raft_step_remote(r, &hb);
 
-    raft_advance_all(r);
+    raft_advance_all_for_tests_only(r);
 
     num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 3);
@@ -63,14 +63,14 @@ MACRO_TEST(raft_conf_truncate_uncommitted_config_is_safe) {
 
     uint64_t new_node = 4;
     raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
-    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1,
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1,
                        .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
-    raft_step(r, &app);
+    raft_step_remote(r, &app);
 
     raft_entry_t conflict = { .term = 2, .index = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
-    raft_msg_t overwrite = { .type = MSG_APPEND_ENTRIES, .from = 3, .term = 2,
+    raft_msg_t overwrite = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 3, .term = 2,
                              .index = 0, .log_term = 0, .entries = &conflict, .num_entries = 1, .commit = 0 };
-    raft_step(r, &overwrite);
+    raft_step_remote(r, &overwrite);
 
     uint64_t active_peers[16];
     size_t num = raft_peers(r, active_peers);
@@ -88,26 +88,26 @@ MACRO_TEST(raft_conf_add_node_applies_on_commit) {
     MACRO_ASSERT_EQ_INT(num, 2);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(r, &hup);
-    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &pv);
-    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &vote);
-    raft_advance_all(r);
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
 
     uint64_t new_node = 4;
     raft_entry_t e = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-    raft_step(r, &p);
+    raft_step_local(r, &p);
 
     num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 2);
 
-    raft_msg_t ack = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
-    raft_step(r, &ack);
+    raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack);
     MACRO_ASSERT_EQ_INT(raft_commit_index(r), 2);
 
-    raft_advance_all(r);
+    raft_advance_all_for_tests_only(r);
 
     num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 3);
@@ -121,34 +121,34 @@ MACRO_TEST(raft_conf_remove_node_applies_on_commit) {
     raft_t* r = raft_create(1, peers, 3);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(r, &hup);
-    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &pv1);
-    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 1, .reject = false };
-    raft_step(r, &pv2);
+    raft_step_local(r, &hup);
+    raft_msg_t pv1 = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv1);
+    raft_msg_t pv2 = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 3, .term = 1, .reject = false };
+    raft_step_remote(r, &pv2);
 
-    raft_msg_t vote1 = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .from = 3, .term = 1, .reject = false };
-    raft_step(r, &vote1);
-    raft_step(r, &vote2);
-    raft_advance_all(r);
+    raft_msg_t vote1 = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_msg_t vote2 = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 3, .term = 1, .reject = false };
+    raft_step_remote(r, &vote1);
+    raft_step_remote(r, &vote2);
+    raft_advance_all_for_tests_only(r);
 
     uint64_t rm_node = 3;
     raft_entry_t e = { .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-    raft_step(r, &p);
+    raft_step_local(r, &p);
 
     uint64_t active_peers[16];
     size_t num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 3);
 
-    raft_msg_t ack1 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
-    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .from = 4, .term = 1, .reject = false, .index = 2 };
-    raft_step(r, &ack1);
-    raft_step(r, &ack2);
+    raft_msg_t ack1 = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .to = 1, .from = 4, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack1);
+    raft_step_remote(r, &ack2);
     MACRO_ASSERT_EQ_INT(raft_commit_index(r), 2);
 
-    raft_advance_all(r);
+    raft_advance_all_for_tests_only(r);
 
     num = raft_peers(r, active_peers);
     MACRO_ASSERT_EQ_INT(num, 2);
@@ -164,24 +164,24 @@ MACRO_TEST(raft_learner_does_not_vote_or_count_in_quorum) {
     raft_add_learner(r, 3);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(r, &hup);
-    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &pv);
-    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &vote);
-    raft_advance_all(r);
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
 
-    raft_msg_t ack2_noop = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 1 };
-    raft_step(r, &ack2_noop);
+    raft_msg_t ack2_noop = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 1 };
+    raft_step_remote(r, &ack2_noop);
     MACRO_ASSERT_EQ_INT(raft_commit_index(r), 1);
 
     raft_entry_t e_data = { .term = 1, .index = 2, .type = ENTRY_NORMAL, .data = (uint8_t*)"x", .data_len = 1 };
     raft_msg_t p_data = { .type = MSG_PROPOSE, .entries = &e_data, .num_entries = 1 };
-    raft_step(r, &p_data);
-    raft_advance_all(r);
+    raft_step_local(r, &p_data);
+    raft_advance_all_for_tests_only(r);
 
-    raft_msg_t ack3 = { .type = MSG_APPEND_RES, .from = 3, .term = 1, .reject = false, .index = 2 };
-    raft_step(r, &ack3);
+    raft_msg_t ack3 = { .type = MSG_APPEND_RES, .to = 1, .from = 3, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack3);
 
     MACRO_ASSERT_EQ_INT(raft_commit_index(r), 1);
 
@@ -193,22 +193,22 @@ MACRO_TEST(raft_leader_stepdown_on_self_removal) {
     raft_t* r = raft_create(1, peers, 1);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(r, &hup);
-    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &pv);
-    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(r, &vote);
-    raft_advance_all(r);
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
 
     uint64_t rm_node = 1;
     raft_entry_t e = { .term = 1, .index = 2, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
     raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-    raft_step(r, &p);
+    raft_step_local(r, &p);
 
-    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .from = 2, .term = 1, .reject = false, .index = 2 };
-    raft_step(r, &ack2);
+    raft_msg_t ack2 = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack2);
 
-    raft_advance_all(r);
+    raft_advance_all_for_tests_only(r);
 
     MACRO_ASSERT_TRUE(raft_state(r) == RAFT_STATE_FOLLOWER);
 
@@ -221,20 +221,20 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
 
     uint64_t node3 = 3;
     raft_entry_t conf_add = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&node3, .data_len = sizeof(uint64_t) };
-    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &conf_add, .num_entries = 1, .commit = 1 };
-    raft_step(r, &app);
-    raft_advance_all(r);
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &conf_add, .num_entries = 1, .commit = 1 };
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
 
     uint64_t act_peers[16]; bool is_learner[16];
-    size_t num = raft_peers_ext(r, act_peers, is_learner);
+    size_t num = raft_peers_ext(r, act_peers, is_learner, 16);
 
     MACRO_ASSERT_EQ_INT(num, 3);
     MACRO_ASSERT_TRUE(is_learner[1]);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(r, &hup);
-    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .from = 3, .term = 2, .reject = false };
-    raft_step(r, &pv);
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 3, .term = 2, .reject = false };
+    raft_step_remote(r, &pv);
 
     MACRO_ASSERT_TRUE(raft_state(r) == RAFT_STATE_PRE_CANDIDATE);
 

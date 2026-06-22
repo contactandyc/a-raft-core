@@ -9,7 +9,6 @@
 
 int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
     if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
-
     uint64_t len = 86;
 
     for (size_t i = 0; i < m->num_entries; i++) {
@@ -23,6 +22,12 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         len += m->snapshot_len;
     }
 
+    // PHASE 17: Allocate space for Snapshot ConfState
+    uint32_t num_p = (uint32_t)m->snapshot_num_peers;
+    if (num_p > 64) return -1;
+    if (len > RAFT_MAX_FRAME_SIZE - (4 + (num_p * 9))) return -1;
+    len += 4 + (num_p * 9);
+
     uint8_t* buf = malloc((size_t)len);
     if (!buf) return -1;
 
@@ -34,10 +39,8 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
     memcpy(buf+pos, &m->log_term, 8); pos += 8;
     memcpy(buf+pos, &m->index, 8); pos += 8;
     memcpy(buf+pos, &m->commit, 8); pos += 8;
-
     memcpy(buf+pos, &m->conflict_term, 8); pos += 8;
     memcpy(buf+pos, &m->conflict_index, 8); pos += 8;
-
     memcpy(buf+pos, &m->read_seq, 8); pos += 8;
 
     buf[pos++] = m->reject ? 1 : 0;
@@ -49,7 +52,6 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
         memcpy(buf+pos, &m->entries[i].term, 8); pos += 8;
         memcpy(buf+pos, &m->entries[i].index, 8); pos += 8;
         buf[pos++] = m->entries[i].type;
-
         memcpy(buf+pos, &m->entries[i].client_id, 8); pos += 8;
         memcpy(buf+pos, &m->entries[i].client_seq, 8); pos += 8;
 
@@ -64,6 +66,13 @@ int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len
     memcpy(buf+pos, &snap_len, 4); pos += 4;
     if (snap_len > 0 && m->snapshot_data != NULL) {
         memcpy(buf+pos, m->snapshot_data, snap_len); pos += snap_len;
+    }
+
+    // PHASE 17: Write Snapshot ConfState
+    memcpy(buf+pos, &num_p, 4); pos += 4;
+    for (size_t i = 0; i < num_p; i++) {
+        memcpy(buf+pos, &m->snapshot_peers[i], 8); pos += 8;
+        buf[pos++] = m->snapshot_is_learner[i] ? 1 : 0;
     }
 
     *out_buf = buf;
@@ -83,10 +92,8 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     memcpy(&m->log_term, buf+pos, 8); pos += 8;
     memcpy(&m->index, buf+pos, 8); pos += 8;
     memcpy(&m->commit, buf+pos, 8); pos += 8;
-
     memcpy(&m->conflict_term, buf+pos, 8); pos += 8;
     memcpy(&m->conflict_index, buf+pos, 8); pos += 8;
-
     memcpy(&m->read_seq, buf+pos, 8); pos += 8;
 
     m->reject = buf[pos++] == 1;
@@ -98,19 +105,15 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
     m->num_entries = num_e;
 
     if (num_e > 0) {
-        // PHASE 15 FIX: Subtraction-form bounds check prevents integer overflow attacks
         if (num_e * 37 > len - pos) return -1;
-
         m->entries = calloc(num_e, sizeof(raft_entry_t));
         if (!m->entries) return -1;
 
         for (size_t i = 0; i < num_e; i++) {
             if (37 > len - pos) goto cleanup_error;
-
             memcpy(&m->entries[i].term, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
             m->entries[i].type = buf[pos++];
-
             memcpy(&m->entries[i].client_id, buf+pos, 8); pos += 8;
             memcpy(&m->entries[i].client_seq, buf+pos, 8); pos += 8;
 
@@ -119,7 +122,6 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
             m->entries[i].data_len = dlen;
 
             if (dlen > 0) {
-                // PHASE 15 FIX: Subtraction-form limits
                 if (dlen > len - pos) goto cleanup_error;
                 m->entries[i].data = malloc(dlen);
                 if (!m->entries[i].data) goto cleanup_error;
@@ -133,11 +135,29 @@ int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) 
         memcpy(&slen, buf+pos, 4); pos += 4;
         m->snapshot_len = slen;
         if (slen > 0) {
-            // PHASE 15 FIX: Subtraction-form limits
             if (slen > len - pos) goto cleanup_error;
             m->snapshot_data = malloc(slen);
             if (!m->snapshot_data) goto cleanup_error;
             memcpy(m->snapshot_data, buf+pos, slen); pos += slen;
+        }
+    }
+
+    // PHASE 17: Read Snapshot ConfState
+    if (4 <= len - pos) {
+        uint32_t num_p;
+        memcpy(&num_p, buf+pos, 4); pos += 4;
+        if (num_p > 64) goto cleanup_error;
+        m->snapshot_num_peers = num_p;
+        if (num_p > 0) {
+            if (num_p * 9 > len - pos) goto cleanup_error;
+            m->snapshot_peers = calloc(num_p, sizeof(uint64_t));
+            m->snapshot_is_learner = calloc(num_p, sizeof(bool));
+            if (!m->snapshot_peers || !m->snapshot_is_learner) goto cleanup_error;
+
+            for (size_t i = 0; i < num_p; i++) {
+                memcpy(&m->snapshot_peers[i], buf+pos, 8); pos += 8;
+                m->snapshot_is_learner[i] = (buf[pos++] == 1);
+            }
         }
     }
 
@@ -162,4 +182,13 @@ void raft_codec_free_msg_entries(raft_msg_t* m) {
         m->snapshot_data = NULL;
         m->snapshot_len = 0;
     }
+    if (m->snapshot_peers) {
+        free(m->snapshot_peers);
+        m->snapshot_peers = NULL;
+    }
+    if (m->snapshot_is_learner) {
+        free(m->snapshot_is_learner);
+        m->snapshot_is_learner = NULL;
+    }
+    m->snapshot_num_peers = 0;
 }

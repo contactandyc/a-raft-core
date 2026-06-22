@@ -5,6 +5,7 @@
 
 #include "a-raft-library/raft_server.h"
 #include "a-raft-library/raft_codec.h"
+#include "raft_internal.h" // Gives server access to raft_log_term and internal getters
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -51,7 +52,7 @@ static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint
 
     uint64_t peers[RAFT_MAX_PEERS];
     bool is_learner[RAFT_MAX_PEERS];
-    hdr.num_peers = (uint32_t)raft_peers_ext(node->core, peers, is_learner);
+    hdr.num_peers = (uint32_t)raft_peers_ext(node->core, peers, is_learner, RAFT_MAX_PEERS);
 
     if (fwrite(&hdr, sizeof(raft_meta_header_t), 1, f) != 1) { fclose(f); return false; }
     for (uint32_t i = 0; i < hdr.num_peers; i++) {
@@ -105,10 +106,10 @@ static void on_election_timeout(uv_timer_t* handle) {
 
     if (raft_state(n->core) == RAFT_STATE_LEADER) {
         raft_msg_t chk = { .type = MSG_CHECK_QUORUM };
-        raft_step(n->core, &chk);
+        raft_step_local(n->core, &chk);
     } else {
         raft_msg_t hup = { .type = MSG_HUP };
-        raft_step(n->core, &hup);
+        raft_step_local(n->core, &hup);
     }
     raft_node_pump(n);
 }
@@ -116,7 +117,7 @@ static void on_election_timeout(uv_timer_t* handle) {
 static void on_heartbeat_tick(uv_timer_t* handle) {
     raft_node_t* n = (raft_node_t*)handle->data;
     raft_msg_t tick = { .type = MSG_TICK };
-    raft_step(n->core, &tick);
+    raft_step_local(n->core, &tick);
 
     raft_node_pump(n);
 }
@@ -353,7 +354,7 @@ void raft_node_pump(raft_node_t* node) {
                 else if (res == RAFT_APPLY_FATAL) {
                     node->fatal_error = true;
                     raft_msg_t hup = { .type = MSG_CHECK_QUORUM };
-                    raft_step(node->core, &hup);
+                    raft_step_local(node->core, &hup);
                     break;
                 }
             }
@@ -479,7 +480,15 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         uint32_t frame_size = sizeof(raft_net_header_t) + h->payload_len;
         if (peer->buffer_len - offset < frame_size) break;
 
-        if (peer->remote_node_id == 0 && h->sender_id != 0) peer->remote_node_id = h->sender_id;
+        // PREVENT SPOOFING: Terminate the connection if the peer lies about its identity mid-stream
+        if (peer->remote_node_id != 0 && peer->remote_node_id != h->sender_id) {
+            fprintf(stderr, "[WARN] Sender ID mismatch. Dropping connection.\n");
+            remove_peer(peer->server, peer);
+            uv_close((uv_handle_t*)client, on_client_close);
+            if (buf->base) free(buf->base);
+            return;
+        }
+        peer->remote_node_id = h->sender_id;
 
         uint8_t *payload = peer->buffer + offset + sizeof(raft_net_header_t);
         if (h->group_id < peer->server->max_groups && peer->server->groups[h->group_id]) {
@@ -488,10 +497,18 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
             raft_msg_t msg;
             if (raft_codec_deserialize_msg(payload, h->payload_len, &msg) == 0) {
 
-                raft_step(target_node->core, &msg);
+                // OVERRIDE: The network layer determines identity, never the payload!
+                msg.from = h->sender_id;
 
-                if (raft_activity_accepted(target_node->core)) {
-                    reset_election_timer(target_node);
+                if (msg.to != target_node->server->physical_node_id) {
+                    fprintf(stderr, "[WARN] Dropped frame not addressed to this node.\n");
+                } else {
+                    // Strict routing to the newly secured API
+                    raft_step_remote(target_node->core, &msg);
+
+                    if (raft_activity_accepted(target_node->core)) {
+                        reset_election_timer(target_node);
+                    }
                 }
 
                 raft_codec_free_msg_entries(&msg);
@@ -700,7 +717,7 @@ int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, u
     raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = client_id, .client_seq = client_seq, .data = (uint8_t*)payload, .data_len = len };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
 
-    raft_step(node->core, &prop);
+    raft_step_local(node->core, &prop);
     raft_node_pump(node);
 
     return RAFT_OK;
@@ -713,7 +730,7 @@ int raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_lea
     }
 
     raft_msg_t req = { .type = MSG_READ_INDEX, .read_seq = read_seq };
-    raft_step(node->core, &req);
+    raft_step_local(node->core, &req);
     raft_node_pump(node);
 
     return RAFT_OK;
@@ -723,8 +740,11 @@ int raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_lea
 int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
-    // Core memory truncation
-    raft_compact(node->core, compact_index);
+    // Use the mathematically safe compaction primitive to enforce durability contracts
+    uint64_t term = raft_log_term(node->core, compact_index);
+    raft_compact_after_snapshot(node->core, compact_index, term);
+
+    if (raft_has_fatal_error(node->core)) return RAFT_APPLY_FATAL;
 
     // Explicit hardstate binding to the new snapshot horizon
     if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, node->saved_applied, raft_snapshot_index(node->core), raft_snapshot_term(node->core))) {

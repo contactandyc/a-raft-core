@@ -3,6 +3,7 @@
 //
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
+#define RAFT_TESTING 1
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,24 +34,24 @@ MACRO_TEST(io_save_and_boot) {
     MACRO_ASSERT_TRUE(core != NULL);
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(core, &hup);
+    raft_step_local(core, &hup);
 
-    raft_msg_t pv_res = { .type = MSG_PRE_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(core, &pv_res);
-    raft_advance_all(core);
+    raft_msg_t pv_res = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(core, &pv_res);
+    raft_advance_all_for_tests_only(core);
 
-    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .from = 2, .term = 1, .reject = false };
-    raft_step(core, &vote);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(core, &vote);
 
     raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"HELLO", .data_len = 5 };
     raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-    raft_step(core, &prop);
+    raft_step_local(core, &prop);
 
     raft_ready_t ready = raft_get_ready(core);
     MACRO_ASSERT_TRUE(ready.num_entries_to_save > 0);
 
     raft_io_save(&wal, &ready);
-    raft_advance_all(core);
+    raft_advance_all_for_tests_only(core);
 
     uint64_t saved_term = raft_term(core);
     uint64_t saved_last_index = raft_last_index(core);
@@ -95,7 +96,10 @@ MACRO_TEST(io_boot_with_purged_wal) {
 
     uint64_t peers[] = {1, 2, 3};
     bool learners[] = {false, false, false};
-    raft_t* core = raft_io_boot(&wal, 1, peers, learners, 3, 1, 0, 1000, 1000, 0, 0);
+
+    // FIX: A purged WAL mathematically requires a baseline snapshot to connect its sequence to!
+    // Passing snapshot_index = 1000, snapshot_term = 1.
+    raft_t* core = raft_io_boot(&wal, 1, peers, learners, 3, 1, 0, 1000, 1000, 1000, 1);
     MACRO_ASSERT_TRUE(core != NULL);
 
     MACRO_ASSERT_TRUE(raft_last_index(core) == 2000);

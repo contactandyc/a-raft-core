@@ -8,7 +8,9 @@
 
 #include "a-raft-library/raft.h"
 
+// Leave 1 slot open for the local node during topology exports
 #define MAX_PEERS 64
+#define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
 
 typedef struct {
@@ -37,7 +39,7 @@ struct raft_s {
     uint64_t commit_index;
     uint64_t last_applied;
 
-    uint64_t peers[MAX_PEERS];
+    uint64_t peers[MAX_REMOTE_PEERS]; // Constrained to remote only
     size_t num_peers;
 
     uint64_t next_index[MAX_PEERS];
@@ -75,6 +77,12 @@ struct raft_s {
     uint64_t pending_snapshot_from;
     uint64_t pending_snapshot_msg_index;
     uint64_t pending_snapshot_msg_term;
+
+    uint64_t pending_snapshot_peers[MAX_PEERS];
+    bool pending_snapshot_is_learner[MAX_PEERS];
+    size_t pending_snapshot_num_peers;
+
+    bool fatal_error; // Exposes core invariants breaches
 };
 
 // Internal Submodule APIs

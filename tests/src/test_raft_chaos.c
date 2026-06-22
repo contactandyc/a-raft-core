@@ -114,7 +114,7 @@ static void route_messages(chaos_harness_t* h) {
                 h->commit_indices[i] = idx;
             }
         }
-        raft_advance_all(h->nodes[i]);
+        raft_advance_all_for_tests_only(h->nodes[i]);
 
         uint64_t new_commit = raft_commit_index(h->nodes[i]);
         uint64_t new_applied = raft_last_applied(h->nodes[i]);
@@ -133,7 +133,8 @@ static void deliver_due_messages(chaos_harness_t* h) {
         if (h->network[j].active && h->current_tick >= h->network[j].deliver_at_tick) {
             raft_msg_t msg = h->network[j].msg;
             int target_idx = msg.to - 1;
-            raft_step(h->nodes[target_idx], &msg);
+
+            raft_step_remote(h->nodes[target_idx], &msg);
 
             if (msg.num_entries > 0) {
                 for (size_t k = 0; k < msg.num_entries; k++) {
@@ -161,7 +162,7 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
     }
 
     raft_msg_t hup = { .type = MSG_HUP };
-    raft_step(h.nodes[0], &hup);
+    raft_step_local(h.nodes[0], &hup);
 
     for (h.current_tick = 0; h.current_tick < MAX_TICKS; h.current_tick++) {
         route_messages(&h);
@@ -169,7 +170,7 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
 
         if (h.current_tick % 5 == 0) {
             raft_msg_t tick = { .type = MSG_TICK };
-            for (int i = 0; i < NUM_NODES; i++) raft_step(h.nodes[i], &tick);
+            for (int i = 0; i < NUM_NODES; i++) raft_step_local(h.nodes[i], &tick);
         }
 
         if (fast_rand() % 100 < 10) {
@@ -177,12 +178,12 @@ MACRO_TEST(raft_chaos_proves_strict_linearizability) {
             uint8_t* payload = (uint8_t*)"DATA";
             raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = 1, .client_seq = h.current_tick, .data = payload, .data_len = 4 };
             raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-            raft_step(h.nodes[target], &p);
+            raft_step_local(h.nodes[target], &p);
         }
 
         if (fast_rand() % 500 == 0) {
             int target = fast_rand() % NUM_NODES;
-            raft_step(h.nodes[target], &hup);
+            raft_step_local(h.nodes[target], &hup);
         }
     }
 

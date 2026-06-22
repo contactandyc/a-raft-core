@@ -28,6 +28,12 @@ static void send_append(raft_t* r, size_t peer_idx) {
     if (next <= r->snapshot_index) {
         raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
                            .index = r->snapshot_index, .log_term = r->snapshot_term };
+
+        // PHASE 17: Atomically bundle the exact network topology along with the payload data
+        msg.snapshot_peers = malloc(MAX_PEERS * sizeof(uint64_t));
+        msg.snapshot_is_learner = malloc(MAX_PEERS * sizeof(bool));
+        msg.snapshot_num_peers = raft_peers_ext(r, msg.snapshot_peers, msg.snapshot_is_learner, MAX_PEERS);
+
         raft_send_msg(r, msg);
         return;
     }
@@ -129,6 +135,7 @@ void raft_replication_step(raft_t* r, raft_msg_t* msg) {
         if (msg->term >= r->current_term) {
             r->state = RAFT_STATE_FOLLOWER;
             r->activity_accepted = true;
+            r->leader_id = msg->from;
 
             uint64_t my_last_idx = raft_log_last_index(r);
 
