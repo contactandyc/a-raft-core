@@ -12,6 +12,7 @@
 #define MAX_PEERS 64
 #define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
+#define RAFT_MAX_FRAME_SIZE (1024 * 1024) // 1MB maximum network frame size
 
 typedef struct {
     uint64_t read_seq;

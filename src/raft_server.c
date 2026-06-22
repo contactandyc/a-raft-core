@@ -4,8 +4,7 @@
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include "a-raft-library/raft_server.h"
-#include "a-raft-library/raft_codec.h"
-#include "raft_internal.h" // Gives server access to raft_log_term and internal getters
+#include "raft_internal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -30,6 +29,12 @@ typedef struct {
     uint8_t is_learner;
 } raft_meta_peer_t;
 #pragma pack(pop)
+
+// Custom wrapper to prevent memory leaks if a socket closes mid-write
+typedef struct {
+    uv_write_t req;
+    uv_buf_t buf;
+} write_req_t;
 
 void raft_node_pump(raft_node_t* node);
 static void attempt_reconnect(uv_timer_t* handle);
@@ -77,8 +82,9 @@ static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint
 
 static void on_write_done(uv_write_t* req, int status) {
     (void)status;
-    free(req->data);
-    free(req);
+    write_req_t* wr = (write_req_t*)req;
+    if (wr->buf.base) free(wr->buf.base);
+    free(wr);
 }
 
 static void on_client_close(uv_handle_t* handle) {
@@ -132,12 +138,20 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
 static void flush_outbound(known_peer_t* kp) {
     if (!kp->conn || kp->out_queue_len == 0) return;
 
-    uv_buf_t buf = uv_buf_init((char*)kp->out_queue, kp->out_queue_len);
-    uv_write_t* req = malloc(sizeof(uv_write_t));
-    if (!req) return;
+    // BACKPRESSURE LIMIT: If the OS TCP buffer is struggling to flush, stop
+    // handing it memory and queue it in userspace until it catches up.
+    if (kp->conn->handle.write_queue_size > 10 * 1024 * 1024) return;
 
-    req->data = kp->out_queue;
-    uv_write(req, (uv_stream_t*)&kp->conn->handle, &buf, 1, on_write_done);
+    write_req_t* wr = malloc(sizeof(write_req_t));
+    if (!wr) return;
+
+    wr->buf = uv_buf_init((char*)kp->out_queue, kp->out_queue_len);
+
+    if (uv_write(&wr->req, (uv_stream_t*)&kp->conn->handle, &wr->buf, 1, on_write_done) != 0) {
+        // Synchronous failure: The callback will NOT be invoked. Free memory instantly.
+        free(wr->buf.base);
+        free(wr);
+    }
 
     kp->out_queue_cap = 65536;
     kp->out_queue = malloc(kp->out_queue_cap);
@@ -163,45 +177,35 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
     h->sender_id = server->physical_node_id;
     memcpy(frame + sizeof(raft_net_header_t), payload, len);
 
-    bool handed_to_uv = false;
+    // Payload bytes are securely stored in the frame buffer, free the original instantly
+    free(payload);
 
     for (uint32_t i = 0; i < server->known_peer_count; i++) {
         known_peer_t* kp = server->known_peers[i];
         if (kp->node_id == target_node_id) {
             size_t needed = kp->out_queue_len + frame_size;
 
-            if (needed < kp->out_queue_len) {
-                free(frame); free(payload); return;
+            // Drop packet if the userspace queue hits 50MB (Death Spiral protection)
+            if (needed < kp->out_queue_len || needed > 50 * 1024 * 1024) {
+                free(frame); return;
             }
 
-            size_t new_cap = kp->out_queue_cap > 0 ? kp->out_queue_cap : 65536;
-
-            while (new_cap < needed) {
-                size_t old_cap = new_cap;
-                new_cap *= 2;
-                if (new_cap < old_cap || new_cap > 50 * 1024 * 1024) {
-                    free(frame); free(payload); return;
-                }
-            }
-
-            if (new_cap != kp->out_queue_cap) {
+            if (kp->out_queue_cap < needed) {
+                size_t new_cap = kp->out_queue_cap > 0 ? kp->out_queue_cap * 2 : 65536;
+                while (new_cap < needed) new_cap *= 2;
                 uint8_t* new_q = realloc(kp->out_queue, new_cap);
-                if (!new_q) {
-                    free(frame); free(payload); return;
-                }
+                if (!new_q) { free(frame); return; }
                 kp->out_queue = new_q;
                 kp->out_queue_cap = new_cap;
             }
 
             memcpy(kp->out_queue + kp->out_queue_len, frame, frame_size);
             kp->out_queue_len += frame_size;
+            free(frame);
 
             if (kp->conn) {
                 flush_outbound(kp);
             }
-
-            free(frame);
-            free(payload);
             return;
         }
     }
@@ -209,24 +213,24 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
     for (uint32_t i = 0; i < server->active_peer_count; i++) {
         peer_connection_t* peer = server->active_peers[i];
         if (peer->remote_node_id == target_node_id) {
-            uv_buf_t buf = uv_buf_init((char*)frame, frame_size);
-            uv_write_t* req = malloc(sizeof(uv_write_t));
-            if (req) {
-                req->data = frame;
-                if (uv_write(req, (uv_stream_t*)&peer->handle, &buf, 1, on_write_done) == 0) {
-                    handed_to_uv = true;
-                } else {
-                    free(req);
-                }
+            // Drop packet if OS write buffer exceeds 10MB (Death Spiral protection)
+            if (peer->handle.write_queue_size > 10 * 1024 * 1024) {
+                free(frame); return;
             }
-            break;
+
+            write_req_t* wr = malloc(sizeof(write_req_t));
+            if (!wr) { free(frame); return; }
+
+            wr->buf = uv_buf_init((char*)frame, frame_size);
+            if (uv_write(&wr->req, (uv_stream_t*)&peer->handle, &wr->buf, 1, on_write_done) != 0) {
+                free(frame);
+                free(wr);
+            }
+            return;
         }
     }
 
-    if (!handed_to_uv) {
-        free(frame);
-    }
-    free(payload);
+    free(frame);
 }
 
 void raft_node_pump(raft_node_t* node) {
@@ -242,7 +246,6 @@ void raft_node_pump(raft_node_t* node) {
         }
     }
 
-    // PHASE 13: True Deferral & Multi-Stage Snapshot Acknowledgement
     if (ready.install_snapshot) {
         bool snap_success = false;
 
@@ -256,7 +259,6 @@ void raft_node_pump(raft_node_t* node) {
             fflush(sf); fsync(fileno(sf)); fclose(sf);
 
             if (rename(tmp_snap, dat_snap) == 0) {
-                // Defer to the host application callback
                 if (!node->snap_cb || node->snap_cb(node->snap_ctx, ready.snapshot_index, ready.snapshot_term, ready.snapshot_data, ready.snapshot_len) == RAFT_SNAPSHOT_OK) {
 
                     if (save_hardstate(node, raft_term(node->core), raft_voted_for(node->core), ready.snapshot_index, ready.snapshot_index, ready.snapshot_index, ready.snapshot_term)) {
@@ -265,7 +267,6 @@ void raft_node_pump(raft_node_t* node) {
                         node->saved_applied = ready.snapshot_index;
                         node->saved_commit = ready.snapshot_index;
 
-                        // We are successfully durable. Safe to truncate.
                         raft_wal_purge_head(&node->wal, ready.snapshot_index);
 
                         actual_applied_idx = ready.snapshot_index > actual_applied_idx ? ready.snapshot_index : actual_applied_idx;
@@ -276,7 +277,6 @@ void raft_node_pump(raft_node_t* node) {
             }
         }
 
-        // Pass the final verdict to the core so it can issue the MSG_APPEND_RES
         raft_snapshot_acked(node->core, snap_success);
         if (!snap_success) {
             fprintf(stderr, "[ERROR] Snapshot installation failed. WAL intact.\n");
@@ -330,9 +330,15 @@ void raft_node_pump(raft_node_t* node) {
             }
         }
 
-        uint8_t* payload; uint32_t len;
-        if (raft_codec_serialize_msg(&ready.messages[i], &payload, &len) == 0) {
-            router_send_rpc(node->server, node->group_id, ready.messages[i].to, payload, len);
+        // INTEGRATE NEW CODEC
+        size_t enc_sz = raft_msg_encoded_size(&ready.messages[i]);
+        uint8_t* payload = malloc(enc_sz);
+        if (payload) {
+            if (raft_msg_encode(&ready.messages[i], payload, enc_sz)) {
+                router_send_rpc(node->server, node->group_id, ready.messages[i].to, payload, (uint32_t)enc_sz);
+            } else {
+                free(payload);
+            }
         }
 
         if (ready.messages[i].type == MSG_INSTALL_SNAPSHOT && ready.messages[i].snapshot_data) {
@@ -480,7 +486,6 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         uint32_t frame_size = sizeof(raft_net_header_t) + h->payload_len;
         if (peer->buffer_len - offset < frame_size) break;
 
-        // PREVENT SPOOFING: Terminate the connection if the peer lies about its identity mid-stream
         if (peer->remote_node_id != 0 && peer->remote_node_id != h->sender_id) {
             fprintf(stderr, "[WARN] Sender ID mismatch. Dropping connection.\n");
             remove_peer(peer->server, peer);
@@ -495,15 +500,16 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
             raft_node_t* target_node = peer->server->groups[h->group_id];
 
             raft_msg_t msg;
-            if (raft_codec_deserialize_msg(payload, h->payload_len, &msg) == 0) {
+            // INTEGRATE NEW CODEC
+            if (raft_msg_decode(payload, h->payload_len, &msg)) {
 
-                // OVERRIDE: The network layer determines identity, never the payload!
+                // SECURITY BOUNDARY: Overwrite stated identity with TLS/TCP verified sender identity.
                 msg.from = h->sender_id;
 
                 if (msg.to != target_node->server->physical_node_id) {
                     fprintf(stderr, "[WARN] Dropped frame not addressed to this node.\n");
                 } else {
-                    // Strict routing to the newly secured API
+                    // Strict routing to the protected remote API. Prevents injection of local ticks/proposals.
                     raft_step_remote(target_node->core, &msg);
 
                     if (raft_activity_accepted(target_node->core)) {
@@ -511,7 +517,7 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
                     }
                 }
 
-                raft_codec_free_msg_entries(&msg);
+                raft_msg_free_payloads(&msg);
                 raft_node_pump(target_node);
             } else {
                 fprintf(stderr, "[WARN] Dropped malformed Raft frame from peer.\n");
@@ -736,22 +742,18 @@ int raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_lea
     return RAFT_OK;
 }
 
-// PHASE 13: Decoupled Local Compaction API
 int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
-    // Use the mathematically safe compaction primitive to enforce durability contracts
     uint64_t term = raft_log_term(node->core, compact_index);
     raft_compact_after_snapshot(node->core, compact_index, term);
 
     if (raft_has_fatal_error(node->core)) return RAFT_APPLY_FATAL;
 
-    // Explicit hardstate binding to the new snapshot horizon
     if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, node->saved_applied, raft_snapshot_index(node->core), raft_snapshot_term(node->core))) {
         return -1;
     }
 
-    // Local historical garbage collection is now mathematically safe
     raft_wal_purge_head(&node->wal, compact_index);
     return RAFT_OK;
 }

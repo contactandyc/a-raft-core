@@ -3,192 +3,307 @@
 //
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
-#include "a-raft-library/raft_codec.h"
-#include <stdlib.h>
+#include "raft_internal.h"
 #include <string.h>
+#include <stdlib.h>
 
-int raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len) {
-    if (m->num_entries > RAFT_MAX_MSG_ENTRIES) return -1;
-    uint64_t len = 86;
+#ifndef RAFT_MAX_MSG_ENTRIES
+#define RAFT_MAX_MSG_ENTRIES 100000
+#endif
 
-    for (size_t i = 0; i < m->num_entries; i++) {
-        uint64_t entry_size = 8 + 8 + 1 + 8 + 8 + 4 + (uint64_t)m->entries[i].data_len;
-        if (len > RAFT_MAX_FRAME_SIZE - entry_size) return -1;
-        len += entry_size;
+// ============================================================================
+// PORTABLE, ALIGNMENT-SAFE PRIMITIVES
+// ============================================================================
+
+static void write_u8(uint8_t** p, uint8_t v) {
+    (*p)[0] = v;
+    *p += 1;
+}
+
+static void write_u32(uint8_t** p, uint32_t v) {
+    uint8_t* b = *p;
+    b[0] = (uint8_t)(v >> 24); b[1] = (uint8_t)(v >> 16);
+    b[2] = (uint8_t)(v >> 8);  b[3] = (uint8_t)(v);
+    *p += 4;
+}
+
+static void write_u64(uint8_t** p, uint64_t v) {
+    uint8_t* b = *p;
+    b[0] = (uint8_t)(v >> 56); b[1] = (uint8_t)(v >> 48);
+    b[2] = (uint8_t)(v >> 40); b[3] = (uint8_t)(v >> 32);
+    b[4] = (uint8_t)(v >> 24); b[5] = (uint8_t)(v >> 16);
+    b[6] = (uint8_t)(v >> 8);  b[7] = (uint8_t)(v);
+    *p += 8;
+}
+
+static bool read_u8(const uint8_t** p, size_t* rem, uint8_t* out) {
+    if (*rem < 1) return false;
+    *out = (*p)[0];
+    *p += 1; *rem -= 1;
+    return true;
+}
+
+static bool read_u32(const uint8_t** p, size_t* rem, uint32_t* out) {
+    if (*rem < 4) return false;
+    const uint8_t* b = *p;
+    *out = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
+    *p += 4; *rem -= 4;
+    return true;
+}
+
+static bool read_u64(const uint8_t** p, size_t* rem, uint64_t* out) {
+    if (*rem < 8) return false;
+    const uint8_t* b = *p;
+    *out = ((uint64_t)b[0] << 56) | ((uint64_t)b[1] << 48) |
+           ((uint64_t)b[2] << 40) | ((uint64_t)b[3] << 32) |
+           ((uint64_t)b[4] << 24) | ((uint64_t)b[5] << 16) |
+           ((uint64_t)b[6] << 8)  |  (uint64_t)b[7];
+    *p += 8; *rem -= 8;
+    return true;
+}
+
+static bool read_bytes(const uint8_t** p, size_t* rem, uint8_t** out_data, size_t len) {
+    if (len == 0) {
+        *out_data = NULL;
+        return true;
+    }
+    if (*rem < len) return false;
+
+    *out_data = malloc(len);
+    if (!*out_data) return false;
+
+    memcpy(*out_data, *p, len);
+    *p += len; *rem -= len;
+    return true;
+}
+
+// ============================================================================
+// PROTOCOL VALIDATION & SAFETY
+// ============================================================================
+
+static bool is_valid_msg_type(uint8_t t) {
+    return t <= MSG_READ_INDEX_RES;
+}
+
+static bool is_valid_entry_type(uint8_t t) {
+    return t == ENTRY_NORMAL ||
+           t == ENTRY_CONF_ADD ||
+           t == ENTRY_CONF_REMOVE ||
+           t == ENTRY_CONF_ADD_LEARNER ||
+           t == ENTRY_CONF_PROMOTE_LEARNER;
+}
+
+static bool add_size(size_t* total, size_t add) {
+    if (add > SIZE_MAX - *total) return false;
+    *total += add;
+    return true;
+}
+
+void raft_msg_free_payloads(raft_msg_t* msg) {
+    if (!msg) return;
+    if (msg->entries) {
+        for (size_t i = 0; i < msg->num_entries; i++) {
+            if (msg->entries[i].data) free(msg->entries[i].data);
+        }
+        free(msg->entries);
+    }
+    if (msg->snapshot_data) free(msg->snapshot_data);
+    if (msg->snapshot_peers) free(msg->snapshot_peers);
+    if (msg->snapshot_is_learner) free(msg->snapshot_is_learner);
+
+    memset(msg, 0, sizeof(raft_msg_t));
+}
+
+bool raft_msg_encoded_size_checked(const raft_msg_t* msg, size_t* out) {
+    size_t sz = 86; // Base fixed header size
+
+    if (!msg || !out) return false;
+    if (msg->num_entries > RAFT_MAX_MSG_ENTRIES) return false;
+    if (msg->snapshot_num_peers > MAX_PEERS) return false;
+    if (msg->num_entries > UINT32_MAX) return false;
+    if (msg->snapshot_len > UINT32_MAX) return false;
+    if (msg->snapshot_num_peers > UINT32_MAX) return false;
+
+    // Reject structurally invalid messages
+    if (msg->num_entries > 0 && !msg->entries) return false;
+    if (msg->snapshot_len > 0 && !msg->snapshot_data) return false;
+    if (msg->snapshot_num_peers > 0 && (!msg->snapshot_peers || !msg->snapshot_is_learner)) return false;
+
+    for (size_t i = 0; i < msg->num_entries; i++) {
+        if (msg->entries[i].data_len > UINT32_MAX) return false;
+        if (msg->entries[i].data_len > 0 && !msg->entries[i].data) return false;
+
+        if (!add_size(&sz, 37)) return false; // 37 bytes per entry header
+        if (!add_size(&sz, msg->entries[i].data_len)) return false;
     }
 
-    if (m->snapshot_len > 0) {
-        if (len > RAFT_MAX_FRAME_SIZE - m->snapshot_len) return -1;
-        len += m->snapshot_len;
-    }
+    if (!add_size(&sz, msg->snapshot_len)) return false;
 
-    // PHASE 17: Allocate space for Snapshot ConfState
-    uint32_t num_p = (uint32_t)m->snapshot_num_peers;
-    if (num_p > 64) return -1;
-    if (len > RAFT_MAX_FRAME_SIZE - (4 + (num_p * 9))) return -1;
-    len += 4 + (num_p * 9);
+    if (msg->snapshot_num_peers > SIZE_MAX / 9) return false;
+    if (!add_size(&sz, msg->snapshot_num_peers * 9)) return false; // 8 bytes ID + 1 byte bool
 
-    uint8_t* buf = malloc((size_t)len);
-    if (!buf) return -1;
+    if (sz > RAFT_MAX_FRAME_SIZE) return false;
 
-    uint32_t pos = 0;
-    buf[pos++] = m->type;
-    memcpy(buf+pos, &m->to, 8); pos += 8;
-    memcpy(buf+pos, &m->from, 8); pos += 8;
-    memcpy(buf+pos, &m->term, 8); pos += 8;
-    memcpy(buf+pos, &m->log_term, 8); pos += 8;
-    memcpy(buf+pos, &m->index, 8); pos += 8;
-    memcpy(buf+pos, &m->commit, 8); pos += 8;
-    memcpy(buf+pos, &m->conflict_term, 8); pos += 8;
-    memcpy(buf+pos, &m->conflict_index, 8); pos += 8;
-    memcpy(buf+pos, &m->read_seq, 8); pos += 8;
+    *out = sz;
+    return true;
+}
 
-    buf[pos++] = m->reject ? 1 : 0;
+size_t raft_msg_encoded_size(const raft_msg_t* msg) {
+    size_t out = 0;
+    raft_msg_encoded_size_checked(msg, &out);
+    return out;
+}
 
-    uint64_t num_e = m->num_entries;
-    memcpy(buf+pos, &num_e, 8); pos += 8;
+// ============================================================================
+// PUBLIC CODEC API
+// ============================================================================
 
-    for (size_t i = 0; i < num_e; i++) {
-        memcpy(buf+pos, &m->entries[i].term, 8); pos += 8;
-        memcpy(buf+pos, &m->entries[i].index, 8); pos += 8;
-        buf[pos++] = m->entries[i].type;
-        memcpy(buf+pos, &m->entries[i].client_id, 8); pos += 8;
-        memcpy(buf+pos, &m->entries[i].client_seq, 8); pos += 8;
+bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap) {
+    size_t expected_size;
+    if (!raft_msg_encoded_size_checked(msg, &expected_size)) return false;
+    if (expected_size > cap) return false;
 
-        uint32_t dlen = m->entries[i].data_len;
-        memcpy(buf+pos, &dlen, 4); pos += 4;
-        if (dlen > 0 && m->entries[i].data != NULL) {
-            memcpy(buf+pos, m->entries[i].data, dlen); pos += dlen;
+    uint8_t* p = buf;
+
+    write_u8(&p, (uint8_t)msg->type);
+    write_u64(&p, msg->to);
+    write_u64(&p, msg->from);
+    write_u64(&p, msg->term);
+    write_u64(&p, msg->log_term);
+    write_u64(&p, msg->index);
+    write_u64(&p, msg->commit);
+    write_u64(&p, msg->conflict_term);
+    write_u64(&p, msg->conflict_index);
+    write_u64(&p, msg->read_seq);
+    write_u8(&p, msg->reject ? 1 : 0);
+
+    write_u32(&p, (uint32_t)msg->num_entries);
+    write_u32(&p, (uint32_t)msg->snapshot_len);
+    write_u32(&p, (uint32_t)msg->snapshot_num_peers);
+
+    for (size_t i = 0; i < msg->num_entries; i++) {
+        write_u64(&p, msg->entries[i].term);
+        write_u64(&p, msg->entries[i].index);
+        write_u8(&p, (uint8_t)msg->entries[i].type);
+        write_u64(&p, msg->entries[i].client_id);
+        write_u64(&p, msg->entries[i].client_seq);
+        write_u32(&p, (uint32_t)msg->entries[i].data_len);
+
+        if (msg->entries[i].data_len > 0) {
+            memcpy(p, msg->entries[i].data, msg->entries[i].data_len);
+            p += msg->entries[i].data_len;
         }
     }
 
-    uint32_t snap_len = (uint32_t)m->snapshot_len;
-    memcpy(buf+pos, &snap_len, 4); pos += 4;
-    if (snap_len > 0 && m->snapshot_data != NULL) {
-        memcpy(buf+pos, m->snapshot_data, snap_len); pos += snap_len;
+    if (msg->snapshot_len > 0) {
+        memcpy(p, msg->snapshot_data, msg->snapshot_len);
+        p += msg->snapshot_len;
     }
 
-    // PHASE 17: Write Snapshot ConfState
-    memcpy(buf+pos, &num_p, 4); pos += 4;
-    for (size_t i = 0; i < num_p; i++) {
-        memcpy(buf+pos, &m->snapshot_peers[i], 8); pos += 8;
-        buf[pos++] = m->snapshot_is_learner[i] ? 1 : 0;
+    for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
+        write_u64(&p, msg->snapshot_peers[i]);
+        write_u8(&p, msg->snapshot_is_learner[i] ? 1 : 0);
     }
 
-    *out_buf = buf;
-    *out_len = (uint32_t)len;
-    return 0;
+    return true;
 }
 
-int raft_codec_deserialize_msg(const uint8_t* buf, uint32_t len, raft_msg_t* m) {
-    memset(m, 0, sizeof(raft_msg_t));
-    if (!buf || len < 86) return -1;
+bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg) {
+    if (!out_msg) return false;
+    memset(out_msg, 0, sizeof(raft_msg_t));
+    if (!buf || len > RAFT_MAX_FRAME_SIZE || len < 86) return false;
 
-    uint32_t pos = 0;
-    m->type = buf[pos++];
-    memcpy(&m->to, buf+pos, 8); pos += 8;
-    memcpy(&m->from, buf+pos, 8); pos += 8;
-    memcpy(&m->term, buf+pos, 8); pos += 8;
-    memcpy(&m->log_term, buf+pos, 8); pos += 8;
-    memcpy(&m->index, buf+pos, 8); pos += 8;
-    memcpy(&m->commit, buf+pos, 8); pos += 8;
-    memcpy(&m->conflict_term, buf+pos, 8); pos += 8;
-    memcpy(&m->conflict_index, buf+pos, 8); pos += 8;
-    memcpy(&m->read_seq, buf+pos, 8); pos += 8;
+    const uint8_t* p = buf;
+    size_t rem = len;
 
-    m->reject = buf[pos++] == 1;
+    uint8_t type_val, reject_val;
+    uint32_t num_entries, snap_len, num_peers;
 
-    uint64_t num_e;
-    memcpy(&num_e, buf+pos, 8); pos += 8;
+    if (!read_u8(&p, &rem, &type_val) ||
+        !read_u64(&p, &rem, &out_msg->to) ||
+        !read_u64(&p, &rem, &out_msg->from) ||
+        !read_u64(&p, &rem, &out_msg->term) ||
+        !read_u64(&p, &rem, &out_msg->log_term) ||
+        !read_u64(&p, &rem, &out_msg->index) ||
+        !read_u64(&p, &rem, &out_msg->commit) ||
+        !read_u64(&p, &rem, &out_msg->conflict_term) ||
+        !read_u64(&p, &rem, &out_msg->conflict_index) ||
+        !read_u64(&p, &rem, &out_msg->read_seq) ||
+        !read_u8(&p, &rem, &reject_val) ||
+        !read_u32(&p, &rem, &num_entries) ||
+        !read_u32(&p, &rem, &snap_len) ||
+        !read_u32(&p, &rem, &num_peers)) {
+        goto decode_fail;
+    }
 
-    if (num_e > RAFT_MAX_MSG_ENTRIES) return -1;
-    m->num_entries = num_e;
+    if (!is_valid_msg_type(type_val)) goto decode_fail;
+    if (reject_val > 1) goto decode_fail;
+    if (num_entries > RAFT_MAX_MSG_ENTRIES) goto decode_fail;
+    if (num_peers > MAX_PEERS) goto decode_fail;
 
-    if (num_e > 0) {
-        if (num_e * 37 > len - pos) return -1;
-        m->entries = calloc(num_e, sizeof(raft_entry_t));
-        if (!m->entries) return -1;
+    out_msg->type = (msg_type_t)type_val;
+    out_msg->reject = (reject_val != 0);
+    out_msg->num_entries = num_entries;
+    out_msg->snapshot_len = snap_len;
+    out_msg->snapshot_num_peers = num_peers;
 
-        for (size_t i = 0; i < num_e; i++) {
-            if (37 > len - pos) goto cleanup_error;
-            memcpy(&m->entries[i].term, buf+pos, 8); pos += 8;
-            memcpy(&m->entries[i].index, buf+pos, 8); pos += 8;
-            m->entries[i].type = buf[pos++];
-            memcpy(&m->entries[i].client_id, buf+pos, 8); pos += 8;
-            memcpy(&m->entries[i].client_seq, buf+pos, 8); pos += 8;
+    if (num_entries > 0) {
+        if (rem / 37 < num_entries) goto decode_fail;
 
+        out_msg->entries = calloc(num_entries, sizeof(raft_entry_t));
+        if (!out_msg->entries) goto decode_fail;
+
+        for (size_t i = 0; i < num_entries; i++) {
+            uint8_t etype;
             uint32_t dlen;
-            memcpy(&dlen, buf+pos, 4); pos += 4;
-            m->entries[i].data_len = dlen;
+            if (!read_u64(&p, &rem, &out_msg->entries[i].term) ||
+                !read_u64(&p, &rem, &out_msg->entries[i].index) ||
+                !read_u8(&p, &rem, &etype) ||
+                !read_u64(&p, &rem, &out_msg->entries[i].client_id) ||
+                !read_u64(&p, &rem, &out_msg->entries[i].client_seq) ||
+                !read_u32(&p, &rem, &dlen)) {
+                goto decode_fail;
+            }
+            if (!is_valid_entry_type(etype)) goto decode_fail;
 
-            if (dlen > 0) {
-                if (dlen > len - pos) goto cleanup_error;
-                m->entries[i].data = malloc(dlen);
-                if (!m->entries[i].data) goto cleanup_error;
-                memcpy(m->entries[i].data, buf+pos, dlen); pos += dlen;
+            out_msg->entries[i].type = (entry_type_t)etype;
+            out_msg->entries[i].data_len = dlen;
+
+            if (!read_bytes(&p, &rem, &out_msg->entries[i].data, dlen)) {
+                goto decode_fail;
             }
         }
     }
 
-    if (4 <= len - pos) {
-        uint32_t slen;
-        memcpy(&slen, buf+pos, 4); pos += 4;
-        m->snapshot_len = slen;
-        if (slen > 0) {
-            if (slen > len - pos) goto cleanup_error;
-            m->snapshot_data = malloc(slen);
-            if (!m->snapshot_data) goto cleanup_error;
-            memcpy(m->snapshot_data, buf+pos, slen); pos += slen;
-        }
+    if (snap_len > 0) {
+        if (!read_bytes(&p, &rem, &out_msg->snapshot_data, snap_len)) goto decode_fail;
     }
 
-    // PHASE 17: Read Snapshot ConfState
-    if (4 <= len - pos) {
-        uint32_t num_p;
-        memcpy(&num_p, buf+pos, 4); pos += 4;
-        if (num_p > 64) goto cleanup_error;
-        m->snapshot_num_peers = num_p;
-        if (num_p > 0) {
-            if (num_p * 9 > len - pos) goto cleanup_error;
-            m->snapshot_peers = calloc(num_p, sizeof(uint64_t));
-            m->snapshot_is_learner = calloc(num_p, sizeof(bool));
-            if (!m->snapshot_peers || !m->snapshot_is_learner) goto cleanup_error;
+    if (num_peers > 0) {
+        if (rem / 9 < num_peers) goto decode_fail;
 
-            for (size_t i = 0; i < num_p; i++) {
-                memcpy(&m->snapshot_peers[i], buf+pos, 8); pos += 8;
-                m->snapshot_is_learner[i] = (buf[pos++] == 1);
+        out_msg->snapshot_peers = calloc(num_peers, sizeof(uint64_t));
+        out_msg->snapshot_is_learner = calloc(num_peers, sizeof(bool));
+        if (!out_msg->snapshot_peers || !out_msg->snapshot_is_learner) goto decode_fail;
+
+        for (size_t i = 0; i < num_peers; i++) {
+            uint8_t lrn;
+            if (!read_u64(&p, &rem, &out_msg->snapshot_peers[i]) ||
+                !read_u8(&p, &rem, &lrn)) {
+                goto decode_fail;
             }
+            if (lrn > 1) goto decode_fail;
+            out_msg->snapshot_is_learner[i] = (lrn != 0);
         }
     }
 
-    return 0;
+    // STRICT TAIL VALIDATION: Reject any packet with unparsed trailing bytes
+    if (rem != 0) goto decode_fail;
 
-cleanup_error:
-    raft_codec_free_msg_entries(m);
-    return -1;
-}
+    return true;
 
-void raft_codec_free_msg_entries(raft_msg_t* m) {
-    if (m->num_entries > 0 && m->entries) {
-        for (size_t i = 0; i < m->num_entries; i++) {
-            if (m->entries[i].data) free(m->entries[i].data);
-        }
-        free(m->entries);
-        m->entries = NULL;
-        m->num_entries = 0;
-    }
-    if (m->snapshot_data) {
-        free(m->snapshot_data);
-        m->snapshot_data = NULL;
-        m->snapshot_len = 0;
-    }
-    if (m->snapshot_peers) {
-        free(m->snapshot_peers);
-        m->snapshot_peers = NULL;
-    }
-    if (m->snapshot_is_learner) {
-        free(m->snapshot_is_learner);
-        m->snapshot_is_learner = NULL;
-    }
-    m->snapshot_num_peers = 0;
+decode_fail:
+    raft_msg_free_payloads(out_msg);
+    return false;
 }

@@ -136,4 +136,11 @@ uint64_t     raft_snapshot_term(raft_t* r);
 uint64_t     raft_uncommitted_bytes(raft_t* r);
 bool         raft_has_fatal_error(raft_t* r);
 
+// Safe Serialization API
+size_t raft_msg_encoded_size(const raft_msg_t* msg);
+bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap);
+bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg);
+void raft_msg_free_payloads(raft_msg_t* msg); // Cleans up after a decode
+bool raft_msg_encoded_size_checked(const raft_msg_t* msg, size_t* out);
+
 #endif // RAFT_H
