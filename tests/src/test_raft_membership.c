@@ -241,6 +241,259 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
     raft_destroy(r);
 }
 
+// ----------------------------------------------------------------------------
+// NEW MEMBERSHIP DEFENSE TESTS
+// ----------------------------------------------------------------------------
+
+MACRO_TEST(raft_add_learner_existing_voter_does_not_demote) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_add_learner(r, 2); // 2 is already a voter
+
+    uint64_t act_peers[16]; bool is_learner[16];
+    raft_peers_ext(r, act_peers, is_learner, 16);
+
+    // Node 2 should still be a voter (index 0 in peers array)
+    MACRO_ASSERT_FALSE(is_learner[0]);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_add_learner_self_voter_does_not_demote) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_add_learner(r, 1); // 1 is already a voter (self)
+
+    MACRO_ASSERT_FALSE(r->is_learner_self);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_add_learner_zero_node_id_rejected_or_fatal) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    uint64_t zero_node = 0;
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&zero_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    // The membership applier should refuse to add node 0 and trip fatal_error
+    MACRO_ASSERT_TRUE(raft_has_fatal_error(r));
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_malformed_config_payload_sets_fatal_error) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // Payload is only 3 bytes, not a full uint64_t
+    uint8_t bad_data[] = {1, 2, 3};
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_REMOVE, .data = bad_data, .data_len = 3 };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    // Applier must fail safely instead of reading uninitialized memory
+    MACRO_ASSERT_TRUE(raft_has_fatal_error(r));
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_promote_missing_learner_is_noop) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_promote_learner(r, 99); // 99 doesn't exist
+
+    uint64_t act_peers[16]; bool is_learner[16];
+    size_t num = raft_peers_ext(r, act_peers, is_learner, 16);
+
+    MACRO_ASSERT_EQ_INT(num, 2); // Just 1 and 2
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_promote_existing_voter_is_noop) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_promote_learner(r, 2); // 2 is already a voter
+
+    uint64_t act_peers[16]; bool is_learner[16];
+    raft_peers_ext(r, act_peers, is_learner, 16);
+
+    MACRO_ASSERT_FALSE(is_learner[0]);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_promote_learner_resets_recent_active) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+    raft_add_learner(r, 3);
+
+    r->recent_active[1] = true; // Spoof learner activity
+
+    raft_promote_learner(r, 3);
+
+    // Upon promotion, recent_active should be reset so it proves itself as a voter
+    MACRO_ASSERT_FALSE(r->recent_active[1]);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_remove_peer_clears_trailing_slot_metadata) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // Artificially dirty the trailing slot (index 1)
+    r->next_index[1] = 99;
+    r->match_index[1] = 50;
+    r->recent_active[1] = true;
+
+    uint64_t rm_node = 2; // Remove index 0
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    // Index 1 should now be completely zeroed out
+    MACRO_ASSERT_EQ_INT(r->next_index[1], 0);
+    MACRO_ASSERT_EQ_INT(r->match_index[1], 0);
+    MACRO_ASSERT_FALSE(r->recent_active[1]);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_remove_peer_moves_voted_for_me_slot) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    r->voted_for_me[1] = true; // Node 3 voted for us
+
+    uint64_t rm_node = 2; // Remove Node 2 (index 0)
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    // Node 3 moved from index 1 to index 0. voted_for_me should follow it.
+    MACRO_ASSERT_TRUE(r->voted_for_me[0]);
+    MACRO_ASSERT_FALSE(r->voted_for_me[1]); // Trailing slot cleared
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_membership_change_clears_pending_read_index_state) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    r->state = RAFT_STATE_LEADER;
+    r->pending_reads[0].active = true;
+    r->pending_reads[0].acks = 1;
+
+    uint64_t new_node = 3;
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    // Changing membership alters quorum, any pending reads must be aborted
+    MACRO_ASSERT_FALSE(r->pending_reads[0].active);
+    MACRO_ASSERT_EQ_INT(r->pending_reads[0].acks, 0);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_remove_self_clears_leader_id) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // 1. Legally become the leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    MACRO_ASSERT_TRUE(raft_state(r) == RAFT_STATE_LEADER);
+    MACRO_ASSERT_EQ_INT(r->leader_id, 1);
+
+    // 2. Leader proposes its own removal
+    uint64_t rm_node = 1;
+    raft_entry_t e = { .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+    raft_step_local(r, &prop);
+
+    // 3. Peer acknowledges it, allowing the leader to commit it
+    raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack);
+    raft_advance_all_for_tests_only(r);
+
+    // 4. The leader processes its own removal, steps down, and clears identity
+    MACRO_ASSERT_EQ_INT(r->leader_id, 0);
+    MACRO_ASSERT_TRUE(raft_state(r) == RAFT_STATE_FOLLOWER);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_remove_self_sets_removed_and_learner_self) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    uint64_t rm_node = 1;
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    MACRO_ASSERT_TRUE(r->removed);
+    MACRO_ASSERT_TRUE(r->is_learner_self);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_add_self_after_removed_restores_as_learner_only) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // Remove self
+    uint64_t rm_node = 1;
+    raft_entry_t e1 = { .term = 1, .index = 1, .type = ENTRY_CONF_REMOVE, .data = (uint8_t*)&rm_node, .data_len = sizeof(uint64_t) };
+    raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e1, .num_entries = 1, .commit = 1 };
+    raft_step_remote(r, &app1);
+    raft_advance_all_for_tests_only(r);
+
+    MACRO_ASSERT_TRUE(r->removed);
+
+    // Add self back
+    uint64_t add_node = 1;
+    raft_entry_t e2 = { .term = 1, .index = 2, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&add_node, .data_len = sizeof(uint64_t) };
+    raft_msg_t app2 = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 1, .log_term = 1,
+                       .entries = &e2, .num_entries = 1, .commit = 2 };
+    raft_step_remote(r, &app2);
+    raft_advance_all_for_tests_only(r);
+
+    MACRO_ASSERT_FALSE(r->removed);
+    MACRO_ASSERT_TRUE(r->is_learner_self); // Must require explicit promotion to vote again
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -254,6 +507,22 @@ int main(void) {
     MACRO_ADD(tests, raft_learner_does_not_vote_or_count_in_quorum);
     MACRO_ADD(tests, raft_leader_stepdown_on_self_removal);
     MACRO_ADD(tests, raft_fault_learner_promotion_after_leader_crash);
+
+    // NEW EDGE CASE TESTS
+    MACRO_ADD(tests, raft_add_learner_existing_voter_does_not_demote);
+    MACRO_ADD(tests, raft_add_learner_self_voter_does_not_demote);
+    MACRO_ADD(tests, raft_add_learner_zero_node_id_rejected_or_fatal);
+    MACRO_ADD(tests, raft_malformed_config_payload_sets_fatal_error);
+    MACRO_ADD(tests, raft_promote_missing_learner_is_noop);
+    MACRO_ADD(tests, raft_promote_existing_voter_is_noop);
+    MACRO_ADD(tests, raft_promote_learner_resets_recent_active);
+    MACRO_ADD(tests, raft_remove_peer_clears_trailing_slot_metadata);
+    MACRO_ADD(tests, raft_remove_peer_moves_voted_for_me_slot);
+    MACRO_ADD(tests, raft_membership_change_clears_pending_read_index_state);
+    MACRO_ADD(tests, raft_remove_self_clears_leader_id);
+    MACRO_ADD(tests, raft_remove_self_sets_removed_and_learner_self);
+    MACRO_ADD(tests, raft_add_self_after_removed_restores_as_learner_only);
+
     macro_run_all("raft_membership", tests, test_count);
     return 0;
 }
