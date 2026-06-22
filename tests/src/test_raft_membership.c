@@ -220,7 +220,8 @@ MACRO_TEST(raft_fault_learner_promotion_after_leader_crash) {
     raft_t* r = raft_create(1, peers, 1);
 
     uint64_t node3 = 3;
-    raft_entry_t conf_add = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&node3, .data_len = sizeof(uint64_t) };
+    // FIX: Add term and index so it passes validation!
+    raft_entry_t conf_add = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&node3, .data_len = sizeof(uint64_t) };
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &conf_add, .num_entries = 1, .commit = 1 };
     raft_step_remote(r, &app);
     raft_advance_all_for_tests_only(r);

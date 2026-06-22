@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+// ============================================================================
+// CORE HELPERS & MATH
+// ============================================================================
+
 static int cmp_u64(const void* a, const void* b) {
     uint64_t ua = *(const uint64_t*)a;
     uint64_t ub = *(const uint64_t*)b;
@@ -15,10 +19,119 @@ static int cmp_u64(const void* a, const void* b) {
     return 0;
 }
 
+// Searches the active topology for a specific node ID.
+static bool get_peer_index(raft_t* r, uint64_t peer_id, size_t* out_idx) {
+    for (size_t i = 0; i < r->num_peers; i++) {
+        if (r->peers[i] == peer_id) {
+            *out_idx = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 void raft_replication_advance_commit(raft_t* r, uint64_t new_commit) {
     if (new_commit <= r->commit_index) return;
     r->commit_index = new_commit;
 }
+
+// Calculates the highest log index replicated to a strict majority of voting peers.
+static void update_commit_index(raft_t* r) {
+    uint64_t matches[MAX_PEERS + 1];
+    size_t voters = 0;
+
+    if (!r->is_learner_self) {
+        matches[voters++] = raft_log_last_index(r);
+    }
+
+    for (size_t j = 0; j < r->num_peers; j++) {
+        if (!r->is_learner[j]) {
+            matches[voters++] = r->match_index[j];
+        }
+    }
+
+    qsort(matches, voters, sizeof(uint64_t), cmp_u64);
+
+    if (voters > 0) {
+        size_t quorum = (voters / 2) + 1;
+        uint64_t candidate = matches[voters - quorum];
+
+        // Raft Safety: We can only commit entries from our CURRENT term
+        if (candidate > r->commit_index && raft_log_term(r, candidate) == r->current_term) {
+            raft_replication_advance_commit(r, candidate);
+        }
+    }
+}
+
+// Determines the optimal backtrack index when a follower rejects our append.
+static uint64_t find_conflict_backtrack_index(raft_t* r, uint64_t conflict_term, uint64_t conflict_index) {
+    if (conflict_term == 0) return conflict_index;
+
+    uint64_t idx = raft_log_last_index(r);
+    while (idx >= r->snapshot_index) {
+        if (raft_log_term(r, idx) == conflict_term) return idx + 1;
+        if (idx == r->snapshot_index || idx == 0) break;
+        idx--;
+    }
+    return conflict_index;
+}
+
+// Evaluates whether pending linearizable reads have achieved a quorum of heartbeat acks.
+static void process_read_index_acks(raft_t* r, size_t peer_idx, uint64_t read_seq) {
+    if (read_seq > r->peer_read_seq[peer_idx]) {
+        r->peer_read_seq[peer_idx] = read_seq;
+    }
+
+    for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
+        if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[peer_idx]) {
+            if (r->peer_read_seq[peer_idx] >= r->pending_reads[pr].read_seq) {
+
+                r->pending_reads[pr].acked_by[peer_idx] = true;
+                if (!r->is_learner[peer_idx]) {
+                    r->pending_reads[pr].acks++;
+                }
+
+                size_t voters = r->is_learner_self ? 0 : 1;
+                for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
+
+                if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
+                    if (r->pending_reads[pr].from == r->id) {
+
+                        size_t new_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
+                        if (r->num_read_states >= r->read_states_cap) {
+                            if (new_cap < r->read_states_cap || new_cap > SIZE_MAX / sizeof(raft_read_state_t)) {
+                                r->fatal_error = true;
+                                return;
+                            }
+                            raft_read_state_t* new_rs = realloc(r->read_states, new_cap * sizeof(raft_read_state_t));
+                            if (!new_rs) {
+                                r->fatal_error = true;
+                                return;
+                            }
+                            r->read_states = new_rs;
+                            r->read_states_cap = new_cap;
+                        }
+
+                        if (r->read_states) {
+                            r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
+                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
+                            r->num_read_states++;
+                        }
+                    } else {
+                        raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
+                                              .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
+                        raft_send_msg(r, rd_res);
+                    }
+                    r->pending_reads[pr].active = false;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// OUTBOUND MESSAGING
+// ============================================================================
 
 static void send_append(raft_t* r, size_t peer_idx) {
     uint64_t peer_id = r->peers[peer_idx];
@@ -29,10 +142,24 @@ static void send_append(raft_t* r, size_t peer_idx) {
         raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
                            .index = r->snapshot_index, .log_term = r->snapshot_term };
 
-        // PHASE 17: Atomically bundle the exact network topology along with the payload data
         msg.snapshot_peers = malloc(MAX_PEERS * sizeof(uint64_t));
         msg.snapshot_is_learner = malloc(MAX_PEERS * sizeof(bool));
-        msg.snapshot_num_peers = raft_peers_ext(r, msg.snapshot_peers, msg.snapshot_is_learner, MAX_PEERS);
+
+        if (!msg.snapshot_peers || !msg.snapshot_is_learner) {
+            free(msg.snapshot_peers);
+            free(msg.snapshot_is_learner);
+            r->fatal_error = true;
+            return;
+        }
+
+        size_t required = raft_peers_ext(r, msg.snapshot_peers, msg.snapshot_is_learner, MAX_PEERS);
+        if (required > MAX_PEERS) {
+            free(msg.snapshot_peers);
+            free(msg.snapshot_is_learner);
+            r->fatal_error = true;
+            return;
+        }
+        msg.snapshot_num_peers = required;
 
         raft_send_msg(r, msg);
         return;
@@ -50,8 +177,14 @@ static void send_append(raft_t* r, size_t peer_idx) {
     for (size_t i = 0; i < num_entries; i++) {
         raft_entry_t* src = raft_log_get(r, next + i);
         if (!src) break;
-        if (batch_bytes + src->data_len > 1048576) {
-            if (actual_entries == 0) actual_entries = 1;
+
+        // Defensive subtraction to prevent size manipulation or overflow
+        if (src->data_len > 1048576 - batch_bytes) {
+            if (actual_entries == 0) {
+                // If a single entry exceeds the frame limit, it can never replicate.
+                r->fatal_error = true;
+                return;
+            }
             break;
         }
         batch_bytes += src->data_len;
@@ -60,7 +193,13 @@ static void send_append(raft_t* r, size_t peer_idx) {
     num_entries = actual_entries;
 
     msg.num_entries = num_entries;
-    msg.entries = num_entries > 0 ? malloc(num_entries * sizeof(raft_entry_t)) : NULL;
+    if (num_entries > 0) {
+        msg.entries = calloc(num_entries, sizeof(raft_entry_t));
+        if (!msg.entries) {
+            r->fatal_error = true;
+            return;
+        }
+    }
 
     for (size_t i = 0; i < num_entries; i++) {
         raft_entry_t* src = raft_log_get(r, next + i);
@@ -70,8 +209,18 @@ static void send_append(raft_t* r, size_t peer_idx) {
         msg.entries[i].client_id = src->client_id;
         msg.entries[i].client_seq = src->client_seq;
         msg.entries[i].data_len = src->data_len;
-        msg.entries[i].data = src->data_len > 0 ? malloc(src->data_len) : NULL;
-        if (src->data_len > 0 && msg.entries[i].data) memcpy(msg.entries[i].data, src->data, src->data_len);
+        msg.entries[i].data = NULL;
+
+        if (src->data_len > 0) {
+            msg.entries[i].data = malloc(src->data_len);
+            if (!msg.entries[i].data) {
+                for (size_t j = 0; j < i; j++) free(msg.entries[j].data);
+                free(msg.entries);
+                r->fatal_error = true;
+                return;
+            }
+            memcpy(msg.entries[i].data, src->data, src->data_len);
+        }
     }
 
     r->next_index[peer_idx] = next + num_entries;
@@ -82,221 +231,206 @@ void raft_replication_bcast_append(raft_t* r) {
     for (size_t i = 0; i < r->num_peers; i++) send_append(r, i);
 }
 
-void raft_replication_step(raft_t* r, raft_msg_t* msg) {
-    if (msg->type == MSG_TICK) {
-        if (r->state == RAFT_STATE_LEADER) raft_replication_bcast_append(r);
+// ============================================================================
+// INBOUND HANDLERS
+// ============================================================================
+
+static void handle_tick(raft_t* r) {
+    if (r->state == RAFT_STATE_LEADER) {
+        raft_replication_bcast_append(r);
+    }
+}
+
+static void handle_propose(raft_t* r, raft_msg_t* msg) {
+    if (r->state != RAFT_STATE_LEADER || msg->num_entries == 0 || !msg->entries) return;
+
+    uint64_t old_last_idx = raft_log_last_index(r);
+    bool has_pending_config = false;
+
+    // Raft safety: Allow only one uncommitted configuration change at a time
+    for (uint64_t idx = r->commit_index + 1; idx <= old_last_idx; idx++) {
+        raft_entry_t* e = raft_log_get(r, idx);
+        if (e && e->type != ENTRY_NORMAL) {
+            has_pending_config = true;
+            break;
+        }
+    }
+
+    bool appended = false;
+    for (size_t i = 0; i < msg->num_entries; i++) {
+        if (msg->entries[i].type != ENTRY_NORMAL) {
+            if (has_pending_config) continue;
+            has_pending_config = true;
+        }
+        raft_log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
+        appended = true;
+    }
+
+    if (!appended) return;
+
+    if (r->num_peers == 0) {
+        raft_replication_advance_commit(r, raft_log_last_index(r));
         return;
     }
-    else if (msg->type == MSG_PROPOSE && r->state == RAFT_STATE_LEADER) {
-        if (msg->num_entries == 0 || msg->entries == NULL) return;
 
-        uint64_t old_last_idx = raft_log_last_index(r);
-        bool has_pending_config = false;
-
-        for (uint64_t idx = r->commit_index + 1; idx <= old_last_idx; idx++) {
-            raft_entry_t* e = raft_log_get(r, idx);
-            if (e && e->type != ENTRY_NORMAL) {
-                has_pending_config = true;
-                break;
-            }
-        }
-
-        bool appended = false;
-        for (size_t i = 0; i < msg->num_entries; i++) {
-            if (msg->entries[i].type != ENTRY_NORMAL) {
-                if (has_pending_config) continue;
-                has_pending_config = true;
-            }
-            raft_log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
-            appended = true;
-        }
-
-        if (!appended) return;
-
-        if (r->num_peers == 0) {
-            raft_replication_advance_commit(r, raft_log_last_index(r));
-            return;
-        }
-        for (size_t i = 0; i < r->num_peers; i++) {
-            if (r->next_index[i] == old_last_idx + 1) {
-                send_append(r, i);
-            }
+    // Broadcast proactively to peers that are fully caught up
+    for (size_t i = 0; i < r->num_peers; i++) {
+        if (r->next_index[i] == old_last_idx + 1) {
+            send_append(r, i);
         }
     }
-    else if (msg->type == MSG_APPEND_ENTRIES) {
-        if (msg->num_entries > 0 && msg->entries == NULL) {
-            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r) };
-            raft_send_msg(r, res);
-            return;
+}
+
+static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
+    // Malformed packet check
+    if (msg->num_entries > 0 && msg->entries == NULL) {
+        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r) };
+        raft_send_msg(r, res);
+        return;
+    }
+
+    // Acknowledge the leader
+    r->state = RAFT_STATE_FOLLOWER;
+    r->activity_accepted = true;
+    r->leader_id = msg->from;
+
+    raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r), .read_seq = 0 };
+    uint64_t my_last_idx = raft_log_last_index(r);
+
+    if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && raft_log_term(r, msg->index) == msg->log_term) {
+        // Log matches! The payload is safe to apply.
+        res.reject = false;
+
+        if (msg->num_entries > 0) {
+            for (size_t i = 0; i < msg->num_entries; i++) {
+                uint64_t new_idx = msg->index + 1 + i;
+
+                // Assert strict wire metadata validity
+                if ((msg->entries[i].index != 0 && msg->entries[i].index != new_idx) ||
+                    (msg->entries[i].term == 0 || msg->entries[i].term > msg->term) ||
+                    (msg->entries[i].data_len > 0 && !msg->entries[i].data)) {
+                    res.reject = true;
+                    break;
+                }
+
+                my_last_idx = raft_log_last_index(r);
+
+                if (new_idx <= my_last_idx && raft_log_term(r, new_idx) == msg->entries[i].term) continue;
+                if (new_idx <= r->commit_index) {
+                    res.reject = true; // Defense against catastrophic leader regressions
+                    break;
+                }
+
+                if (new_idx <= my_last_idx) raft_log_truncate(r, new_idx);
+
+                raft_log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
+            }
         }
 
-        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r), .read_seq = 0 };
+        if (!res.reject) {
+            res.index = msg->index + msg->num_entries;
+            if (msg->commit > r->commit_index) {
+                raft_replication_advance_commit(r, (msg->commit < res.index) ? msg->commit : res.index);
+            }
+            res.read_seq = msg->read_seq;
+        }
 
-        if (msg->term >= r->current_term) {
-            r->state = RAFT_STATE_FOLLOWER;
-            r->activity_accepted = true;
-            r->leader_id = msg->from;
+    } else if (msg->index < r->snapshot_index) {
+        // Conflict occurs deep in compacted history
+        res.reject = true;
+        res.index = r->snapshot_index;
+        res.conflict_term = 0;
+        res.conflict_index = r->snapshot_index + 1;
 
-            uint64_t my_last_idx = raft_log_last_index(r);
-
-            if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && raft_log_term(r, msg->index) == msg->log_term) {
-                res.reject = false;
-
-                if (msg->num_entries > 0) {
-                    for (size_t i = 0; i < msg->num_entries; i++) {
-                        uint64_t new_idx = msg->index + 1 + i;
-                        my_last_idx = raft_log_last_index(r);
-
-                        if (new_idx <= my_last_idx && raft_log_term(r, new_idx) == msg->entries[i].term) continue;
-                        if (new_idx <= r->commit_index) {
-                            res.reject = true;
-                            break;
-                        }
-                        if (new_idx <= my_last_idx) raft_log_truncate(r, new_idx);
-
-                        raft_log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len);
-                    }
-                }
-
-                if (!res.reject) {
-                    res.index = msg->index + msg->num_entries;
-                    if (msg->commit > r->commit_index) {
-                        raft_replication_advance_commit(r, (msg->commit < res.index) ? msg->commit : res.index);
-                    }
-                    res.read_seq = msg->read_seq;
-                }
-            } else if (msg->index < r->snapshot_index) {
-                res.reject = true;
-                res.index = r->snapshot_index;
-                res.conflict_term = 0;
-                res.conflict_index = r->snapshot_index + 1;
-            } else {
-                res.reject = true;
-                if (msg->index > my_last_idx) {
-                    res.conflict_index = my_last_idx + 1;
-                    res.conflict_term = 0;
-                } else {
-                    res.conflict_term = raft_log_term(r, msg->index);
-                    uint64_t first_idx = msg->index;
-                    while (first_idx >= r->snapshot_index) {
-                        if (raft_log_term(r, first_idx) == res.conflict_term) {
-                            while (first_idx > r->snapshot_index && raft_log_term(r, first_idx - 1) == res.conflict_term) {
-                                first_idx--;
-                            }
-                            break;
-                        }
-                        if (first_idx == r->snapshot_index || first_idx == 0) break;
+    } else {
+        // Generate backtracking hints to help the leader catch us up faster
+        res.reject = true;
+        if (msg->index > my_last_idx) {
+            res.conflict_index = my_last_idx + 1;
+            res.conflict_term = 0;
+        } else {
+            res.conflict_term = raft_log_term(r, msg->index);
+            uint64_t first_idx = msg->index;
+            while (first_idx >= r->snapshot_index) {
+                if (raft_log_term(r, first_idx) == res.conflict_term) {
+                    while (first_idx > r->snapshot_index && raft_log_term(r, first_idx - 1) == res.conflict_term) {
                         first_idx--;
                     }
-                    res.conflict_index = first_idx;
+                    break;
                 }
+                if (first_idx == r->snapshot_index || first_idx == 0) break;
+                first_idx--;
             }
+            res.conflict_index = first_idx;
         }
-        raft_send_msg(r, res);
     }
-    else if (msg->type == MSG_APPEND_RES && r->state == RAFT_STATE_LEADER) {
-        if (msg->term != r->current_term) return;
 
-        uint64_t my_last_idx = raft_log_last_index(r);
+    raft_send_msg(r, res);
+}
 
-        for (size_t i = 0; i < r->num_peers; i++) {
-            if (r->peers[i] == msg->from) {
+static void handle_append_response(raft_t* r, raft_msg_t* msg) {
+    if (r->state != RAFT_STATE_LEADER || msg->term != r->current_term) return;
 
-                if (!msg->reject) {
-                    if (msg->read_seq > r->peer_read_seq[i]) r->peer_read_seq[i] = msg->read_seq;
+    size_t peer_idx;
+    if (!get_peer_index(r, msg->from, &peer_idx)) return;
 
-                    for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-                        if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[i]) {
-                            if (r->peer_read_seq[i] >= r->pending_reads[pr].read_seq) {
-                                r->pending_reads[pr].acked_by[i] = true;
-                                if (!r->is_learner[i]) r->pending_reads[pr].acks++;
+    // Any valid current-term response proves the peer is active and responsive.
+    r->recent_active[peer_idx] = true;
 
-                                size_t voters = r->is_learner_self ? 0 : 1;
-                                for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
+    if (!msg->reject) {
+        uint64_t last = raft_log_last_index(r);
+        if (msg->index > last) return; // Prevent malicious/broken followers from spoofing completion
 
-                                if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
-                                    if (r->pending_reads[pr].from == r->id) {
-                                        if (r->num_read_states >= r->read_states_cap) {
-                                            r->read_states_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-                                            raft_read_state_t* new_rs = realloc(r->read_states, r->read_states_cap * sizeof(raft_read_state_t));
-                                            if (new_rs) r->read_states = new_rs;
-                                        }
-                                        if (r->read_states) {
-                                            r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
-                                            r->num_read_states++;
-                                        }
-                                    } else {
-                                        raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
-                                                              .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
-                                        raft_send_msg(r, rd_res);
-                                    }
-                                    r->pending_reads[pr].active = false;
-                                }
-                            }
-                        }
-                    }
-                }
+        process_read_index_acks(r, peer_idx, msg->read_seq);
 
-                if (!msg->reject && msg->index > my_last_idx) return;
-
-                if (msg->reject) {
-                    if (msg->conflict_term == 0) {
-                        r->next_index[i] = msg->conflict_index;
-                    } else {
-                        uint64_t last_idx = 0;
-                        bool found = false;
-
-                        uint64_t idx = my_last_idx;
-                        while (idx >= r->snapshot_index) {
-                            if (raft_log_term(r, idx) == msg->conflict_term) {
-                                last_idx = idx;
-                                found = true;
-                                break;
-                            }
-                            if (idx == r->snapshot_index || idx == 0) break;
-                            idx--;
-                        }
-
-                        if (found) {
-                            r->next_index[i] = last_idx + 1;
-                        } else {
-                            r->next_index[i] = msg->conflict_index;
-                        }
-                    }
-                    if (r->next_index[i] < 1) r->next_index[i] = 1;
-                    send_append(r, i);
-                } else {
-                    uint64_t safe_idx = msg->index < my_last_idx ? msg->index : my_last_idx;
-                    if (safe_idx >= r->match_index[i]) {
-                        r->match_index[i] = safe_idx;
-                        r->next_index[i] = safe_idx + 1;
-                    }
-
-                    uint64_t matches[MAX_PEERS + 1];
-                    size_t voters = 0;
-                    if (!r->is_learner_self) matches[voters++] = my_last_idx;
-                    for (size_t j = 0; j < r->num_peers; j++) {
-                        if (!r->is_learner[j]) matches[voters++] = r->match_index[j];
-                    }
-
-                    qsort(matches, voters, sizeof(uint64_t), cmp_u64);
-
-                    if (voters > 0) {
-                        size_t quorum = (voters / 2) + 1;
-                        uint64_t candidate = matches[voters - quorum];
-
-                        if (candidate > r->commit_index && raft_log_term(r, candidate) == r->current_term) {
-                            raft_replication_advance_commit(r, candidate);
-                        }
-                    }
-
-                    if (r->next_index[i] <= my_last_idx && r->state == RAFT_STATE_LEADER) {
-                        send_append(r, i);
-                    }
-                }
-                break;
-            }
+        uint64_t safe_idx = msg->index < last ? msg->index : last;
+        if (safe_idx >= r->match_index[peer_idx]) {
+            r->match_index[peer_idx] = safe_idx;
+            r->next_index[peer_idx] = safe_idx + 1;
         }
+
+        update_commit_index(r);
+
+        // Continue pipelining if the peer is still lagging
+        if (r->next_index[peer_idx] <= raft_log_last_index(r)) {
+            send_append(r, peer_idx);
+        }
+
+    } else {
+        // Replication rejected due to log inconsistency
+        if (msg->index > raft_log_last_index(r)) return; // Ignore stale rejections
+
+        uint64_t backtrack = find_conflict_backtrack_index(r, msg->conflict_term, msg->conflict_index);
+        uint64_t last = raft_log_last_index(r);
+
+        // Strict bounds clamping
+        if (backtrack < 1) backtrack = 1;
+        if (backtrack > last + 1) backtrack = last + 1;
+
+        r->next_index[peer_idx] = backtrack;
+        send_append(r, peer_idx);
+    }
+}
+
+// ============================================================================
+// PUBLIC ROUTER
+// ============================================================================
+
+void raft_replication_step(raft_t* r, raft_msg_t* msg) {
+    switch(msg->type) {
+        case MSG_TICK:
+            handle_tick(r);
+            break;
+        case MSG_PROPOSE:
+            handle_propose(r, msg);
+            break;
+        case MSG_APPEND_ENTRIES:
+            handle_append_entries(r, msg);
+            break;
+        case MSG_APPEND_RES:
+            handle_append_response(r, msg);
+            break;
+        default:
+            break;
     }
 }

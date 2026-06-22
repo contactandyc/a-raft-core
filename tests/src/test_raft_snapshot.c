@@ -3,6 +3,7 @@
 //
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
+#define RAFT_TESTING 1
 #include <stdio.h>
 #include <string.h>
 #include "raft_internal.h"
@@ -46,12 +47,12 @@ MACRO_TEST(snapshot_install_failure_leaves_state_intact) {
     uint64_t peers[] = {2, 3};
     raft_t* r = raft_create(1, peers, 2);
 
-    raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
+    // FIX: Provide valid term and index so strict validators don't instantly reject it
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
     raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
     raft_step_remote(r, &app);
-    MACRO_ASSERT_EQ_INT(raft_last_index(r), 1);
-
     raft_advance_all_for_tests_only(r);
+    MACRO_ASSERT_EQ_INT(raft_last_index(r), 1);
 
     uint8_t snap_data[] = "STATE";
     raft_msg_t snap = {

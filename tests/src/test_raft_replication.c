@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "raft_internal.h"
 #include "the-macro-library/macro_test.h"
 
@@ -752,7 +753,7 @@ MACRO_TEST(raft_leader_backoff_floor) {
     raft_step_remote(r, &vote);
     raft_advance_all_for_tests_only(r);
 
-    raft_msg_t rj = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 99, .conflict_index = 0 };
+    raft_msg_t rj = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = raft_last_index(r), .conflict_index = 0 };
     raft_step_remote(r, &rj);
     raft_step_remote(r, &rj);
     raft_step_remote(r, &rj);
@@ -939,14 +940,14 @@ MACRO_TEST(raft_follower_rejects_conflict_before_commit_index) {
     uint64_t peers[] = {2, 3};
     raft_t* r = raft_create(1, peers, 2);
 
-    raft_entry_t e1 = { .term = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"A", .data_len = 1 };
+    raft_entry_t e1 = { .term = 1, .index = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"A", .data_len = 1 };
     raft_msg_t app1 = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
                         .entries = &e1, .num_entries = 1, .commit = 1 };
     raft_step_remote(r, &app1);
     MACRO_ASSERT_EQ_INT(raft_commit_index(r), 1);
     raft_advance_all_for_tests_only(r);
 
-    raft_entry_t conflict = { .term = 2, .type = ENTRY_NORMAL, .data = (uint8_t*)"B", .data_len = 1 };
+    raft_entry_t conflict = { .term = 2, .index = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"B", .data_len = 1 };
     raft_msg_t app2 = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 3, .term = 2, .index = 0, .log_term = 0,
                         .entries = &conflict, .num_entries = 1, .commit = 0 };
     raft_step_remote(r, &app2);
@@ -1037,6 +1038,223 @@ MACRO_TEST(raft_leader_tick_sends_pending_entries_to_lagging_peer) {
     raft_destroy(r);
 }
 
+// ----------------------------------------------------------------------------
+// BOUNDARY DEFENSE TESTS
+// ----------------------------------------------------------------------------
+
+MACRO_TEST(raft_success_append_res_beyond_log_end_does_not_update_match_or_commit) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Leader has exactly 1 entry (the no-op).
+    // Peer attempts to trick leader into committing index 5
+    raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 5 };
+    raft_step_remote(r, &ack);
+
+    MACRO_ASSERT_EQ_INT(raft_commit_index(r), 0);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_success_append_res_beyond_log_end_does_not_satisfy_readindex) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Ack the noop so ReadIndex is allowed
+    raft_msg_t valid_ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 1 };
+    raft_step_remote(r, &valid_ack);
+
+    raft_msg_t ri = { .type = MSG_READ_INDEX, .read_seq = 123 };
+    raft_step_local(r, &ri);
+
+    // Malicious or broken peer tries to answer the read sequence but lies about the index it appended
+    raft_msg_t bad_ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 999, .read_seq = 123 };
+    raft_step_remote(r, &bad_ack);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_read_states, 0); // Read is ignored
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_valid_append_res_marks_recent_active) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Clear recent activity
+    raft_msg_t chk = { .type = MSG_CHECK_QUORUM };
+    raft_step_local(r, &chk);
+    MACRO_ASSERT_FALSE(r->recent_active[0]); // Node 2
+
+    raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 1 };
+    raft_step_remote(r, &ack);
+
+    MACRO_ASSERT_TRUE(r->recent_active[0]); // Successfully restored activity!
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_rejected_append_res_marks_recent_active) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Clear recent activity
+    raft_msg_t chk = { .type = MSG_CHECK_QUORUM };
+    raft_step_local(r, &chk);
+
+    // A rejection still proves the node is alive
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 1, .conflict_index = 0 };
+    raft_step_remote(r, &rej);
+
+    MACRO_ASSERT_TRUE(r->recent_active[0]);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_append_entries_rejects_entry_index_mismatch) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // The leader claims index=0, so the first payload should have index=1
+    // The malicious payload explicitly declares index=99
+    raft_entry_t e = { .term = 1, .index = 99, .data = (uint8_t*)"A", .data_len = 1 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1,
+                       .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject); // The engine rejects the mismatch safely
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_append_entries_rejects_entry_term_zero) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // Term 0 is reserved mathematically for baseline snapshots
+    raft_entry_t e = { .term = 0, .index = 1, .data = (uint8_t*)"A", .data_len = 1 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1,
+                       .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_append_entries_rejects_entry_term_greater_than_leader_term) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // The payload declares a term higher than the packet envelope
+    raft_entry_t e = { .term = 5, .index = 1, .data = (uint8_t*)"A", .data_len = 1 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1,
+                       .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_append_entries_rejects_data_len_with_null_data) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // Packet declares 100 bytes of data but supplies a NULL pointer
+    raft_entry_t e = { .term = 1, .index = 1, .data = NULL, .data_len = 100 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1,
+                       .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_reject_conflict_index_clamped_to_log_bounds) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Leader has exactly 1 entry. Follower rejects and demands we backtrack to index 99.
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 1, .conflict_index = 99 };
+    raft_step_remote(r, &rej);
+
+    // Engine must clamp backtrack target to LastLogIndex + 1 (which is 2)
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 1);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_oversized_single_entry_is_rejected_before_replication) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Propose an entry larger than the 1MB frame limit. Allocate dummy buffer
+    // to prove the engine intercepts it gracefully without buffer over-reads!
+    uint8_t* big_payload = malloc(2000000);
+    memset(big_payload, 'A', 2000000);
+
+    raft_entry_t e = { .data = big_payload, .data_len = 2000000 };
+    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+    raft_step_local(r, &prop);
+
+    // The engine should detect it can never be serialized, fail closed, and halt
+    MACRO_ASSERT_TRUE(raft_has_fatal_error(r));
+
+    free(big_payload);
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1081,6 +1299,18 @@ int main(void) {
     MACRO_ADD(tests, raft_leader_tick_sends_heartbeat_to_all_peers);
     MACRO_ADD(tests, raft_follower_tick_does_nothing);
     MACRO_ADD(tests, raft_leader_tick_sends_pending_entries_to_lagging_peer);
+
+    // BOUNDARY DEFENSE TESTS
+    MACRO_ADD(tests, raft_success_append_res_beyond_log_end_does_not_update_match_or_commit);
+    MACRO_ADD(tests, raft_success_append_res_beyond_log_end_does_not_satisfy_readindex);
+    MACRO_ADD(tests, raft_valid_append_res_marks_recent_active);
+    MACRO_ADD(tests, raft_rejected_append_res_marks_recent_active);
+    MACRO_ADD(tests, raft_append_entries_rejects_entry_index_mismatch);
+    MACRO_ADD(tests, raft_append_entries_rejects_entry_term_zero);
+    MACRO_ADD(tests, raft_append_entries_rejects_entry_term_greater_than_leader_term);
+    MACRO_ADD(tests, raft_append_entries_rejects_data_len_with_null_data);
+    MACRO_ADD(tests, raft_reject_conflict_index_clamped_to_log_bounds);
+    MACRO_ADD(tests, raft_oversized_single_entry_is_rejected_before_replication);
 
     macro_run_all("raft_replication", tests, test_count);
     return 0;
