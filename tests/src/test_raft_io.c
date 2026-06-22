@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include "a-raft-library/raft.h"
+#include "raft_internal.h"
 #include "a-raft-library/raft_io.h"
 #include "a-raft-library/raft_wal.h"
 #include "the-macro-library/macro_test.h"

@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "a-raft-library/raft.h"
+#include "raft_internal.h"
 #include "the-macro-library/macro_test.h"
 
 #define NUM_NODES 5

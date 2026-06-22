@@ -72,7 +72,6 @@ typedef struct {
     uint8_t* snapshot_data;
     size_t snapshot_len;
 
-    // PHASE 17: Embed Snapshot ConfState directly into the packet
     uint64_t* snapshot_peers;
     bool* snapshot_is_learner;
     size_t snapshot_num_peers;
@@ -111,15 +110,12 @@ raft_t* raft_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num
                      uint64_t snapshot_index, uint64_t snapshot_term,
                      raft_entry_t* entries, size_t num_entries);
 
-// The Split Execution API
 void    raft_step_local(raft_t* r, raft_msg_t* msg);
 void    raft_step_remote(raft_t* r, raft_msg_t* msg);
-
 raft_ready_t raft_get_ready(raft_t* r);
 
 void    raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index);
 
-// The Durable Compaction API
 void    raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term);
 void    raft_snapshot_acked(raft_t* r, bool success);
 
@@ -134,15 +130,10 @@ bool         raft_activity_accepted(raft_t* r);
 size_t       raft_peers(raft_t* r, uint64_t* out_peers);
 uint64_t     raft_leader_id(raft_t* r);
 
-void         raft_add_learner(raft_t* r, uint64_t peer_id);
-void         raft_promote_learner(raft_t* r, uint64_t peer_id);
-
 size_t       raft_peers_ext(raft_t* r, uint64_t* out_peers, bool* out_is_learners, size_t out_cap);
 uint64_t     raft_snapshot_index(raft_t* r);
 uint64_t     raft_snapshot_term(raft_t* r);
 uint64_t     raft_uncommitted_bytes(raft_t* r);
 bool         raft_has_fatal_error(raft_t* r);
-
-void raft_advance_all_for_tests_only(raft_t* r);
 
 #endif // RAFT_H

@@ -5,7 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "a-raft-library/raft.h"
+#include "raft_internal.h"
 #include "the-macro-library/macro_test.h"
 
 MACRO_TEST(raft_follower_rejects_log_gaps) {

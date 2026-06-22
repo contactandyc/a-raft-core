@@ -104,4 +104,13 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg);
 void raft_read_index_step(raft_t* r, raft_msg_t* msg);
 void raft_membership_apply_config(raft_t* r, uint64_t index);
 
+void raft_advance_all_for_tests_only(raft_t* r);
+
+void raft_read_index_step(raft_t* r, raft_msg_t* msg);
+void raft_membership_apply_config(raft_t* r, uint64_t index);
+
+// Safe Internal Topology Mutations
+void raft_add_learner(raft_t* r, uint64_t peer_id);
+void raft_promote_learner(raft_t* r, uint64_t peer_id);
+
 #endif // RAFT_INTERNAL_H
