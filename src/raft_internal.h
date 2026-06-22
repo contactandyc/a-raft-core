@@ -107,6 +107,7 @@ void raft_membership_apply_config(raft_t* r, uint64_t index);
 void raft_advance_all_for_tests_only(raft_t* r);
 
 void raft_read_index_step(raft_t* r, raft_msg_t* msg);
+void raft_read_index_ack(raft_t* r, size_t peer_idx, uint64_t read_seq);
 void raft_membership_apply_config(raft_t* r, uint64_t index);
 
 // Safe Internal Topology Mutations

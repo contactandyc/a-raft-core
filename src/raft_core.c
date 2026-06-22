@@ -244,6 +244,7 @@ static bool is_remote_message_sender_allowed(raft_t* r, raft_msg_t* msg) {
             return is_known_voting_member(r, msg->from);
 
         case MSG_APPEND_RES:
+        case MSG_READ_INDEX:
             return is_known_cluster_member(r, msg->from);
 
         default:
@@ -511,6 +512,7 @@ void raft_step_remote(raft_t* r, raft_msg_t* msg) {
         case MSG_INSTALL_SNAPSHOT:
             raft_snapshot_step(r, msg);
             break;
+        case MSG_READ_INDEX:
         case MSG_READ_INDEX_RES:
             raft_read_index_step(r, msg);
             break;

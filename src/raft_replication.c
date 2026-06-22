@@ -76,59 +76,6 @@ static uint64_t find_conflict_backtrack_index(raft_t* r, uint64_t conflict_term,
     return conflict_index;
 }
 
-// Evaluates whether pending linearizable reads have achieved a quorum of heartbeat acks.
-static void process_read_index_acks(raft_t* r, size_t peer_idx, uint64_t read_seq) {
-    if (read_seq > r->peer_read_seq[peer_idx]) {
-        r->peer_read_seq[peer_idx] = read_seq;
-    }
-
-    for (int pr = 0; pr < MAX_PENDING_READS; pr++) {
-        if (r->pending_reads[pr].active && !r->pending_reads[pr].acked_by[peer_idx]) {
-            if (r->peer_read_seq[peer_idx] >= r->pending_reads[pr].read_seq) {
-
-                r->pending_reads[pr].acked_by[peer_idx] = true;
-                if (!r->is_learner[peer_idx]) {
-                    r->pending_reads[pr].acks++;
-                }
-
-                size_t voters = r->is_learner_self ? 0 : 1;
-                for (size_t j = 0; j < r->num_peers; j++) if (!r->is_learner[j]) voters++;
-
-                if (r->pending_reads[pr].acks >= (voters / 2) + 1) {
-                    if (r->pending_reads[pr].from == r->id) {
-
-                        size_t new_cap = r->read_states_cap == 0 ? 16 : r->read_states_cap * 2;
-                        if (r->num_read_states >= r->read_states_cap) {
-                            if (new_cap < r->read_states_cap || new_cap > SIZE_MAX / sizeof(raft_read_state_t)) {
-                                r->fatal_error = true;
-                                return;
-                            }
-                            raft_read_state_t* new_rs = realloc(r->read_states, new_cap * sizeof(raft_read_state_t));
-                            if (!new_rs) {
-                                r->fatal_error = true;
-                                return;
-                            }
-                            r->read_states = new_rs;
-                            r->read_states_cap = new_cap;
-                        }
-
-                        if (r->read_states) {
-                            r->read_states[r->num_read_states].index = r->pending_reads[pr].index;
-                            r->read_states[r->num_read_states].read_seq = r->pending_reads[pr].client_ctx;
-                            r->num_read_states++;
-                        }
-                    } else {
-                        raft_msg_t rd_res = { .type = MSG_READ_INDEX_RES, .to = r->pending_reads[pr].from,
-                                              .read_seq = r->pending_reads[pr].client_ctx, .index = r->pending_reads[pr].index, .reject = false };
-                        raft_send_msg(r, rd_res);
-                    }
-                    r->pending_reads[pr].active = false;
-                }
-            }
-        }
-    }
-}
-
 // ============================================================================
 // OUTBOUND MESSAGING
 // ============================================================================
@@ -374,14 +321,13 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
     size_t peer_idx;
     if (!get_peer_index(r, msg->from, &peer_idx)) return;
 
-    // Any valid current-term response proves the peer is active and responsive.
     r->recent_active[peer_idx] = true;
 
     if (!msg->reject) {
         uint64_t last = raft_log_last_index(r);
-        if (msg->index > last) return; // Prevent malicious/broken followers from spoofing completion
+        if (msg->index > last) return;
 
-        process_read_index_acks(r, peer_idx, msg->read_seq);
+        raft_read_index_ack(r, peer_idx, msg->read_seq);
 
         uint64_t safe_idx = msg->index < last ? msg->index : last;
         if (safe_idx >= r->match_index[peer_idx]) {
