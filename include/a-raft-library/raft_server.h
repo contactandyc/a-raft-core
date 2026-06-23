@@ -32,7 +32,7 @@ typedef struct {
 
 typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
 typedef void (*raft_read_cb)(void* ctx, uint64_t read_seq);
-typedef int (*raft_snapshot_fn)(void* ctx, uint64_t index, uint64_t term, const uint8_t* data, size_t len);
+typedef int (*raft_snapshot_fn)(void* ctx, uint64_t index, uint64_t term, const char* file_path);
 
 typedef struct raft_node_s raft_node_t;
 typedef struct raft_server_s raft_server_t;

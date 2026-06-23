@@ -455,6 +455,64 @@ endif()
 
 add_test(NAME test_raft_membership COMMAND $<TARGET_FILE:test_raft_membership>)
 # ==============================================================================
+# test_raft_pump Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_pump
+  src/test_raft_pump.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_pump BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_pump)
+
+set_target_properties(test_raft_pump PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_pump PRIVATE libuv::uv)
+target_link_libraries(test_raft_pump PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_pump PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_pump PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_pump PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_pump PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_pump PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_pump PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_pump PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_pump PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_pump PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_pump COMMAND $<TARGET_FILE:test_raft_pump>)
+# ==============================================================================
 # test_raft_read_index Target (Standard Test)
 # ==============================================================================
 add_executable(test_raft_read_index

@@ -226,12 +226,64 @@ MACRO_TEST(snapshot_below_last_applied_is_ignored) {
     };
     raft_step_remote(r, &snap);
 
-    // The core MUST ignore it, but importantly, MUST NOT reject it (so the leader knows we have the data)
+    // The core MUST ignore the stale snapshot, but importantly, MUST NOT reject it.
+    // Furthermore, it should fast-forward the leader by responding with its actual last_applied (100)!
     raft_ready_t ready = raft_get_ready(r);
     MACRO_ASSERT_FALSE(ready.install_snapshot);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_FALSE(ready.messages[0].reject); // Acknowledge without applying!
-    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 80);
+    MACRO_ASSERT_TRUE(ready.messages[0].snapshot_done);
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 100); // FIX: Expect 100, not 80
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_topology) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // Become Leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Apply 10 dummy entries
+    for (int i=0; i<10; i++) {
+        raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
+        raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+        raft_step_local(r, &p);
+        raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2+i };
+        raft_step_remote(r, &ack);
+    }
+    raft_advance_all_for_tests_only(r);
+
+    // Take a snapshot at index 11 (Topology is {1, 2, 3})
+    raft_compact_after_snapshot(r, 11, 1);
+
+    // Add Node 4 to the LIVE topology
+    raft_add_learner(r, 4);
+    raft_promote_learner(r, 4);
+
+    // Force the leader to send a snapshot to a lagging follower (Node 3 is stuck at 0)
+    raft_msg_t req = { .type = MSG_APPEND_RES, .to = 1, .from = 3, .term = 1, .reject = true, .index = 0, .conflict_index = 0 };
+    raft_step_remote(r, &req);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_INSTALL_SNAPSHOT);
+
+    // ASSERTION: The message MUST contain the frozen topology {1, 2, 3}, NOT the live {1, 2, 3, 4}
+    MACRO_ASSERT_EQ_INT(ready.messages[0].snapshot_num_peers, 3);
+
+    bool found_4 = false;
+    for (size_t i = 0; i < ready.messages[0].snapshot_num_peers; i++) {
+        if (ready.messages[0].snapshot_peers[i] == 4) found_4 = true;
+    }
+    MACRO_ASSERT_FALSE(found_4);
 
     raft_destroy(r);
 }
@@ -246,6 +298,7 @@ int main(void) {
     MACRO_ADD(tests, snapshot_message_contains_confstate);
     MACRO_ADD(tests, lagging_follower_installs_snapshot_and_gets_updated_membership);
     MACRO_ADD(tests, snapshot_below_last_applied_is_ignored);
+    MACRO_ADD(tests, leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_topology);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;

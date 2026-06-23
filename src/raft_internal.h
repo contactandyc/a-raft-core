@@ -12,6 +12,9 @@
 #define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
 
+// BLOCKER 6: Unified Batch Limit for Public API and Internal Replication
+#define RAFT_MAX_PAYLOAD_SIZE (1048576)
+
 typedef struct {
     uint64_t read_seq;
     uint64_t client_ctx;
@@ -86,6 +89,15 @@ struct raft_s {
     bool pending_snapshot_is_learner[MAX_PEERS];
     size_t pending_snapshot_num_peers;
 
+    // BLOCKERS 2 & 3: Snapshot chunk tracking
+    uint64_t expected_snapshot_offset;
+    bool pending_snapshot_chunk_ready;
+
+    // BLOCKER 5: Topology cache for snapshot artifact binding
+    uint64_t snapshot_peers_cache[MAX_PEERS];
+    bool snapshot_learners_cache[MAX_PEERS];
+    size_t snapshot_peers_count;
+
     bool fatal_error;
 };
 
@@ -95,9 +107,9 @@ uint64_t raft_log_last_index(raft_t* r);
 uint64_t raft_log_term(raft_t* r, uint64_t index);
 raft_entry_t* raft_log_get(raft_t* r, uint64_t index);
 
-// Phase 1: Changed to transactional boolean return
 bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len);
 void raft_log_truncate(raft_t* r, uint64_t index);
+uint64_t raft_uncommitted_bytes(raft_t* r);
 
 void raft_election_step(raft_t* r, raft_msg_t* msg);
 void raft_election_become_leader(raft_t* r);

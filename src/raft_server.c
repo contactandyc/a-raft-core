@@ -44,13 +44,28 @@ static void attempt_reconnect(uv_timer_t* handle);
 static void remove_peer(raft_server_t* server, peer_connection_t* peer);
 static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t target_node_id, uint8_t* payload, uint32_t len);
 
-static void queue_inbound_msg(raft_node_t* node, raft_msg_t* msg) {
+static bool queue_inbound_msg(raft_node_t* node, raft_msg_t* msg) {
     if (node->inbound_queue_len >= node->inbound_queue_cap) {
+        // Prevent unbounded memory growth if the disk completely stalls
+        if (node->inbound_queue_cap > 10000) {
+            raft_msg_free_payloads(msg);
+            return false;
+        }
+
         size_t new_cap = node->inbound_queue_cap == 0 ? 16 : node->inbound_queue_cap * 2;
-        node->inbound_queue = realloc(node->inbound_queue, new_cap * sizeof(raft_msg_t));
+        raft_msg_t* new_q = realloc(node->inbound_queue, new_cap * sizeof(raft_msg_t));
+
+        if (!new_q) {
+            // Fail closed on OOM
+            node->fatal_error = true;
+            raft_msg_free_payloads(msg);
+            return false;
+        }
+        node->inbound_queue = new_q;
         node->inbound_queue_cap = new_cap;
     }
     node->inbound_queue[node->inbound_queue_len++] = *msg;
+    return true;
 }
 
 static void queue_local_msg(raft_node_t* node, msg_type_t type) {
@@ -313,7 +328,11 @@ static void pump_after_work(uv_work_t* req, int status) {
     // 1. Process Completed Snapshot
     if (ready->install_snapshot) {
         if (ready->snapshot_done && ctx->snap_success) {
-            if (node->snap_cb && node->snap_cb(node->snap_ctx, ready->snapshot_index, ready->snapshot_term, NULL, 0) != RAFT_SNAPSHOT_OK) {
+            char dat_snap[512];
+            snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+
+            // Pass the file path to the state machine
+            if (node->snap_cb && node->snap_cb(node->snap_ctx, ready->snapshot_index, ready->snapshot_term, dat_snap) != RAFT_SNAPSHOT_OK) {
                 ctx->snap_success = false;
             }
             if (ctx->snap_success) {
@@ -323,14 +342,26 @@ static void pump_after_work(uv_work_t* req, int status) {
                 node->saved_commit = ready->snapshot_index;
                 raft_wal_purge_head(&node->wal, ready->snapshot_index);
 
-                uint64_t new_tail = raft_last_index(node->core);
-                if (new_tail <= node->wal.max_disk_index) raft_wal_truncate_tail(&node->wal, new_tail + 1);
-
                 ctx->actual_applied_idx = ready->snapshot_index > ctx->actual_applied_idx ? ready->snapshot_index : ctx->actual_applied_idx;
                 highest_saved_index = ready->snapshot_index > highest_saved_index ? ready->snapshot_index : highest_saved_index;
             }
         }
+
+        // Update the core FIRST so it discards any conflicting memory suffix
         raft_snapshot_acked(node->core, ctx->snap_success);
+
+        // FIX: Truncate the WAL using the NEW tail calculated after the core has discarded the suffix!
+        if (ctx->snap_success && ready->snapshot_done) {
+            uint64_t new_tail = raft_last_index(node->core);
+            if (new_tail <= node->wal.max_disk_index) {
+                raft_wal_truncate_tail(&node->wal, new_tail + 1);
+            }
+        }
+
+        // FORCE synchronous hardstate save BEFORE generating the network ACK
+        if (ctx->snap_success) {
+            save_hardstate(node, raft_term(node->core), raft_voted_for(node->core), raft_commit_index(node->core), ctx->actual_applied_idx, node->saved_snap_idx, node->saved_snap_term);
+        }
 
         // Refresh 'ready' state to capture snapshot ACKs immediately
         pump_cleanup_ready(ready);
@@ -880,11 +911,28 @@ int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, u
         return RAFT_ERR_NOT_LEADER;
     }
 
-    if (len > (RAFT_MAX_FRAME_SIZE - 200)) return RAFT_ERR_QUEUE_FULL;
+    if (len > RAFT_MAX_PAYLOAD_SIZE) return RAFT_ERR_QUEUE_FULL;
     if (raft_last_index(node->core) - raft_commit_index(node->core) > 2000) return RAFT_ERR_QUEUE_FULL;
     if (raft_uncommitted_bytes(node->core) > 10 * 1024 * 1024) return RAFT_ERR_QUEUE_FULL;
 
-    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = malloc(sizeof(raft_entry_t)), .num_entries = 1 };
+    // <--- REPLACE THE OLD ARRAY INITIALIZATION WITH THIS SAFE ALLOCATION:
+    if (len > 0 && !payload) return -1; // RAFT_ERR_INVALID
+
+    raft_entry_t* e_arr = malloc(sizeof(raft_entry_t));
+    if (!e_arr) return -1; // RAFT_ERR_NOMEM
+
+    e_arr[0] = (raft_entry_t){ .type = ENTRY_NORMAL, .client_id = client_id, .client_seq = client_seq, .data = NULL, .data_len = len };
+
+    if (len > 0) {
+        e_arr[0].data = malloc(len);
+        if (!e_arr[0].data) {
+            free(e_arr);
+            return -1; // RAFT_ERR_NOMEM
+        }
+        memcpy(e_arr[0].data, payload, len);
+    }
+
+    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = e_arr, .num_entries = 1 };
     prop.entries[0] = (raft_entry_t){ .type = ENTRY_NORMAL, .client_id = client_id, .client_seq = client_seq, .data = NULL, .data_len = len };
     if (len > 0) {
         prop.entries[0].data = malloc(len);
@@ -948,14 +996,27 @@ static int propose_config(raft_node_t* node, entry_type_t type, uint64_t target_
     if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_ERR_NOT_LEADER;
     if (raft_state(node->core) != RAFT_STATE_LEADER) return RAFT_ERR_NOT_LEADER;
 
-    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = calloc(1, sizeof(raft_entry_t)), .num_entries = 1 };
-    prop.entries[0].type = type;
-    prop.entries[0].data_len = sizeof(uint64_t);
-    prop.entries[0].data = malloc(sizeof(uint64_t));
-    memcpy(prop.entries[0].data, &target_node_id, sizeof(uint64_t));
+    // Blocker 8: Safe memory allocation for configuration proposals
+    raft_entry_t* e_arr = calloc(1, sizeof(raft_entry_t));
+    if (!e_arr) return RAFT_APPLY_FATAL; // Check primary array allocation
+
+    e_arr[0].type = type;
+    e_arr[0].data_len = sizeof(uint64_t);
+    e_arr[0].data = malloc(sizeof(uint64_t));
+
+    if (!e_arr[0].data) {
+        free(e_arr);
+        return RAFT_APPLY_FATAL; // Fail closed if payload allocation fails
+    }
+    memcpy(e_arr[0].data, &target_node_id, sizeof(uint64_t));
+
+    raft_msg_t prop = { .type = MSG_PROPOSE, .entries = e_arr, .num_entries = 1 };
 
     if (node->is_flushing) {
-        queue_inbound_msg(node, &prop);
+        if (!queue_inbound_msg(node, &prop)) {
+            // Queue failed (OOM or overflow limits hit), payloads were automatically freed
+            return RAFT_APPLY_FATAL;
+        }
     } else {
         raft_step_local(node->core, &prop);
         raft_msg_free_payloads(&prop);

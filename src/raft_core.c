@@ -99,18 +99,17 @@ static size_t calculate_total_topology_size(raft_t* r) {
 }
 
 static bool load_restored_log_entries(raft_t* r, raft_entry_t* entries, size_t num_entries) {
+    if (!entries || num_entries == 0) return true;
     for (size_t i = 0; i < num_entries; i++) {
-        if (entries[i].index <= r->snapshot_index) continue;
+        // FIX: Safely skip discarded suffix entries from the WAL
+        if (entries[i].index <= r->snapshot_index) {
+            continue;
+        }
 
-        raft_entry_t* e = &r->log[r->log_len++];
-        *e = entries[i];
-        e->data = NULL;
+        if (entries[i].index != raft_log_last_index(r) + 1) return false;
 
-        if (entries[i].data_len > 0) {
-            if (!entries[i].data) return false;
-            e->data = malloc(entries[i].data_len);
-            if (!e->data) return false;
-            memcpy(e->data, entries[i].data, entries[i].data_len);
+        if (!raft_log_append(r, entries[i].term, entries[i].type, entries[i].client_id, entries[i].client_seq, entries[i].data, entries[i].data_len)) {
+            return false;
         }
     }
     return true;
@@ -407,6 +406,14 @@ raft_t* raft_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num
     r->commit_index = commit_index;
     r->last_applied = applied_index;
 
+    r->snapshot_peers_count = raft_peers_ext(r, r->snapshot_peers_cache, r->snapshot_learners_cache, MAX_PEERS);
+
+    r->uncommitted_bytes = 0;
+    for (uint64_t i = r->commit_index + 1; i <= raft_log_last_index(r); i++) {
+        raft_entry_t* e = raft_log_get(r, i);
+        if (e) r->uncommitted_bytes += e->data_len;
+    }
+
     return r;
 }
 
@@ -512,7 +519,7 @@ raft_ready_t raft_get_ready(raft_t* r) {
     ready.read_states = r->read_states;
     ready.num_read_states = r->num_read_states;
 
-    ready.install_snapshot = r->pending_snapshot;
+    ready.install_snapshot = r->pending_snapshot_chunk_ready;
     ready.snapshot_index = r->pending_snapshot_msg_index;
     ready.snapshot_term = r->pending_snapshot_msg_term;
     ready.snapshot_data = r->pending_snapshot_data;
@@ -572,6 +579,8 @@ void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t com
         r->fatal_error = true;
         return;
     }
+
+    r->snapshot_peers_count = raft_peers_ext(r, r->snapshot_peers_cache, r->snapshot_learners_cache, MAX_PEERS);
 
     uint64_t offset = compact_index - r->snapshot_index;
     if (offset >= r->log_len) {

@@ -14,17 +14,21 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
             r->activity_accepted = true;
             r->leader_id = msg->from;
 
-            // Phase 4 Fix: Ignore stale snapshots that would roll the state machine backward,
-            // but ACK them (reject = false) so the leader knows we already have the data.
+            // Blocker 4: Release the leader from stale snapshots
             if (msg->index <= r->last_applied) {
-                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
+                uint64_t clamp_idx = msg->index > r->last_applied ? msg->index : r->last_applied;
+                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = clamp_idx, .snapshot_done = true };
                 raft_send_msg(r, res);
                 return;
             }
 
             if (msg->index > r->snapshot_index) {
+                // Blocker 3: Validate chunk offset
                 if (msg->snapshot_offset == 0) {
+                    r->expected_snapshot_offset = 0;
                     r->pending_snapshot = true;
+
+                    // FIX: Restore the actual metadata assignments!
                     r->pending_snapshot_from = msg->from;
                     r->pending_snapshot_msg_index = msg->index;
                     r->pending_snapshot_msg_term = msg->log_term;
@@ -33,6 +37,11 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                         r->pending_snapshot_peers[i] = msg->snapshot_peers[i];
                         r->pending_snapshot_is_learner[i] = msg->snapshot_is_learner[i];
                     }
+                } else if (!r->pending_snapshot || msg->snapshot_offset != r->expected_snapshot_offset) {
+                    // Reject out-of-order chunk and hint expected offset
+                    raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = r->expected_snapshot_offset };
+                    raft_send_msg(r, res);
+                    return;
                 }
 
                 if (r->pending_snapshot_data) free(r->pending_snapshot_data);
@@ -40,9 +49,14 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                 if (msg->snapshot_len > 0 && r->pending_snapshot_data) {
                     memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
                 }
+
+                r->expected_snapshot_offset += msg->snapshot_len; // Advance expected offset
                 r->pending_snapshot_len = msg->snapshot_len;
                 r->pending_snapshot_offset = msg->snapshot_offset;
                 r->pending_snapshot_done = msg->snapshot_done;
+
+                // Blocker 2: Flag chunk as ready for consumption
+                r->pending_snapshot_chunk_ready = true;
 
             } else {
                 raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
@@ -57,6 +71,9 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
 
 void raft_snapshot_acked(raft_t* r, bool success) {
     if (!r->pending_snapshot) return;
+
+    // Blocker 2: Mark chunk consumed so we don't re-process it!
+    r->pending_snapshot_chunk_ready = false;
 
     raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
                        .reject = !success,
@@ -85,7 +102,7 @@ void raft_snapshot_acked(raft_t* r, bool success) {
                 if (r->log[i].data) free(r->log[i].data);
             }
             r->log_len = 1;
-            r->uncommitted_bytes = 0; // Phase 2: Reset tracking since everything is now committed
+            r->uncommitted_bytes = 0;
         }
 
         r->snapshot_index = r->pending_snapshot_msg_index;

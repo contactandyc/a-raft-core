@@ -111,14 +111,11 @@ static void send_append(raft_t* r, size_t peer_idx) {
             return;
         }
 
-        size_t required = raft_peers_ext(r, msg.snapshot_peers, msg.snapshot_is_learner, MAX_PEERS);
-        if (required > MAX_PEERS) {
-            free(msg.snapshot_peers);
-            free(msg.snapshot_is_learner);
-            r->fatal_error = true;
-            return;
+        msg.snapshot_num_peers = r->snapshot_peers_count;
+        for (size_t i = 0; i < r->snapshot_peers_count; i++) {
+            msg.snapshot_peers[i] = r->snapshot_peers_cache[i];
+            msg.snapshot_is_learner[i] = r->snapshot_learners_cache[i];
         }
-        msg.snapshot_num_peers = required;
 
         raft_send_msg(r, msg);
         return;
@@ -137,9 +134,9 @@ static void send_append(raft_t* r, size_t peer_idx) {
         raft_entry_t* src = raft_log_get(r, next + i);
         if (!src) break;
 
-        if (src->data_len > 1048576 - batch_bytes) {
+        // FIX 1: Use the macro and drop gracefully instead of triggering a fatal error
+        if (src->data_len > RAFT_MAX_PAYLOAD_SIZE - batch_bytes) {
             if (actual_entries == 0) {
-                r->fatal_error = true;
                 return;
             }
             break;
@@ -215,14 +212,18 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
 
     bool appended = false;
     for (size_t i = 0; i < msg->num_entries; i++) {
+
+        // FIX 2: Gracefully drop oversized proposals at the core level!
+        if (msg->entries[i].data_len > RAFT_MAX_PAYLOAD_SIZE) {
+            return;
+        }
+
         if (msg->entries[i].type != ENTRY_NORMAL) {
 
             // Safety: Only one uncommitted/unapplied configuration change at a time
             if (has_pending_config) continue;
 
             // Phase 3: Secure Learner Promotion Guard
-            // Intercept proposals to promote a learner. If they are lagging behind the commit index,
-            // drop the proposal entirely. This prevents instantly killing cluster availability.
             if (msg->entries[i].type == ENTRY_CONF_PROMOTE_LEARNER && msg->entries[i].data_len == sizeof(uint64_t)) {
                 uint64_t target_node;
                 memcpy(&target_node, msg->entries[i].data, sizeof(uint64_t));
