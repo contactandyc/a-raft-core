@@ -16,7 +16,7 @@
 #define NUM_NODES 5
 #define MAX_INFLIGHT 20000
 #define MAX_TICKS 10000
-#define MAX_LOG_SIZE 10000 // Safely absorb intense chaos bursts
+#define MAX_LOG_SIZE 10000
 
 typedef struct {
     raft_msg_t msg;
@@ -36,13 +36,18 @@ typedef struct {
     bool is_up;
     char wal_path[128];
 
-    // Mocked meta_grp.dat fields
     uint64_t saved_term;
     uint64_t saved_vote;
     uint64_t saved_commit;
     uint64_t saved_applied;
     uint64_t saved_snap_idx;
     uint64_t saved_snap_term;
+
+    // ReadIndex Tracker
+    raft_read_state_t pending_reads[128];
+    size_t num_pending_reads;
+    uint64_t successful_reads;
+    uint64_t max_read_index;
 
     applied_entry_t state_machine[MAX_LOG_SIZE];
     uint64_t highest_applied;
@@ -90,7 +95,6 @@ static void crash_node(chaos_harness_t* h, int idx) {
     chaos_node_t* n = &h->nodes[idx];
     if (!n->is_up) return;
 
-    // Emulate atomic metadata sync exactly as it would occur on a real disk
     n->saved_term = raft_term(n->core);
     n->saved_vote = raft_voted_for(n->core);
     n->saved_commit = raft_commit_index(n->core);
@@ -102,6 +106,7 @@ static void crash_node(chaos_harness_t* h, int idx) {
     raft_destroy(n->core);
     n->core = NULL;
     n->is_up = false;
+    n->num_pending_reads = 0; // Wipes pending reads in memory on crash
 }
 
 // ----------------------------------------------------------------------------
@@ -116,6 +121,14 @@ static void pump_node(chaos_harness_t* h, int idx) {
     uint64_t actual_saved_idx = raft_last_index(n->core) - ready.num_entries_to_save;
     uint64_t actual_applied_idx = n->saved_applied;
 
+    // Buffer new pending reads from the core
+    for (size_t i = 0; i < ready.num_read_states; i++) {
+        if (n->num_pending_reads < 128) {
+            n->pending_reads[n->num_pending_reads++] = ready.read_states[i];
+        }
+    }
+
+    // 1. Snapshot Installations
     if (ready.install_snapshot) {
         n->saved_snap_idx = ready.snapshot_index;
         n->saved_snap_term = ready.snapshot_term;
@@ -129,7 +142,6 @@ static void pump_node(chaos_harness_t* h, int idx) {
 
         raft_snapshot_acked(n->core, true);
 
-        // Phase 4: Truncate WAL tail safely to prevent resurrecting dirty suffixes!
         uint64_t new_tail = raft_last_index(n->core);
         if (new_tail <= n->wal.max_disk_index) {
             raft_wal_truncate_tail(&n->wal, new_tail + 1);
@@ -141,6 +153,7 @@ static void pump_node(chaos_harness_t* h, int idx) {
         actual_saved_idx = raft_last_index(n->core) - ready.num_entries_to_save;
     }
 
+    // 2. Disk Persistence
     if (ready.num_entries_to_save > 0) {
         MACRO_ASSERT_TRUE(raft_io_save(&n->wal, &ready));
         actual_saved_idx = raft_last_index(n->core);
@@ -149,12 +162,13 @@ static void pump_node(chaos_harness_t* h, int idx) {
     n->saved_term = raft_term(n->core);
     n->saved_vote = raft_voted_for(n->core);
 
+    // 3. Network Routing
     for (size_t m = 0; m < ready.num_messages; m++) {
         raft_msg_t msg = ready.messages[m];
 
-        if (fast_rand() % 100 < 5) continue; // 5% packet loss
+        if (fast_rand() % 100 < 5) continue;
 
-        int delay = 1 + (fast_rand() % 20); // Massive network jitter
+        int delay = 1 + (fast_rand() % 20);
 
         for (int j = 0; j < MAX_INFLIGHT; j++) {
             if (!h->network[j].active) {
@@ -181,6 +195,7 @@ static void pump_node(chaos_harness_t* h, int idx) {
         }
     }
 
+    // 4. State Machine Application
     if (ready.num_committed_entries > 0) {
         for (size_t c = 0; c < ready.num_committed_entries; c++) {
             raft_entry_t* e = &ready.committed_entries[c];
@@ -195,6 +210,21 @@ static void pump_node(chaos_harness_t* h, int idx) {
 
             actual_applied_idx = e->index;
             if (e->index > n->highest_applied) n->highest_applied = e->index;
+        }
+    }
+
+    // 5. READ INDEX RESOLUTION (The Oracle Check)
+    for (size_t i = 0; i < n->num_pending_reads; ) {
+        if (n->pending_reads[i].index <= actual_applied_idx) {
+            n->successful_reads++;
+            if (n->pending_reads[i].index > n->max_read_index) {
+                n->max_read_index = n->pending_reads[i].index;
+            }
+            // Clear it
+            n->num_pending_reads--;
+            if (i < n->num_pending_reads) n->pending_reads[i] = n->pending_reads[n->num_pending_reads];
+        } else {
+            i++;
         }
     }
 
@@ -248,7 +278,6 @@ MACRO_TEST(raft_grand_chaos_matrix) {
     for (h.current_tick = 0; h.current_tick < MAX_TICKS; h.current_tick++) {
 
         deliver_due_messages(&h);
-
         for (int i = 0; i < NUM_NODES; i++) pump_node(&h, i);
 
         if (h.current_tick % 10 == 0) {
@@ -256,22 +285,33 @@ MACRO_TEST(raft_grand_chaos_matrix) {
             for (int i = 0; i < NUM_NODES; i++) if (h.nodes[i].is_up) raft_step_local(h.nodes[i].core, &tick);
         }
 
+        // Propose Data OR ReadIndex
         if (fast_rand() % 100 < 30) {
             int target = fast_rand() % NUM_NODES;
             if (h.nodes[target].is_up && raft_state(h.nodes[target].core) == RAFT_STATE_LEADER) {
-                uint8_t payload[4] = "DATA";
-                raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = 1, .client_seq = h.current_tick, .data = payload, .data_len = 4 };
-                raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
-                raft_step_local(h.nodes[target].core, &p);
+
+                if (fast_rand() % 100 < 20) {
+                    // Inject a Linearizable Read Request
+                    raft_msg_t p = { .type = MSG_READ_INDEX, .read_seq = h.current_tick };
+                    raft_step_local(h.nodes[target].core, &p);
+                } else {
+                    // Inject a Write Request
+                    uint8_t payload[4] = "DATA";
+                    raft_entry_t e = { .type = ENTRY_NORMAL, .client_id = 1, .client_seq = h.current_tick, .data = payload, .data_len = 4 };
+                    raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+                    raft_step_local(h.nodes[target].core, &p);
+                }
             }
         }
 
+        // Crash/Reboot
         if (h.current_tick > 100 && fast_rand() % 1000 < 5) {
             int target = fast_rand() % NUM_NODES;
             if (h.nodes[target].is_up) crash_node(&h, target);
             else boot_node(&h, target);
         }
 
+        // Compaction
         if (h.current_tick > 500 && fast_rand() % 1000 < 10) {
             int target = fast_rand() % NUM_NODES;
             if (h.nodes[target].is_up) {
@@ -285,21 +325,20 @@ MACRO_TEST(raft_grand_chaos_matrix) {
 
                     h.nodes[target].saved_snap_idx = compact_idx;
                     h.nodes[target].saved_snap_term = term;
-
-                    // Keep metadata completely in sync during manual compactions
                     h.nodes[target].saved_applied = raft_last_applied(h.nodes[target].core);
                     h.nodes[target].saved_commit = raft_commit_index(h.nodes[target].core);
                 }
             }
         }
 
+        // Timeout
         if (fast_rand() % 500 == 0) {
             int target = fast_rand() % NUM_NODES;
             if (h.nodes[target].is_up) raft_step_local(h.nodes[target].core, &hup);
         }
     }
 
-    // Graceful Shutdown
+    // Drain
     for (int i = 0; i < NUM_NODES; i++) if (!h.nodes[i].is_up) boot_node(&h, i);
     for (int wait = 0; wait < 1000; wait++) {
         h.current_tick++;
@@ -311,15 +350,25 @@ MACRO_TEST(raft_grand_chaos_matrix) {
         }
     }
 
-    // ORACLE VERIFICATION
+    // THE ORACLE: Verify Linearizability & Read Bounds
     uint64_t global_max_commit = 0;
+    uint64_t total_successful_reads = 0;
     for (int i = 0; i < NUM_NODES; i++) {
         if (h.nodes[i].highest_applied > global_max_commit) global_max_commit = h.nodes[i].highest_applied;
+        total_successful_reads += h.nodes[i].successful_reads;
+
+        // ORACLE CHECK 1: Ensure no read returned data from the future or deadlocked
+        MACRO_ASSERT_TRUE(h.nodes[i].max_read_index <= global_max_commit);
     }
 
-    MACRO_ASSERT_TRUE(global_max_commit > 0);
     printf("[INFO] Highest applied index after chaos: %llu\n", (unsigned long long)global_max_commit);
+    printf("[INFO] Total strict ReadIndex requests served under chaos: %llu\n", (unsigned long long)total_successful_reads);
 
+    // Prove liveness: Raft did work and served reads successfully!
+    MACRO_ASSERT_TRUE(global_max_commit > 0);
+    MACRO_ASSERT_TRUE(total_successful_reads > 0);
+
+    // ORACLE CHECK 2: Strict Write Linearizability
     for (uint64_t idx = 1; idx <= global_max_commit; idx++) {
         uint64_t expected_term = 0;
         uint8_t expected_payload[16] = {0};
