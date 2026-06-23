@@ -75,10 +75,12 @@ void raft_snapshot_acked(raft_t* r, bool success) {
             memmove(&r->log[1], &r->log[r->pending_snapshot_msg_index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
             r->log_len = keep_len;
         } else {
+            // Complete log overwrite
             for (size_t i = 0; i < r->log_len; i++) {
                 if (r->log[i].data) free(r->log[i].data);
             }
             r->log_len = 1;
+            r->uncommitted_bytes = 0; // Phase 2: Reset tracking since everything is now committed
         }
 
         r->snapshot_index = r->pending_snapshot_msg_index;

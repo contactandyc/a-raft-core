@@ -35,9 +35,7 @@ static void free_message_allocations(raft_msg_t* msg) {
 static bool ensure_msg_queue_capacity(raft_t* r) {
     if (r->msg_queue_len < r->msg_queue_cap) return true;
 
-    if (r->msg_queue_cap > (SIZE_MAX / 2) / sizeof(raft_msg_t)) {
-        return false;
-    }
+    if (r->msg_queue_cap > (SIZE_MAX / 2) / sizeof(raft_msg_t)) return false;
 
     size_t new_cap = r->msg_queue_cap == 0 ? 16 : r->msg_queue_cap * 2;
     raft_msg_t* new_q = realloc(r->msg_queue, new_cap * sizeof(raft_msg_t));
@@ -126,8 +124,11 @@ static bool is_valid_initial_topology(uint64_t self_id, uint64_t* peers, size_t 
     if (num_peers > MAX_REMOTE_PEERS) return false;
     if (num_peers > 0 && !peers) return false;
 
+    // Phase 1: Mathematically forbid Node ID 0
+    if (self_id == 0) return false;
+
     for (size_t i = 0; i < num_peers; i++) {
-        if (peers[i] == self_id) return false;
+        if (peers[i] == 0 || peers[i] == self_id) return false;
         for (size_t j = i + 1; j < num_peers; j++) {
             if (peers[i] == peers[j]) return false;
         }
@@ -139,8 +140,12 @@ static bool is_valid_restore_topology(uint64_t self_id, uint64_t* peers, size_t 
     if (num_peers > MAX_PEERS) return false;
     if (num_peers > 0 && !peers) return false;
 
+    // Phase 1: Mathematically forbid Node ID 0
+    if (self_id == 0) return false;
+
     size_t remote_count = 0;
     for (size_t i = 0; i < num_peers; i++) {
+        if (peers[i] == 0) return false;
         if (peers[i] != self_id) remote_count++;
         for (size_t j = i + 1; j < num_peers; j++) {
             if (peers[i] == peers[j]) return false;
@@ -205,11 +210,8 @@ static bool is_known_voting_member(raft_t* r, uint64_t node_id) {
 }
 
 static bool is_local_message_type(msg_type_t type) {
-    return type == MSG_HUP ||
-           type == MSG_TICK ||
-           type == MSG_PROPOSE ||
-           type == MSG_READ_INDEX ||
-           type == MSG_CHECK_QUORUM;
+    return type == MSG_HUP || type == MSG_TICK || type == MSG_PROPOSE ||
+           type == MSG_READ_INDEX || type == MSG_CHECK_QUORUM;
 }
 
 static bool is_remote_message_sender_allowed(raft_t* r, raft_msg_t* msg) {
@@ -226,7 +228,6 @@ static bool is_remote_message_sender_allowed(raft_t* r, raft_msg_t* msg) {
         case MSG_APPEND_RES:
         case MSG_READ_INDEX:
             return is_known_cluster_member(r, msg->from);
-
         default:
             return false;
     }
@@ -410,7 +411,7 @@ raft_t* raft_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num
 }
 
 void raft_step_local(raft_t* r, raft_msg_t* msg) {
-    if (r->fatal_error) return;
+    if (!r || r->fatal_error) return; // Phase 1: Hard Boundary Protection
     if (msg->to != 0 && msg->to != r->id) return;
     if (msg->from != 0) return;
     if (msg->term != 0) return;
@@ -434,7 +435,7 @@ void raft_step_local(raft_t* r, raft_msg_t* msg) {
 }
 
 void raft_step_remote(raft_t* r, raft_msg_t* msg) {
-    if (r->fatal_error) return;
+    if (!r || r->fatal_error) return; // Phase 1: Hard Boundary Protection
     if (msg->to != r->id) return;
     if (msg->from == 0) return;
     if (msg->term == 0) return;
@@ -488,7 +489,7 @@ void raft_step_remote(raft_t* r, raft_msg_t* msg) {
 raft_ready_t raft_get_ready(raft_t* r) {
     raft_ready_t ready;
     memset(&ready, 0, sizeof(ready));
-    if (r->fatal_error) return ready;
+    if (!r || r->fatal_error) return ready;
 
     ready.messages = r->msg_queue;
     ready.num_messages = r->msg_queue_len;
@@ -523,7 +524,7 @@ raft_ready_t raft_get_ready(raft_t* r) {
 }
 
 void raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index) {
-    if (r->fatal_error) return;
+    if (!r || r->fatal_error) return; // Phase 1: Hard Boundary Protection
 
     uint64_t last = raft_log_last_index(r);
 
@@ -554,7 +555,7 @@ void raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index) {
 }
 
 void raft_advance_all_for_tests_only(raft_t* r) {
-    if (r->fatal_error) return;
+    if (!r || r->fatal_error) return;
     raft_ready_t ready = raft_get_ready(r);
     if (ready.num_entries_to_save > 0) free(ready.entries_to_save);
     if (ready.num_committed_entries > 0) free(ready.committed_entries);
@@ -562,7 +563,7 @@ void raft_advance_all_for_tests_only(raft_t* r) {
 }
 
 void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term) {
-    if (r->fatal_error) return;
+    if (!r || r->fatal_error) return;
     if (compact_index <= r->snapshot_index || compact_index > r->last_applied) return;
 
     if (compact_index > raft_log_last_index(r)) return;
@@ -607,19 +608,20 @@ void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t com
 // GETTERS
 // ----------------------------------------------------------------------------
 
-raft_state_t raft_state(raft_t* r) { return r->state; }
-uint64_t raft_term(raft_t* r) { return r->current_term; }
-uint64_t raft_voted_for(raft_t* r) { return r->voted_for; }
-uint64_t raft_commit_index(raft_t* r) { return r->commit_index; }
-uint64_t raft_last_index(raft_t* r) { return raft_log_last_index(r); }
-uint64_t raft_last_applied(raft_t* r) { return r->last_applied; }
-bool raft_activity_accepted(raft_t* r) { return r->activity_accepted; }
-uint64_t raft_leader_id(raft_t* r) { return r->leader_id; }
-uint64_t raft_snapshot_index(raft_t* r) { return r->snapshot_index; }
-uint64_t raft_snapshot_term(raft_t* r) { return r->snapshot_term; }
-bool raft_has_fatal_error(raft_t* r) { return r->fatal_error; }
+raft_state_t raft_state(raft_t* r) { return r ? r->state : RAFT_STATE_FOLLOWER; }
+uint64_t raft_term(raft_t* r) { return r ? r->current_term : 0; }
+uint64_t raft_voted_for(raft_t* r) { return r ? r->voted_for : 0; }
+uint64_t raft_commit_index(raft_t* r) { return r ? r->commit_index : 0; }
+uint64_t raft_last_index(raft_t* r) { return r ? raft_log_last_index(r) : 0; }
+uint64_t raft_last_applied(raft_t* r) { return r ? r->last_applied : 0; }
+bool raft_activity_accepted(raft_t* r) { return r ? r->activity_accepted : false; }
+uint64_t raft_leader_id(raft_t* r) { return r ? r->leader_id : 0; }
+uint64_t raft_snapshot_index(raft_t* r) { return r ? r->snapshot_index : 0; }
+uint64_t raft_snapshot_term(raft_t* r) { return r ? r->snapshot_term : 0; }
+bool raft_has_fatal_error(raft_t* r) { return r ? r->fatal_error : true; }
 
 size_t raft_peers(raft_t* r, uint64_t* out_peers) {
+    if (!r) return 0;
     if (out_peers) {
         for (size_t i = 0; i < r->num_peers; i++) out_peers[i] = r->peers[i];
     }
@@ -627,6 +629,7 @@ size_t raft_peers(raft_t* r, uint64_t* out_peers) {
 }
 
 size_t raft_peers_ext(raft_t* r, uint64_t* out_peers, bool* out_is_learners, size_t out_cap) {
+    if (!r) return 0;
     size_t required = calculate_total_topology_size(r);
 
     if ((!out_peers && !out_is_learners) || out_cap < required) {

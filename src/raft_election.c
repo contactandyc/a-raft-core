@@ -55,9 +55,6 @@ static bool register_vote_and_check_quorum(raft_t* r, uint64_t peer_id) {
 // STATE TRANSITIONS & CAMPAIGNING
 // ============================================================================
 
-// Transitions the node to the Leader state. Asserts authority, initializes
-// tracking, appends a no-op, and broadcasts its new status.
-// Guarded against dynamic membership mid-flight demotions.
 void raft_election_become_leader(raft_t* r) {
     if (!self_is_voter(r)) return;
 
@@ -66,7 +63,12 @@ void raft_election_become_leader(raft_t* r) {
     r->leader_id = r->id;
 
     uint8_t dummy = 0;
-    raft_log_append(r, r->current_term, ENTRY_NORMAL, 0, 0, &dummy, 0);
+
+    // Phase 1: Check allocation failure on the no-op append
+    if (!raft_log_append(r, r->current_term, ENTRY_NORMAL, 0, 0, &dummy, 0)) {
+        return;
+    }
+
     r->term_start_index = raft_log_last_index(r);
 
     for (size_t i = 0; i < r->num_peers; i++) {
@@ -82,7 +84,6 @@ void raft_election_become_leader(raft_t* r) {
     raft_replication_bcast_append(r);
 }
 
-// Initiates the Pre-Vote phase to see if a real campaign would be viable.
 static void campaign_for_pre_votes(raft_t* r) {
     r->state = RAFT_STATE_PRE_CANDIDATE;
     r->votes_received = 1; // We always pre-vote for ourselves
@@ -99,7 +100,6 @@ static void campaign_for_pre_votes(raft_t* r) {
     }
 }
 
-// Initiates a formal Raft election. Guarded against dynamic mid-flight demotions.
 static void campaign_for_hard_votes(raft_t* r) {
     if (!self_is_voter(r)) return;
 
@@ -208,7 +208,7 @@ static void handle_check_quorum(raft_t* r) {
 
     if (active_voters < (total_voters / 2) + 1) {
         r->state = RAFT_STATE_FOLLOWER;
-        r->leader_id = 0; // Explicitly clear leader identity upon partition failure
+        r->leader_id = 0;
     }
 }
 

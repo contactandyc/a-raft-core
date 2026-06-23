@@ -789,11 +789,17 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
 }
 
 int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id) {
-    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_ERR_NOT_LEADER; // Phase 1: Unified Fatal Check
+    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_ERR_NOT_LEADER;
 
     if (raft_state(node->core) != RAFT_STATE_LEADER) {
         if (out_leader_id) *out_leader_id = raft_leader_id(node->core);
         return RAFT_ERR_NOT_LEADER;
+    }
+
+    // Phase 2: Strict proposal bounds.
+    // Leave safe overhead room for the 95-byte packet header and 37-byte entry wrapper.
+    if (len > (RAFT_MAX_FRAME_SIZE - 200)) {
+        return RAFT_ERR_QUEUE_FULL;
     }
 
     if (raft_last_index(node->core) - raft_commit_index(node->core) > 2000) {

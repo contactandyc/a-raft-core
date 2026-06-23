@@ -23,14 +23,40 @@ raft_entry_t* raft_log_get(raft_t* r, uint64_t index) {
     return &r->log[index - r->snapshot_index];
 }
 
-void raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len) {
+bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len) {
+    if (r->fatal_error) return false;
+
+    if (data_len > 0 && !data) {
+        r->fatal_error = true;
+        return false;
+    }
+
     if (r->log_len >= r->log_cap) {
         size_t new_cap = r->log_cap == 0 ? 16 : r->log_cap * 2;
+        if (new_cap < r->log_cap || new_cap > (SIZE_MAX / sizeof(raft_entry_t))) {
+            r->fatal_error = true;
+            return false;
+        }
+
         raft_entry_t* new_log = realloc(r->log, new_cap * sizeof(raft_entry_t));
-        if (!new_log) return;
+        if (!new_log) {
+            r->fatal_error = true;
+            return false;
+        }
         r->log = new_log;
         r->log_cap = new_cap;
     }
+
+    uint8_t* payload = NULL;
+    if (data_len > 0) {
+        payload = malloc(data_len);
+        if (!payload) {
+            r->fatal_error = true;
+            return false;
+        }
+        memcpy(payload, data, data_len);
+    }
+
     uint64_t next_idx = raft_log_last_index(r) + 1;
     raft_entry_t* e = &r->log[r->log_len++];
     e->term = term;
@@ -39,26 +65,35 @@ void raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, 
     e->client_id = cid;
     e->client_seq = cseq;
     e->data_len = data_len;
-    e->data = data_len > 0 ? malloc(data_len) : NULL;
-    if (data_len > 0 && e->data) memcpy(e->data, data, data_len);
+    e->data = payload;
+
+    // Phase 2: Add to backpressure tracker
+    r->uncommitted_bytes += data_len;
+
+    return true;
 }
 
 void raft_log_truncate(raft_t* r, uint64_t index) {
     if (index <= r->snapshot_index) return;
     size_t new_len = index - r->snapshot_index;
     for (size_t i = new_len; i < r->log_len; i++) {
+
+        // Phase 2: Deduct uncommitted bytes before freeing them
+        if (r->log[i].index > r->commit_index) {
+            if (r->uncommitted_bytes >= r->log[i].data_len) {
+                r->uncommitted_bytes -= r->log[i].data_len;
+            } else {
+                r->uncommitted_bytes = 0; // Failsafe against underflow
+            }
+        }
+
         if (r->log[i].data) free(r->log[i].data);
     }
     r->log_len = new_len;
     if (r->last_saved_index >= index) r->last_saved_index = index - 1;
 }
 
+// Phase 2: O(1) Fetch
 uint64_t raft_uncommitted_bytes(raft_t* r) {
-    uint64_t bytes = 0;
-    uint64_t last = raft_log_last_index(r);
-    for (uint64_t i = r->commit_index + 1; i <= last; i++) {
-        raft_entry_t* e = raft_log_get(r, i);
-        if (e) bytes += e->data_len;
-    }
-    return bytes;
+    return r->uncommitted_bytes;
 }

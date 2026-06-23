@@ -8,7 +8,6 @@
 
 #include "a-raft-library/raft.h"
 
-// Leave 1 slot open for the local node during topology exports
 #define MAX_PEERS 64
 #define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
@@ -44,7 +43,7 @@ struct raft_s {
 
     uint64_t next_index[MAX_PEERS];
     uint64_t match_index[MAX_PEERS];
-    uint64_t snapshot_offset[MAX_PEERS]; // Leader tracks snapshot progress
+    uint64_t snapshot_offset[MAX_PEERS];
 
     size_t votes_received;
     bool voted_for_me[MAX_PEERS];
@@ -55,6 +54,8 @@ struct raft_s {
 
     uint64_t last_saved_index;
     bool activity_accepted;
+
+    uint64_t uncommitted_bytes;
 
     bool recent_active[MAX_PEERS];
     bool is_learner[MAX_PEERS];
@@ -73,7 +74,7 @@ struct raft_s {
     uint64_t leader_id;
 
     bool pending_snapshot;
-    uint8_t* pending_snapshot_data; // Holds the current streaming chunk
+    uint8_t* pending_snapshot_data;
     size_t pending_snapshot_len;
     uint64_t pending_snapshot_offset;
     bool pending_snapshot_done;
@@ -93,7 +94,9 @@ void raft_send_msg(raft_t* r, raft_msg_t msg);
 uint64_t raft_log_last_index(raft_t* r);
 uint64_t raft_log_term(raft_t* r, uint64_t index);
 raft_entry_t* raft_log_get(raft_t* r, uint64_t index);
-void raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len);
+
+// Phase 1: Changed to transactional boolean return
+bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len);
 void raft_log_truncate(raft_t* r, uint64_t index);
 
 void raft_election_step(raft_t* r, raft_msg_t* msg);
@@ -109,9 +112,7 @@ void raft_membership_apply_config(raft_t* r, uint64_t index);
 
 void raft_advance_all_for_tests_only(raft_t* r);
 
-void raft_read_index_step(raft_t* r, raft_msg_t* msg);
 void raft_read_index_ack(raft_t* r, size_t peer_idx, uint64_t read_seq);
-void raft_membership_apply_config(raft_t* r, uint64_t index);
 
 void raft_add_learner(raft_t* r, uint64_t peer_id);
 void raft_promote_learner(raft_t* r, uint64_t peer_id);
