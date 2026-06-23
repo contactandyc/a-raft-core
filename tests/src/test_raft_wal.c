@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "a-raft-library/raft_wal.h"
-#include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_test.h"
 
 #define TEST_WAL_DIR "wal_test_data"
@@ -95,12 +94,12 @@ MACRO_TEST(wal_detects_crc_corruption_in_old_sealed_segment_as_fatal) {
     raft_wal_t wal;
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, TEST_WAL_DIR, 1, 0), 0);
 
-    uint8_t* big = aml_calloc(1, 600000);
+    uint8_t* big = calloc(1, 600000);
     raft_wal_append(&wal, 1, 1, 0, 0, 0, big, 600000);
     raft_wal_append(&wal, 1, 2, 0, 0, 0, big, 600000);
     raft_wal_flush_batch(&wal);
     raft_wal_close(&wal);
-    aml_free(big);
+    free(big);
 
     int fd = open(TEST_WAL_DIR "/0000000001.wal", O_RDWR);
     uint8_t garbage = 0x99;
@@ -116,22 +115,22 @@ MACRO_TEST(wal_reused_standby_file_does_not_resurrect_old_frames) {
     raft_wal_t wal;
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, TEST_WAL_DIR, 1, 1), 0);
 
-    uint8_t* big = aml_calloc(1, 600000);
+    uint8_t* big = calloc(1, 600000);
     raft_wal_append(&wal, 1, 1, 0, 0, 0, big, 600000);
     raft_wal_append(&wal, 1, 2, 0, 0, 0, big, 600000);
     raft_wal_append(&wal, 1, 3, 0, 0, 0, big, 600000);
     raft_wal_flush_batch(&wal);
 
     raft_wal_truncate_tail(&wal, 2);
-    aml_free(big);
+    free(big);
 
-    uint8_t* big2 = aml_calloc(1, 600000);
+    uint8_t* big2 = calloc(1, 600000);
     raft_wal_append(&wal, 1, 2, 0, 0, 0, big2, 600000);
     raft_wal_append(&wal, 1, 3, 0, 0, 0, big2, 600000);
     raft_wal_flush_batch(&wal);
 
     raft_wal_close(&wal);
-    aml_free(big2);
+    free(big2);
 
     raft_wal_t wal2;
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal2, TEST_WAL_DIR, 1, 1), 0);
@@ -236,16 +235,16 @@ MACRO_TEST(wal_truncate_tail_clears_read_cache_for_removed_segment) {
     raft_wal_t wal;
     MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, TEST_WAL_DIR, 1, 0), 0);
 
-    uint8_t* big = aml_calloc(1, 600000);
+    uint8_t* big = calloc(1, 600000);
     raft_wal_append(&wal, 1, 1, 0, 0, 0, big, 600000);
     raft_wal_append(&wal, 1, 2, 0, 0, 0, big, 600000);
     raft_wal_flush_batch(&wal);
-    aml_free(big);
+    free(big);
 
     uint64_t out_term, out_cid, out_cseq; uint8_t out_type; uint32_t out_len;
     uint8_t* out_payload = NULL;
     raft_wal_read_entry(&wal, 1, &out_term, &out_type, &out_cid, &out_cseq, &out_payload, &out_len);
-    if (out_payload) aml_free(out_payload);
+    if (out_payload) free(out_payload);
 
     MACRO_ASSERT_TRUE(wal.read_fd >= 0);
     raft_wal_truncate_tail(&wal, 1);

@@ -567,6 +567,31 @@ MACRO_TEST(promote_learner_rejected_until_caught_up) {
     raft_destroy(r);
 }
 
+MACRO_TEST(entry_conf_add_is_safely_mapped_to_learner) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    uint64_t new_node = 4;
+    // We intentionally use the dangerous ENTRY_CONF_ADD type
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_CONF_ADD, .data = (uint8_t*)&new_node, .data_len = sizeof(uint64_t) };
+
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 1 };
+    raft_step_remote(r, &app);
+    raft_advance_all_for_tests_only(r);
+
+    uint64_t active_peers[16]; bool is_learner[16];
+    size_t num = raft_peers_ext(r, active_peers, is_learner, 16);
+
+    // Prove that the engine intercepted the dangerous config and safely added it as a LEARNER instead
+    // The cluster contains: Self(1), Node(2), Node(3), and the new Learner(4) = 4 total nodes.
+    MACRO_ASSERT_EQ_INT(num, 4);
+    MACRO_ASSERT_EQ_INT(active_peers[2], 4);
+    MACRO_ASSERT_TRUE(is_learner[2]);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -598,6 +623,8 @@ int main(void) {
 
     MACRO_ADD(tests, committed_unapplied_config_blocks_new_config_proposal);
     MACRO_ADD(tests, promote_learner_rejected_until_caught_up);
+
+    MACRO_ADD(tests, entry_conf_add_is_safely_mapped_to_learner);
 
     macro_run_all("raft_membership", tests, test_count);
     return 0;

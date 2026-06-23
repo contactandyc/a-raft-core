@@ -5,7 +5,6 @@
 
 #define _GNU_SOURCE
 #include "a-raft-library/raft_wal.h"
-#include "a-memory-library/aml_alloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +15,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <stdarg.h>
 
 #define WAL_V2_MAGIC 0x57414C32
 #define WAL_V2_SEG_HEADER_SIZE 20
@@ -50,6 +50,28 @@ static uint64_t unpack_u64(const uint8_t* p) {
 // -----------------------------------------------------------------------------
 // INTERNAL UTILITIES
 // -----------------------------------------------------------------------------
+
+static char* strdupf(const char* format, ...) {
+    va_list args;
+
+    // First pass: determine the required length
+    va_start(args, format);
+    int len = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    if (len < 0) return NULL; // Encoding error
+
+    // Allocate memory (+1 for the null terminator)
+    char* str = malloc((size_t)len + 1);
+    if (!str) return NULL;
+
+    // Second pass: actually format the string into the allocated buffer
+    va_start(args, format);
+    vsnprintf(str, (size_t)len + 1, format, args);
+    va_end(args);
+
+    return str;
+}
 
 static uint32_t crc32_update(uint32_t crc, const void *buf, size_t size) {
     const uint8_t *p = buf;
@@ -143,12 +165,12 @@ static bool ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
             new_cap *= 2;
         }
 
-        raft_wal_loc_t* new_offsets = aml_calloc(new_cap, sizeof(raft_wal_loc_t));
+        raft_wal_loc_t* new_offsets = calloc(new_cap, sizeof(raft_wal_loc_t));
         if (!new_offsets) return false;
 
         if (wal->offsets) {
             memcpy(new_offsets, wal->offsets, wal->offsets_cap * sizeof(raft_wal_loc_t));
-            aml_free(wal->offsets);
+            free(wal->offsets);
         }
         wal->offsets = new_offsets;
         wal->offsets_cap = new_cap;
@@ -179,11 +201,11 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
     wal->segment_size_bytes = seg_bytes;
     wal->max_standby = max_standby;
 
-    wal->standby_paths = max_standby > 0 ? aml_malloc(sizeof(char*) * max_standby) : NULL;
+    wal->standby_paths = max_standby > 0 ? malloc(sizeof(char*) * max_standby) : NULL;
     if (max_standby > 0 && !wal->standby_paths) goto init_fail;
 
     wal->batch_cap = 65536;
-    wal->batch_buf = aml_malloc(wal->batch_cap);
+    wal->batch_buf = malloc(wal->batch_cap);
     if (!wal->batch_buf) goto init_fail;
 
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) goto init_fail;
@@ -197,7 +219,7 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
     while ((ep = readdir(dp))) {
         if (strncmp(ep->d_name, "standby_", 8) == 0) {
             if (wal->standby_count < wal->max_standby) {
-                char* sp = aml_strdupf("%s/%s", dir, ep->d_name);
+                char* sp = strdupf("%s/%s", dir, ep->d_name);
                 if (sp) wal->standby_paths[wal->standby_count++] = sp;
             } else {
                 char excess[1024]; snprintf(excess, 1024, "%s/%s", dir, ep->d_name);
@@ -291,13 +313,13 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
 
             uint8_t* payload = NULL;
             if (len > 0) {
-                payload = aml_malloc(len);
+                payload = malloc(len);
                 if (!payload) {
                     close(fd); goto init_fail;
                 }
                 if (safe_pread(fd, payload, len, offset + WAL_V2_FRAME_HEADER_SIZE) != len) {
                     torn_write = true;
-                    aml_free(payload);
+                    free(payload);
                     break;
                 }
             }
@@ -308,10 +330,10 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
 
             if (stored_crc != computed_crc) {
                 torn_write = true;
-                if (payload) aml_free(payload);
+                if (payload) free(payload);
                 break;
             }
-            if (payload) aml_free(payload);
+            if (payload) free(payload);
 
             if (!ensure_offset_capacity(wal, index)) { close(fd); goto init_fail; }
             wal->offsets[index].seg_id = seg;
@@ -377,7 +399,7 @@ static int raft_wal_rotate(raft_wal_t* wal, uint64_t next_seq) {
 
         wal->standby_count--;
         wal->standby_paths[slot] = NULL;
-        aml_free(standby_path);
+        free(standby_path);
 
         fd = open(tmp_path, O_RDWR);
         if (fd < 0) return -1;
@@ -428,7 +450,7 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
             if (new_cap > SIZE_MAX / 2) return -1;
             new_cap *= 2;
         }
-        uint8_t *new_buf = aml_realloc(wal->batch_buf, new_cap);
+        uint8_t *new_buf = realloc(wal->batch_buf, new_cap);
         if (!new_buf) return -1;
         wal->batch_buf = new_buf;
         wal->batch_cap = new_cap;
@@ -527,10 +549,10 @@ int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_te
     uint8_t* payload = NULL;
 
     if (len > 0) {
-        payload = aml_malloc(len);
+        payload = malloc(len);
         if (!payload) return 0;
         if (safe_pread(wal->read_fd, payload, len, loc.offset + WAL_V2_FRAME_HEADER_SIZE) != len) {
-            aml_free(payload);
+            free(payload);
             return 0;
         }
     }
@@ -540,7 +562,7 @@ int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_te
     computed_crc = ~computed_crc;
 
     if (stored_crc != computed_crc) {
-        if (payload) aml_free(payload);
+        if (payload) free(payload);
         return 0;
     }
 
@@ -583,11 +605,11 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
             }
 
             if (wal->standby_count < wal->max_standby) {
-                char* standby_path = aml_strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)bad_seg, wal->standby_count);
+                char* standby_path = strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)bad_seg, wal->standby_count);
                 if (standby_path && rename(bad_path, standby_path) == 0) {
                     wal->standby_paths[wal->standby_count++] = standby_path;
                 } else {
-                    if (standby_path) aml_free(standby_path);
+                    if (standby_path) free(standby_path);
                     if (unlink(bad_path) != 0) return -1;
                 }
             } else {
@@ -649,12 +671,12 @@ int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
 
             bool removed = false;
             if (wal->standby_count < wal->max_standby) {
-                char* standby_path = aml_strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)wal->oldest_seg_id, wal->standby_count);
+                char* standby_path = strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)wal->oldest_seg_id, wal->standby_count);
                 if (standby_path && rename(path, standby_path) == 0) {
                     wal->standby_paths[wal->standby_count++] = standby_path;
                     removed = true;
                 } else {
-                    if (standby_path) aml_free(standby_path);
+                    if (standby_path) free(standby_path);
                 }
             }
 
@@ -685,13 +707,13 @@ void raft_wal_close(raft_wal_t* wal) {
 
     if (wal->standby_paths) {
         for (uint32_t i = 0; i < wal->standby_count; i++) {
-            if (wal->standby_paths[i]) aml_free(wal->standby_paths[i]);
+            if (wal->standby_paths[i]) free(wal->standby_paths[i]);
         }
-        aml_free(wal->standby_paths);
+        free(wal->standby_paths);
         wal->standby_paths = NULL;
     }
-    if (wal->offsets) { aml_free(wal->offsets); wal->offsets = NULL; }
-    if (wal->batch_buf) { aml_free(wal->batch_buf); wal->batch_buf = NULL; }
+    if (wal->offsets) { free(wal->offsets); wal->offsets = NULL; }
+    if (wal->batch_buf) { free(wal->batch_buf); wal->batch_buf = NULL; }
 
     wal->standby_count = 0;
     wal->batch_len = 0;

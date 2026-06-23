@@ -95,6 +95,25 @@ MACRO_TEST(node_propose_oversized_payload_returns_error_without_fatal) {
     uv_loop_close(&loop);
 }
 
+MACRO_TEST(raft_node_init_rejects_too_many_initial_peers) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    raft_server_t srv;
+    raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_api_toomany");
+
+    raft_node_t node;
+    uint64_t massive_peers[100];
+    for (int i=0; i<100; i++) massive_peers[i] = i+1;
+
+    // RAFT_MAX_PEERS is 64. Passing 100 should fail safely.
+    raft_node_init(&node, &srv, 0, massive_peers, 100, NULL, NULL, NULL, NULL, NULL, NULL);
+    MACRO_ASSERT_TRUE(node.core == NULL);
+    MACRO_ASSERT_TRUE(node.fatal_error == true);
+
+    free(srv.groups);
+    uv_loop_close(&loop);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -103,6 +122,7 @@ int main(void) {
     MACRO_ADD(tests, raft_create_rejects_peer_id_zero);
     MACRO_ADD(tests, raft_node_init_rejects_group_id_out_of_bounds);
     MACRO_ADD(tests, node_propose_oversized_payload_returns_error_without_fatal);
+    MACRO_ADD(tests, raft_node_init_rejects_too_many_initial_peers);
 
     macro_run_all("raft_api", tests, test_count);
     return 0;

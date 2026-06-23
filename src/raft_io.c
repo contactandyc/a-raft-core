@@ -4,7 +4,6 @@
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include "a-raft-library/raft_io.h"
-#include "a-memory-library/aml_alloc.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -54,7 +53,7 @@ raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                 entries[arr_idx].data = payload;
                 entries[arr_idx].data_len = len;
             } else {
-                for(size_t j = 0; j < arr_idx; j++) if (entries[j].data) aml_free(entries[j].data);
+                for(size_t j = 0; j < arr_idx; j++) if (entries[j].data) free(entries[j].data);
                 free(entries);
                 return NULL;
             }
@@ -66,7 +65,7 @@ raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                                           snapshot_index, snapshot_term, entries, total_entries);
 
     if (total_entries > 0 && entries) {
-        for (size_t i = 0; i < total_entries; i++) if (entries[i].data) aml_free(entries[i].data);
+        for (size_t i = 0; i < total_entries; i++) if (entries[i].data) free(entries[i].data);
         free(entries);
     }
     return core;
