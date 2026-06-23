@@ -495,6 +495,78 @@ MACRO_TEST(raft_add_self_after_removed_restores_as_learner_only) {
     raft_destroy(r);
 }
 
+MACRO_TEST(committed_unapplied_config_blocks_new_config_proposal) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // Boot leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Propose first config
+    uint64_t n3 = 3;
+    raft_entry_t e1 = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&n3, .data_len = 8 };
+    raft_msg_t prop1 = { .type = MSG_PROPOSE, .entries = &e1, .num_entries = 1 };
+    raft_step_local(r, &prop1);
+
+    // Commit it, but do NOT apply it!
+    raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 };
+    raft_step_remote(r, &ack);
+    raft_advance(r, 2, 1); // Applied is still 1!
+
+    // Propose second config
+    uint64_t n4 = 4;
+    raft_entry_t e2 = { .type = ENTRY_CONF_ADD_LEARNER, .data = (uint8_t*)&n4, .data_len = 8 };
+    raft_msg_t prop2 = { .type = MSG_PROPOSE, .entries = &e2, .num_entries = 1 };
+    raft_step_local(r, &prop2);
+
+    // The core must drop the second config because the first is still pending application
+    MACRO_ASSERT_EQ_INT(raft_last_index(r), 2);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(promote_learner_rejected_until_caught_up) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+    raft_add_learner(r, 3); // Node 3 is a learner at index 0
+
+    // Boot leader and commit 10 dummy entries
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    for(int i=0; i<10; i++) {
+        raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"x", .data_len = 1 };
+        raft_msg_t prop = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+        raft_step_local(r, &prop);
+        raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2 + i };
+        raft_step_remote(r, &ack);
+    }
+    raft_advance_all_for_tests_only(r);
+    MACRO_ASSERT_EQ_INT(raft_commit_index(r), 11);
+
+    // Try to promote Node 3 (whose match_index is 0)
+    uint64_t n3 = 3;
+    raft_entry_t prom = { .type = ENTRY_CONF_PROMOTE_LEARNER, .data = (uint8_t*)&n3, .data_len = 8 };
+    raft_msg_t prop_prom = { .type = MSG_PROPOSE, .entries = &prom, .num_entries = 1 };
+    raft_step_local(r, &prop_prom);
+
+    // Proposal must be dropped because learner is mathematically unsafe to promote
+    MACRO_ASSERT_EQ_INT(raft_last_index(r), 11);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -523,6 +595,9 @@ int main(void) {
     MACRO_ADD(tests, raft_remove_self_clears_leader_id);
     MACRO_ADD(tests, raft_remove_self_sets_removed_and_learner_self);
     MACRO_ADD(tests, raft_add_self_after_removed_restores_as_learner_only);
+
+    MACRO_ADD(tests, committed_unapplied_config_blocks_new_config_proposal);
+    MACRO_ADD(tests, promote_learner_rejected_until_caught_up);
 
     macro_run_all("raft_membership", tests, test_count);
     return 0;

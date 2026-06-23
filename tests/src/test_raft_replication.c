@@ -1255,6 +1255,33 @@ MACRO_TEST(raft_oversized_single_entry_is_rejected_before_replication) {
     raft_destroy(r);
 }
 
+MACRO_TEST(leader_uses_reject_hints_even_when_follower_log_is_longer) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // Leader has 1 entry. Follower has 20 uncommitted entries and rejects with index=20, conflict=6
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 20, .conflict_index = 6 };
+    raft_step_remote(r, &rej);
+
+    // The leader MUST NOT ignore the rejection. It must clamp the backtrack to its own tail + 1.
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_APPEND_ENTRIES);
+
+    // Leader's last index is 1. Backtrack target was 6. Clamped target is 2. Therefore, it sends next_index = 2.
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 1); // prevLogIndex = next - 1 = 1
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1312,6 +1339,7 @@ int main(void) {
     MACRO_ADD(tests, raft_reject_conflict_index_clamped_to_log_bounds);
     MACRO_ADD(tests, raft_oversized_single_entry_is_rejected_before_replication);
 
+    MACRO_ADD(tests, leader_uses_reject_hints_even_when_follower_log_is_longer);
     macro_run_all("raft_replication", tests, test_count);
     return 0;
 }

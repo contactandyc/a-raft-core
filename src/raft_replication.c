@@ -32,7 +32,7 @@ static bool get_peer_index(raft_t* r, uint64_t peer_id, size_t* out_idx) {
 void raft_replication_advance_commit(raft_t* r, uint64_t new_commit) {
     if (new_commit <= r->commit_index) return;
 
-    // Phase 2: Deduct newly committed bytes from the backpressure tracker
+    // Phase 2: O(1) Backpressure Tracking
     for (uint64_t i = r->commit_index + 1; i <= new_commit; i++) {
         raft_entry_t* e = raft_log_get(r, i);
         if (e) {
@@ -204,7 +204,7 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
     uint64_t old_last_idx = raft_log_last_index(r);
     bool has_pending_config = false;
 
-    // Phase 3: Check entire unapplied tail for overlapping configurations
+    // Phase 3: Check the entire unapplied tail for overlapping configurations
     for (uint64_t idx = r->last_applied + 1; idx <= old_last_idx; idx++) {
         raft_entry_t* e = raft_log_get(r, idx);
         if (e && e->type != ENTRY_NORMAL) {
@@ -216,11 +216,28 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
     bool appended = false;
     for (size_t i = 0; i < msg->num_entries; i++) {
         if (msg->entries[i].type != ENTRY_NORMAL) {
+
+            // Safety: Only one uncommitted/unapplied configuration change at a time
             if (has_pending_config) continue;
+
+            // Phase 3: Secure Learner Promotion Guard
+            // Intercept proposals to promote a learner. If they are lagging behind the commit index,
+            // drop the proposal entirely. This prevents instantly killing cluster availability.
+            if (msg->entries[i].type == ENTRY_CONF_PROMOTE_LEARNER && msg->entries[i].data_len == sizeof(uint64_t)) {
+                uint64_t target_node;
+                memcpy(&target_node, msg->entries[i].data, sizeof(uint64_t));
+
+                size_t p_idx;
+                if (get_peer_index(r, target_node, &p_idx)) {
+                    if (r->match_index[p_idx] < r->commit_index) {
+                        continue; // Drop unsafe promotion
+                    }
+                }
+            }
+
             has_pending_config = true;
         }
 
-        // Phase 1: Halt and fail closed on memory exhaustion
         if (!raft_log_append(r, r->current_term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len)) {
             break;
         }
@@ -279,7 +296,6 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
 
                 if (new_idx <= my_last_idx) raft_log_truncate(r, new_idx);
 
-                // Phase 1: Halt and reject the remainder if memory is exhausted
                 if (!raft_log_append(r, msg->entries[i].term, msg->entries[i].type, msg->entries[i].client_id, msg->entries[i].client_seq, msg->entries[i].data, msg->entries[i].data_len)) {
                     res.reject = true;
                     break;
@@ -334,7 +350,6 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
 
     r->recent_active[peer_idx] = true;
 
-    // Snapshot stream acknowledgment check
     if (r->next_index[peer_idx] <= r->snapshot_index) {
         if (!msg->reject) {
             if (msg->snapshot_done) {
@@ -352,7 +367,7 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
 
     if (!msg->reject) {
         uint64_t last = raft_log_last_index(r);
-        if (msg->index > last) return; // Stale success is still invalid
+        if (msg->index > last) return;
 
         raft_read_index_ack(r, peer_idx, msg->read_seq);
 
@@ -369,9 +384,6 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
         }
 
     } else {
-        // Phase 2: Removed "if (msg->index > raft_log_last_index(r)) return;"
-        // Followers with longer conflicting logs return higher msg->index values.
-
         uint64_t backtrack = find_conflict_backtrack_index(r, msg->conflict_term, msg->conflict_index);
         uint64_t last = raft_log_last_index(r);
 

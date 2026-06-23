@@ -49,6 +49,64 @@ set(TEST_EXECUTABLES "")
 
 # ---- Targets ----
 # ==============================================================================
+# test_raft_api Target (Standard Test)
+# ==============================================================================
+add_executable(test_raft_api
+  src/test_raft_api.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_codec.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_election.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_read_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_replication.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_snapshot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/raft_wal.c
+)
+
+target_include_directories(test_raft_api BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_raft_api)
+
+set_target_properties(test_raft_api PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_raft_api PRIVATE libuv::uv)
+target_link_libraries(test_raft_api PRIVATE h2o_c_library::h2o_c_library)
+target_link_libraries(test_raft_api PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_raft_api PRIVATE a_raft_library::a_raft_library)
+
+if(M_LIB)
+  target_link_libraries(test_raft_api PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_raft_api PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_raft_api PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_raft_api PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_raft_api PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_raft_api PRIVATE -O0 -g --coverage)
+    target_link_options(test_raft_api PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_raft_api COMMAND $<TARGET_FILE:test_raft_api>)
+# ==============================================================================
 # test_raft_chaos Target (Standard Test)
 # ==============================================================================
 add_executable(test_raft_chaos

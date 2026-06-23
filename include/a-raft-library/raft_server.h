@@ -32,8 +32,6 @@ typedef struct {
 
 typedef int (*raft_apply_fn)(void* ctx, const raft_entry_t* entry, uint64_t current_term);
 typedef void (*raft_read_cb)(void* ctx, uint64_t read_seq);
-
-// PHASE 13: Callback for the application to ingest snapshot payloads natively
 typedef int (*raft_snapshot_fn)(void* ctx, uint64_t index, uint64_t term, const uint8_t* data, size_t len);
 
 typedef struct raft_node_s raft_node_t;
@@ -82,6 +80,19 @@ struct raft_server_s {
     bool network_isolated;
 };
 
+// Phase 5: Asynchronous I/O Context
+typedef struct {
+    raft_ready_t ready;
+    uint64_t actual_applied_idx;
+    uint64_t actual_saved_idx;
+
+    bool meta_changed;
+    uint64_t term, vote, commit, snap_idx, snap_term;
+
+    bool snap_success;
+    bool io_failed;
+} disk_flush_ctx_t;
+
 struct raft_node_s {
     uint64_t group_id;
     raft_server_t* server;
@@ -111,6 +122,15 @@ struct raft_node_s {
     raft_read_state_t pending_reads[128];
     size_t num_pending_reads;
 
+    // Phase 5: Async I/O State & Mailbox
+    bool is_flushing;
+    uv_work_t flush_work;
+    disk_flush_ctx_t flush_ctx;
+
+    raft_msg_t* inbound_queue;
+    size_t inbound_queue_len;
+    size_t inbound_queue_cap;
+
     bool fatal_error;
 };
 
@@ -124,8 +144,11 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
 
 int  raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id);
 int  raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_leader_id);
-
-// PHASE 13: Two-step decoupled API. App generates durable snapshot, then orders Raft to compact history safely.
 int  raft_node_compact(raft_node_t* node, uint64_t compact_index);
+
+// Phase 5: Clean Configuration APIs
+int  raft_node_add_server(raft_node_t* node, uint64_t target_node_id);
+int  raft_node_promote_server(raft_node_t* node, uint64_t target_node_id);
+int  raft_node_remove_server(raft_node_t* node, uint64_t target_node_id);
 
 #endif // RAFT_SERVER_H

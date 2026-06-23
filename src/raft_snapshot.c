@@ -14,6 +14,14 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
             r->activity_accepted = true;
             r->leader_id = msg->from;
 
+            // Phase 4 Fix: Ignore stale snapshots that would roll the state machine backward,
+            // but ACK them (reject = false) so the leader knows we already have the data.
+            if (msg->index <= r->last_applied) {
+                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
+                raft_send_msg(r, res);
+                return;
+            }
+
             if (msg->index > r->snapshot_index) {
                 if (msg->snapshot_offset == 0) {
                     r->pending_snapshot = true;
@@ -50,8 +58,6 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
 void raft_snapshot_acked(raft_t* r, bool success) {
     if (!r->pending_snapshot) return;
 
-    // FIX: Only report the snapshot's index if it was fully and successfully installed.
-    // Otherwise, report our actual, intact local index.
     raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
                        .reject = !success,
                        .index = (success && r->pending_snapshot_done) ? r->pending_snapshot_msg_index : raft_log_last_index(r),
@@ -75,7 +81,6 @@ void raft_snapshot_acked(raft_t* r, bool success) {
             memmove(&r->log[1], &r->log[r->pending_snapshot_msg_index - r->snapshot_index + 1], (keep_len - 1) * sizeof(raft_entry_t));
             r->log_len = keep_len;
         } else {
-            // Complete log overwrite
             for (size_t i = 0; i < r->log_len; i++) {
                 if (r->log[i].data) free(r->log[i].data);
             }
@@ -108,6 +113,7 @@ void raft_snapshot_acked(raft_t* r, bool success) {
                         r->is_learner[r->num_peers] = r->pending_snapshot_is_learner[i];
                         r->next_index[r->num_peers] = r->snapshot_index + 1;
                         r->match_index[r->num_peers] = 0;
+                        r->snapshot_offset[r->num_peers] = 0;
                         r->recent_active[r->num_peers] = false;
                         r->num_peers++;
                     }

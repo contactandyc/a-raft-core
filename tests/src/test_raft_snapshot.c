@@ -210,6 +210,32 @@ MACRO_TEST(lagging_follower_installs_snapshot_and_gets_updated_membership) {
     raft_destroy(r);
 }
 
+MACRO_TEST(snapshot_below_last_applied_is_ignored) {
+    uint64_t peers[] = {1, 2, 3};
+    // Boot a follower already safely compacted and applied up to index 100
+    raft_t* r = raft_restore(1, peers, NULL, 3, 2, 0, 100, 100, 100, 2, NULL, 0);
+
+    MACRO_ASSERT_EQ_INT(raft_last_applied(r), 100);
+
+    // Simulate leader sending a stale snapshot at index 80
+    uint8_t snap_data[] = "OLD_STATE";
+    raft_msg_t snap = {
+        .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
+        .index = 80, .log_term = 1, .snapshot_data = snap_data, .snapshot_len = 9,
+        .snapshot_done = true
+    };
+    raft_step_remote(r, &snap);
+
+    // The core MUST ignore it, but importantly, MUST NOT reject it (so the leader knows we have the data)
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_FALSE(ready.install_snapshot);
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_FALSE(ready.messages[0].reject); // Acknowledge without applying!
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 80);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -219,6 +245,7 @@ int main(void) {
     MACRO_ADD(tests, snapshot_install_preserves_valid_suffix);
     MACRO_ADD(tests, snapshot_message_contains_confstate);
     MACRO_ADD(tests, lagging_follower_installs_snapshot_and_gets_updated_membership);
+    MACRO_ADD(tests, snapshot_below_last_applied_is_ignored);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;

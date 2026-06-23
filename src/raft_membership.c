@@ -10,15 +10,12 @@
 // MEMBERSHIP DATA HELPERS
 // ============================================================================
 
-// Safely extracts a uint64_t node ID from the payload of a configuration entry.
-// Rejects node ID 0 as it is reserved for 'no sender/no vote'.
 static bool extract_node_id(raft_entry_t* e, uint64_t* out_id) {
     if (!e->data || e->data_len != sizeof(uint64_t)) return false;
     memcpy(out_id, e->data, sizeof(uint64_t));
     return *out_id != 0;
 }
 
-// Searches the active remote peer topology for a specific node ID.
 static bool find_peer_index(raft_t* r, uint64_t node_id, size_t* out_idx) {
     for (size_t i = 0; i < r->num_peers; i++) {
         if (r->peers[i] == node_id) {
@@ -29,8 +26,6 @@ static bool find_peer_index(raft_t* r, uint64_t node_id, size_t* out_idx) {
     return false;
 }
 
-// Clears pending ReadIndex requests. Because membership changes alter quorum,
-// any reads collected under the old voter set are no longer safe to serve.
 static void clear_read_index_state(raft_t* r) {
     for (size_t i = 0; i < MAX_PENDING_READS; i++) {
         r->pending_reads[i].active = false;
@@ -54,22 +49,18 @@ void raft_add_learner(raft_t* r, uint64_t peer_id) {
     }
 
     size_t idx;
-    if (find_peer_index(r, peer_id, &idx)) {
-        // Node already exists. Do not demote a voter!
-        return;
-    }
+    if (find_peer_index(r, peer_id, &idx)) return; // Do not demote a voter!
 
-    // Add brand new remote learner to the topology array
     if (r->num_peers < MAX_REMOTE_PEERS) {
         size_t i = r->num_peers;
         r->peers[i] = peer_id;
         r->is_learner[i] = true;
 
-        // Assume the new learner has no logs, start matching from the current tail
         r->next_index[i] = raft_log_last_index(r) + 1;
         r->match_index[i] = 0;
+        r->snapshot_offset[i] = 0; // Phase 1/3: Reset chunk tracking for new learners
 
-        r->recent_active[i] = true; // Assume active to allow initial probe
+        r->recent_active[i] = true;
         r->peer_read_seq[i] = 0;
         r->voted_for_me[i] = false;
         r->num_peers++;
@@ -87,8 +78,8 @@ void raft_promote_learner(raft_t* r, uint64_t peer_id) {
     size_t idx;
     if (find_peer_index(r, peer_id, &idx)) {
         if (r->is_learner[idx]) {
-            r->is_learner[idx] = false; // Grants the peer voting rights
-            r->recent_active[idx] = false; // Must freshly prove activity as a voter
+            r->is_learner[idx] = false;
+            r->recent_active[idx] = false;
         }
     }
 }
@@ -97,7 +88,7 @@ static void execute_remove_node(raft_t* r, uint64_t peer_id) {
     if (peer_id == r->id) {
         if (r->state == RAFT_STATE_LEADER) {
             r->state = RAFT_STATE_FOLLOWER;
-            r->leader_id = 0; // Explicitly drop authority
+            r->leader_id = 0;
         }
         r->is_learner_self = true;
         r->removed = true;
@@ -115,16 +106,17 @@ static void execute_remove_node(raft_t* r, uint64_t peer_id) {
         r->is_learner[idx] = r->is_learner[last];
         r->next_index[idx] = r->next_index[last];
         r->match_index[idx] = r->match_index[last];
+        r->snapshot_offset[idx] = r->snapshot_offset[last];
         r->recent_active[idx] = r->recent_active[last];
         r->peer_read_seq[idx] = r->peer_read_seq[last];
         r->voted_for_me[idx] = r->voted_for_me[last];
     }
 
-    // Clear the trailing slot to prevent stale data ghosts
     r->peers[last] = 0;
     r->is_learner[last] = false;
     r->next_index[last] = 0;
     r->match_index[last] = 0;
+    r->snapshot_offset[last] = 0;
     r->recent_active[last] = false;
     r->peer_read_seq[last] = 0;
     r->voted_for_me[last] = false;
@@ -141,7 +133,9 @@ void raft_membership_apply_config(raft_t* r, uint64_t index) {
     raft_entry_t* e = raft_log_get(r, index);
     if (!e) return;
 
-    if (e->type == ENTRY_CONF_ADD_LEARNER ||
+    // Phase 3: Route unsafe direct additions through the Learner pattern
+    if (e->type == ENTRY_CONF_ADD ||
+        e->type == ENTRY_CONF_ADD_LEARNER ||
         e->type == ENTRY_CONF_PROMOTE_LEARNER ||
         e->type == ENTRY_CONF_REMOVE) {
 
@@ -152,6 +146,7 @@ void raft_membership_apply_config(raft_t* r, uint64_t index) {
         }
 
         switch (e->type) {
+            case ENTRY_CONF_ADD:
             case ENTRY_CONF_ADD_LEARNER:
                 raft_add_learner(r, node_id);
                 clear_read_index_state(r);
