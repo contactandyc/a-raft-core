@@ -22,7 +22,20 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                 return;
             }
 
+
+
             if (msg->index > r->snapshot_index) {
+                if (r->pending_snapshot_chunk_ready) {
+                    raft_msg_t res = {
+                        .type = MSG_APPEND_RES,
+                        .to = msg->from,
+                        .term = r->current_term,
+                        .reject = true,
+                        .conflict_index = r->expected_snapshot_offset - r->pending_snapshot_len
+                    };
+                    raft_send_msg(r, res);
+                    return;
+                }
                 // Blocker 3: Validate chunk offset
                 if (msg->snapshot_offset == 0) {
                     r->expected_snapshot_offset = 0;

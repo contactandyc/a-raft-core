@@ -151,10 +151,16 @@ MACRO_TEST(snapshot_chunk_duplicate_offset_is_rejected_or_reacked) {
                          .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
     raft_step_remote(node.core, &snap1);
 
+    // FIX: Simulate host consuming Chunk 1 so the core unlocks the next chunk!
+    raft_node_pump(&node); wait_for_pump(&loop);
+
     // 2. Send valid Chunk 2 (Offset 4)
     raft_msg_t snap2 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
                          .snapshot_offset = 4, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
     raft_step_remote(node.core, &snap2);
+
+    // FIX: Simulate host consuming Chunk 2!
+    raft_node_pump(&node); wait_for_pump(&loop);
 
     // 3. Attempt to send Duplicate Chunk 2 (Offset 4) again!
     raft_step_remote(node.core, &snap2);

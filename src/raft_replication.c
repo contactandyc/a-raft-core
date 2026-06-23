@@ -352,17 +352,22 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
     r->recent_active[peer_idx] = true;
 
     if (r->next_index[peer_idx] <= r->snapshot_index) {
-        if (!msg->reject) {
-            if (msg->snapshot_done) {
-                r->match_index[peer_idx] = r->snapshot_index;
-                r->next_index[peer_idx] = r->snapshot_index + 1;
-                r->snapshot_offset[peer_idx] = 0;
-                update_commit_index(r);
-            } else {
-                r->snapshot_offset[peer_idx] = msg->conflict_index;
-            }
+        // FIX 2: Honor rejected snapshot chunk conflict hints
+        if (msg->reject) {
+            r->snapshot_offset[peer_idx] = msg->conflict_index;
             send_append(r, peer_idx);
+            return;
         }
+
+        if (msg->snapshot_done) {
+            r->match_index[peer_idx] = r->snapshot_index;
+            r->next_index[peer_idx] = r->snapshot_index + 1;
+            r->snapshot_offset[peer_idx] = 0;
+            update_commit_index(r);
+        } else {
+            r->snapshot_offset[peer_idx] = msg->conflict_index;
+        }
+        send_append(r, peer_idx);
         return;
     }
 

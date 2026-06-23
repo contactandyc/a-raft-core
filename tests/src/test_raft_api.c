@@ -114,6 +114,44 @@ MACRO_TEST(raft_node_init_rejects_too_many_initial_peers) {
     uv_loop_close(&loop);
 }
 
+MACRO_TEST(node_propose_single_allocation_no_leak_and_queue_failure_checked) {
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_api_alloc; mkdir -p /tmp/raft_api_alloc");
+
+    raft_server_t srv;
+    raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_api_alloc");
+
+    raft_node_t node;
+    uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // Bootstrap Leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(node.core, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(node.core, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(node.core, &vote);
+
+    // Force the inbound queue to reach max capacity intentionally
+    node.inbound_queue_cap = 10001;
+    node.inbound_queue_len = 10001;
+    node.is_flushing = true; // Simulating a stalled I/O flush blocking new local events
+
+    uint8_t payload[] = "VALID_DATA";
+    int err = raft_node_propose(&node, payload, 10, 1, 1, NULL);
+
+    // Assert that the proposal safely bails out with NOMEM when queue hits hard limit
+    MACRO_ASSERT_EQ_INT(err, RAFT_ERR_NOMEM);
+    MACRO_ASSERT_FALSE(node.fatal_error);
+
+    raft_wal_close(&node.wal);
+    raft_destroy(node.core);
+    free(srv.groups);
+    uv_loop_close(&loop);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -123,6 +161,7 @@ int main(void) {
     MACRO_ADD(tests, raft_node_init_rejects_group_id_out_of_bounds);
     MACRO_ADD(tests, node_propose_oversized_payload_returns_error_without_fatal);
     MACRO_ADD(tests, raft_node_init_rejects_too_many_initial_peers);
+    MACRO_ADD(tests, node_propose_single_allocation_no_leak_and_queue_failure_checked);
 
     macro_run_all("raft_api", tests, test_count);
     return 0;

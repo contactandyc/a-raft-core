@@ -1283,6 +1283,55 @@ MACRO_TEST(leader_uses_reject_hints_even_when_follower_log_is_longer) {
     raft_destroy(r);
 }
 
+MACRO_TEST(leader_resends_snapshot_from_conflict_index_on_chunk_reject) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // Become Leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(r, &hup);
+    raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &pv);
+    raft_msg_t vote = { .type = MSG_REQUEST_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
+    raft_step_remote(r, &vote);
+    raft_advance_all_for_tests_only(r);
+
+    // FIX: Seed the log with 10 entries so it can actually be compacted!
+    for (int i=0; i<10; i++) {
+        raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
+        raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
+        raft_step_local(r, &p);
+        raft_msg_t ack = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = false, .index = 2+i };
+        raft_step_remote(r, &ack);
+    }
+    raft_advance_all_for_tests_only(r);
+
+    // Force application up to the end of the log to unlock compaction
+    r->last_applied = 11;
+
+    // Now we can successfully compact at index 10
+    raft_compact_after_snapshot(r, 10, 1);
+
+    // Force node 2 to require a snapshot
+    raft_msg_t req = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 0, .conflict_index = 0 };
+    raft_step_remote(r, &req);
+    raft_advance_all_for_tests_only(r); // Clears the initial snapshot dispatch
+
+    // Simulate Node 2 rejecting an intermediate chunk and requesting offset 1024
+    raft_msg_t rej = { .type = MSG_APPEND_RES, .to = 1, .from = 2, .term = 1, .reject = true, .index = 10, .conflict_index = 1024 };
+    raft_step_remote(r, &rej);
+
+    raft_ready_t ready = raft_get_ready(r);
+
+    // Assert the leader resends starting specifically from the requested conflict index
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_INSTALL_SNAPSHOT);
+    MACRO_ASSERT_EQ_INT(ready.messages[0].snapshot_offset, 1024);
+
+    raft_destroy(r);
+}
+
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1341,6 +1390,7 @@ int main(void) {
     MACRO_ADD(tests, raft_oversized_single_entry_is_rejected_before_replication);
 
     MACRO_ADD(tests, leader_uses_reject_hints_even_when_follower_log_is_longer);
+    MACRO_ADD(tests, leader_resends_snapshot_from_conflict_index_on_chunk_reject);
     macro_run_all("raft_replication", tests, test_count);
     return 0;
 }

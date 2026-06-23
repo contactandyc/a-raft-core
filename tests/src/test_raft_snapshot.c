@@ -288,6 +288,32 @@ MACRO_TEST(leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_to
     raft_destroy(r);
 }
 
+MACRO_TEST(snapshot_next_chunk_before_ack_is_rejected) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    // Send chunk 0
+    uint8_t snap_data[] = "CHUNK1";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 6, .snapshot_done = false };
+    raft_step_remote(r, &snap1);
+
+    // Attempt to push chunk 2 BEFORE clearing ready/acking chunk 1
+    uint8_t snap_data2[] = "CHUNK2";
+    raft_msg_t snap2 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 6, .snapshot_data = snap_data2, .snapshot_len = 6, .snapshot_done = false };
+    raft_step_remote(r, &snap2);
+
+    raft_ready_t ready = raft_get_ready(r);
+
+    // Must reject the second chunk with conflict_index = 0
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    MACRO_ASSERT_EQ_INT(ready.messages[0].conflict_index, 0);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -299,6 +325,7 @@ int main(void) {
     MACRO_ADD(tests, lagging_follower_installs_snapshot_and_gets_updated_membership);
     MACRO_ADD(tests, snapshot_below_last_applied_is_ignored);
     MACRO_ADD(tests, leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_topology);
+    MACRO_ADD(tests, snapshot_next_chunk_before_ack_is_rejected);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;
