@@ -292,6 +292,57 @@ MACRO_TEST(snapshot_discarded_suffix_does_not_resurrect_after_restart) {
     uv_loop_close(&loop2);
 }
 
+MACRO_TEST(snapshot_worker_short_write_or_fsync_failure_rejects_chunk) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // Simulate catastrophic disk permissions error (ReadOnly)
+    system("chmod 400 /tmp/raft_test_pump");
+
+    uint8_t snap_data[] = "SNAP";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+
+    raft_step_remote(node.core, &snap1);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    // I/O thread must detect the fwrite/fsync failure and safely fail the snapshot
+    MACRO_ASSERT_FALSE(node.flush_ctx.snap_success);
+
+    system("chmod 777 /tmp/raft_test_pump"); // Restore for cleanup
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(snapshot_install_does_not_restore_stale_ctx_snapshot_metadata) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // Intentionally poison the async context to simulate a stale meta capture
+    node.flush_ctx.meta_changed = true;
+    node.flush_ctx.snap_idx = 5;
+
+    // Inject a legitimate Snapshot at index 10
+    uint8_t snap_data[] = "SNAP";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true };
+
+    raft_step_remote(node.core, &snap1);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    // Assert the node safely ignored the poisoned ctx.snap_idx and pulled directly from the core
+    MACRO_ASSERT_EQ_INT(node.saved_snap_idx, 10);
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -302,6 +353,8 @@ int main(void) {
     MACRO_ADD(tests, snapshot_chunk_gap_does_not_append_to_tmp_file);
     MACRO_ADD(tests, node_pump_snapshot_install_does_not_consume_stale_ready);
     MACRO_ADD(tests, snapshot_discarded_suffix_does_not_resurrect_after_restart);
+    MACRO_ADD(tests, snapshot_worker_short_write_or_fsync_failure_rejects_chunk);
+    MACRO_ADD(tests, snapshot_install_does_not_restore_stale_ctx_snapshot_metadata);
 
     macro_run_all("raft_pump", tests, test_count);
     return 0;

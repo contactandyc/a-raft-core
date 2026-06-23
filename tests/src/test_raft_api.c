@@ -152,6 +152,40 @@ MACRO_TEST(node_propose_single_allocation_no_leak_and_queue_failure_checked) {
     uv_loop_close(&loop);
 }
 
+MACRO_TEST(node_propose_null_payload_with_nonzero_len_returns_error) {
+    raft_node_t node = {0};
+    // Send a payload of length 10, but provide a NULL pointer
+    int err = raft_node_propose(&node, NULL, 10, 1, 1, NULL);
+    MACRO_ASSERT_EQ_INT(err, -1);
+}
+
+MACRO_TEST(read_index_queue_failure_returns_error) {
+    raft_node_t node = {0};
+    node.is_flushing = true;
+    node.inbound_queue_cap = 10000;
+    node.inbound_queue_len = 10000; // Queue is completely full
+
+    int err = raft_node_read_index(&node, 1, NULL);
+    MACRO_ASSERT_EQ_INT(err, -1); // Must fail cleanly
+}
+
+MACRO_TEST(inbound_queue_cap_exactly_10000_does_not_grow) {
+    raft_node_t node = {0};
+    node.inbound_queue_cap = 10000;
+    node.inbound_queue_len = 10000;
+    node.inbound_queue = malloc(sizeof(raft_msg_t));
+
+    // Simulate internal enqueue call
+    node.is_flushing = true;
+    int err = raft_node_read_index(&node, 1, NULL);
+
+    // Must fail without attempting to realloc
+    MACRO_ASSERT_EQ_INT(err, -1);
+    MACRO_ASSERT_EQ_INT(node.inbound_queue_cap, 10000);
+
+    free(node.inbound_queue);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -162,7 +196,9 @@ int main(void) {
     MACRO_ADD(tests, node_propose_oversized_payload_returns_error_without_fatal);
     MACRO_ADD(tests, raft_node_init_rejects_too_many_initial_peers);
     MACRO_ADD(tests, node_propose_single_allocation_no_leak_and_queue_failure_checked);
-
+    MACRO_ADD(tests, node_propose_null_payload_with_nonzero_len_returns_error);
+    MACRO_ADD(tests, read_index_queue_failure_returns_error);
+    MACRO_ADD(tests, inbound_queue_cap_exactly_10000_does_not_grow);
     macro_run_all("raft_api", tests, test_count);
     return 0;
 }

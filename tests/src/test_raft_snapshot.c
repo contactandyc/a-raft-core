@@ -314,6 +314,24 @@ MACRO_TEST(snapshot_next_chunk_before_ack_is_rejected) {
     raft_destroy(r);
 }
 
+MACRO_TEST(snapshot_chunk_malloc_failure_does_not_advance_expected_offset) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    // Create an impossibly large payload that will guarantee a malloc failure
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"X", .snapshot_len = 0xFFFFFFFFFFFFFFFF, .snapshot_done = false };
+
+    raft_step_remote(r, &snap1);
+
+    // Core must hit fatal_error immediately upon allocation failure,
+    // and critically, the offset must remain safely at 0.
+    MACRO_ASSERT_TRUE(raft_has_fatal_error(r));
+    MACRO_ASSERT_EQ_INT(r->expected_snapshot_offset, 0);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -326,6 +344,7 @@ int main(void) {
     MACRO_ADD(tests, snapshot_below_last_applied_is_ignored);
     MACRO_ADD(tests, leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_topology);
     MACRO_ADD(tests, snapshot_next_chunk_before_ack_is_rejected);
+    MACRO_ADD(tests, snapshot_chunk_malloc_failure_does_not_advance_expected_offset);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;
