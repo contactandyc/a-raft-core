@@ -10,6 +10,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+// Global network limit: 10 MB maximum frame size
+#define RAFT_MAX_FRAME_SIZE (1024 * 1024 * 10)
+
 #define RAFT_OK 0
 #define RAFT_ERR_NOT_LEADER -1
 #define RAFT_ERR_QUEUE_FULL -2
@@ -69,8 +72,12 @@ typedef struct {
     uint64_t read_seq;
     raft_entry_t* entries;
     size_t num_entries;
+
+    // Snapshot Chunking Metadata
     uint8_t* snapshot_data;
     size_t snapshot_len;
+    uint64_t snapshot_offset;
+    bool snapshot_done;
 
     uint64_t* snapshot_peers;
     bool* snapshot_is_learner;
@@ -93,11 +100,14 @@ typedef struct {
     size_t num_committed_entries;
     raft_read_state_t* read_states;
     size_t num_read_states;
+
     bool install_snapshot;
     uint64_t snapshot_index;
     uint64_t snapshot_term;
     uint8_t* snapshot_data;
     size_t snapshot_len;
+    uint64_t snapshot_offset;
+    bool snapshot_done;
 } raft_ready_t;
 
 typedef struct raft_s raft_t;
@@ -140,7 +150,7 @@ bool         raft_has_fatal_error(raft_t* r);
 size_t raft_msg_encoded_size(const raft_msg_t* msg);
 bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap);
 bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg);
-void raft_msg_free_payloads(raft_msg_t* msg); // Cleans up after a decode
+void raft_msg_free_payloads(raft_msg_t* msg);
 bool raft_msg_encoded_size_checked(const raft_msg_t* msg, size_t* out);
 
 #endif // RAFT_H

@@ -116,7 +116,7 @@ void raft_msg_free_payloads(raft_msg_t* msg) {
 }
 
 bool raft_msg_encoded_size_checked(const raft_msg_t* msg, size_t* out) {
-    size_t sz = 86; // Base fixed header size
+    size_t sz = 95; // Base fixed header size (86 + 8 byte offset + 1 byte done flag)
 
     if (!msg || !out) return false;
     if (msg->num_entries > RAFT_MAX_MSG_ENTRIES) return false;
@@ -179,7 +179,12 @@ bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap) {
     write_u8(&p, msg->reject ? 1 : 0);
 
     write_u32(&p, (uint32_t)msg->num_entries);
+
+    // Chunking Expansion
     write_u32(&p, (uint32_t)msg->snapshot_len);
+    write_u64(&p, msg->snapshot_offset);
+    write_u8(&p, msg->snapshot_done ? 1 : 0);
+
     write_u32(&p, (uint32_t)msg->snapshot_num_peers);
 
     for (size_t i = 0; i < msg->num_entries; i++) {
@@ -212,12 +217,12 @@ bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap) {
 bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg) {
     if (!out_msg) return false;
     memset(out_msg, 0, sizeof(raft_msg_t));
-    if (!buf || len > RAFT_MAX_FRAME_SIZE || len < 86) return false;
+    if (!buf || len > RAFT_MAX_FRAME_SIZE || len < 95) return false;
 
     const uint8_t* p = buf;
     size_t rem = len;
 
-    uint8_t type_val, reject_val;
+    uint8_t type_val, reject_val, snap_done;
     uint32_t num_entries, snap_len, num_peers;
 
     if (!read_u8(&p, &rem, &type_val) ||
@@ -233,12 +238,15 @@ bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg) {
         !read_u8(&p, &rem, &reject_val) ||
         !read_u32(&p, &rem, &num_entries) ||
         !read_u32(&p, &rem, &snap_len) ||
+        !read_u64(&p, &rem, &out_msg->snapshot_offset) ||
+        !read_u8(&p, &rem, &snap_done) ||
         !read_u32(&p, &rem, &num_peers)) {
         goto decode_fail;
     }
 
     if (!is_valid_msg_type(type_val)) goto decode_fail;
     if (reject_val > 1) goto decode_fail;
+    if (snap_done > 1) goto decode_fail;
     if (num_entries > RAFT_MAX_MSG_ENTRIES) goto decode_fail;
     if (num_peers > MAX_PEERS) goto decode_fail;
 
@@ -246,6 +254,7 @@ bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg) {
     out_msg->reject = (reject_val != 0);
     out_msg->num_entries = num_entries;
     out_msg->snapshot_len = snap_len;
+    out_msg->snapshot_done = (snap_done != 0);
     out_msg->snapshot_num_peers = num_peers;
 
     if (num_entries > 0) {

@@ -57,7 +57,7 @@ int  raft_wal_flush_batch(raft_wal_t* wal);
 int  raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint64_t* out_cid, uint64_t* out_cseq, uint8_t** out_payload, uint32_t* out_len);
 
 int  raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index);
-void raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index);
+int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index);
 void raft_wal_close(raft_wal_t* wal);
 
 #endif // RAFT_WAL_H

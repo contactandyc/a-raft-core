@@ -89,6 +89,10 @@ static void send_append(raft_t* r, size_t peer_idx) {
         raft_msg_t msg = { .type = MSG_INSTALL_SNAPSHOT, .to = peer_id, .term = r->current_term,
                            .index = r->snapshot_index, .log_term = r->snapshot_term };
 
+        // Safe Chunking Parameters (The server will fill the payload and determine if done)
+        msg.snapshot_offset = r->snapshot_offset[peer_idx];
+        msg.snapshot_done = false;
+
         msg.snapshot_peers = malloc(MAX_PEERS * sizeof(uint64_t));
         msg.snapshot_is_learner = malloc(MAX_PEERS * sizeof(bool));
 
@@ -125,10 +129,8 @@ static void send_append(raft_t* r, size_t peer_idx) {
         raft_entry_t* src = raft_log_get(r, next + i);
         if (!src) break;
 
-        // Defensive subtraction to prevent size manipulation or overflow
         if (src->data_len > 1048576 - batch_bytes) {
             if (actual_entries == 0) {
-                // If a single entry exceeds the frame limit, it can never replicate.
                 r->fatal_error = true;
                 return;
             }
@@ -194,7 +196,6 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
     uint64_t old_last_idx = raft_log_last_index(r);
     bool has_pending_config = false;
 
-    // Raft safety: Allow only one uncommitted configuration change at a time
     for (uint64_t idx = r->commit_index + 1; idx <= old_last_idx; idx++) {
         raft_entry_t* e = raft_log_get(r, idx);
         if (e && e->type != ENTRY_NORMAL) {
@@ -220,7 +221,6 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
         return;
     }
 
-    // Broadcast proactively to peers that are fully caught up
     for (size_t i = 0; i < r->num_peers; i++) {
         if (r->next_index[i] == old_last_idx + 1) {
             send_append(r, i);
@@ -229,14 +229,12 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
 }
 
 static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
-    // Malformed packet check
     if (msg->num_entries > 0 && msg->entries == NULL) {
         raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r) };
         raft_send_msg(r, res);
         return;
     }
 
-    // Acknowledge the leader
     r->state = RAFT_STATE_FOLLOWER;
     r->activity_accepted = true;
     r->leader_id = msg->from;
@@ -245,14 +243,12 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
     uint64_t my_last_idx = raft_log_last_index(r);
 
     if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && raft_log_term(r, msg->index) == msg->log_term) {
-        // Log matches! The payload is safe to apply.
         res.reject = false;
 
         if (msg->num_entries > 0) {
             for (size_t i = 0; i < msg->num_entries; i++) {
                 uint64_t new_idx = msg->index + 1 + i;
 
-                // Assert strict wire metadata validity
                 if ((msg->entries[i].index != 0 && msg->entries[i].index != new_idx) ||
                     (msg->entries[i].term == 0 || msg->entries[i].term > msg->term) ||
                     (msg->entries[i].data_len > 0 && !msg->entries[i].data)) {
@@ -264,7 +260,7 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
 
                 if (new_idx <= my_last_idx && raft_log_term(r, new_idx) == msg->entries[i].term) continue;
                 if (new_idx <= r->commit_index) {
-                    res.reject = true; // Defense against catastrophic leader regressions
+                    res.reject = true;
                     break;
                 }
 
@@ -283,14 +279,12 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
         }
 
     } else if (msg->index < r->snapshot_index) {
-        // Conflict occurs deep in compacted history
         res.reject = true;
         res.index = r->snapshot_index;
         res.conflict_term = 0;
         res.conflict_index = r->snapshot_index + 1;
 
     } else {
-        // Generate backtracking hints to help the leader catch us up faster
         res.reject = true;
         if (msg->index > my_last_idx) {
             res.conflict_index = my_last_idx + 1;
@@ -323,6 +317,22 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
 
     r->recent_active[peer_idx] = true;
 
+    // Snapshot stream acknowledgment check
+    if (r->next_index[peer_idx] <= r->snapshot_index) {
+        if (!msg->reject) {
+            if (msg->snapshot_done) {
+                r->match_index[peer_idx] = r->snapshot_index;
+                r->next_index[peer_idx] = r->snapshot_index + 1;
+                r->snapshot_offset[peer_idx] = 0;
+                update_commit_index(r);
+            } else {
+                r->snapshot_offset[peer_idx] = msg->conflict_index; // Use conflict_index to indicate the next expected offset
+            }
+            send_append(r, peer_idx);
+        }
+        return;
+    }
+
     if (!msg->reject) {
         uint64_t last = raft_log_last_index(r);
         if (msg->index > last) return;
@@ -337,19 +347,16 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
 
         update_commit_index(r);
 
-        // Continue pipelining if the peer is still lagging
         if (r->next_index[peer_idx] <= raft_log_last_index(r)) {
             send_append(r, peer_idx);
         }
 
     } else {
-        // Replication rejected due to log inconsistency
-        if (msg->index > raft_log_last_index(r)) return; // Ignore stale rejections
+        if (msg->index > raft_log_last_index(r)) return;
 
         uint64_t backtrack = find_conflict_backtrack_index(r, msg->conflict_term, msg->conflict_index);
         uint64_t last = raft_log_last_index(r);
 
-        // Strict bounds clamping
         if (backtrack < 1) backtrack = 1;
         if (backtrack > last + 1) backtrack = last + 1;
 

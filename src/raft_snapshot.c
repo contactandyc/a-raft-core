@@ -15,10 +15,17 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
             r->leader_id = msg->from;
 
             if (msg->index > r->snapshot_index) {
-                r->pending_snapshot = true;
-                r->pending_snapshot_from = msg->from;
-                r->pending_snapshot_msg_index = msg->index;
-                r->pending_snapshot_msg_term = msg->log_term;
+                if (msg->snapshot_offset == 0) {
+                    r->pending_snapshot = true;
+                    r->pending_snapshot_from = msg->from;
+                    r->pending_snapshot_msg_index = msg->index;
+                    r->pending_snapshot_msg_term = msg->log_term;
+                    r->pending_snapshot_num_peers = msg->snapshot_num_peers;
+                    for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
+                        r->pending_snapshot_peers[i] = msg->snapshot_peers[i];
+                        r->pending_snapshot_is_learner[i] = msg->snapshot_is_learner[i];
+                    }
+                }
 
                 if (r->pending_snapshot_data) free(r->pending_snapshot_data);
                 r->pending_snapshot_data = msg->snapshot_len > 0 ? malloc(msg->snapshot_len) : NULL;
@@ -26,13 +33,8 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                     memcpy(r->pending_snapshot_data, msg->snapshot_data, msg->snapshot_len);
                 }
                 r->pending_snapshot_len = msg->snapshot_len;
-
-                // PHASE 17: Stage the newly received ConfState topology!
-                r->pending_snapshot_num_peers = msg->snapshot_num_peers;
-                for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
-                    r->pending_snapshot_peers[i] = msg->snapshot_peers[i];
-                    r->pending_snapshot_is_learner[i] = msg->snapshot_is_learner[i];
-                }
+                r->pending_snapshot_offset = msg->snapshot_offset;
+                r->pending_snapshot_done = msg->snapshot_done;
 
             } else {
                 raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = msg->index };
@@ -48,7 +50,15 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
 void raft_snapshot_acked(raft_t* r, bool success) {
     if (!r->pending_snapshot) return;
 
-    if (success) {
+    // FIX: Only report the snapshot's index if it was fully and successfully installed.
+    // Otherwise, report our actual, intact local index.
+    raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
+                       .reject = !success,
+                       .index = (success && r->pending_snapshot_done) ? r->pending_snapshot_msg_index : raft_log_last_index(r),
+                       .snapshot_done = r->pending_snapshot_done,
+                       .conflict_index = r->pending_snapshot_offset + r->pending_snapshot_len };
+
+    if (success && r->pending_snapshot_done) {
         bool suffix_match = false;
         uint64_t my_last_idx = raft_log_last_index(r);
 
@@ -82,7 +92,6 @@ void raft_snapshot_acked(raft_t* r, bool success) {
         if (r->commit_index < r->snapshot_index) r->commit_index = r->snapshot_index;
         if (r->last_applied < r->snapshot_index) r->last_applied = r->snapshot_index;
 
-        // PHASE 17: Execute Atomic Topology Overwrite!
         if (r->pending_snapshot_num_peers > 0) {
             r->num_peers = 0;
             bool found_self = false;
@@ -95,7 +104,6 @@ void raft_snapshot_acked(raft_t* r, bool success) {
                     if (r->num_peers < MAX_PEERS) {
                         r->peers[r->num_peers] = r->pending_snapshot_peers[i];
                         r->is_learner[r->num_peers] = r->pending_snapshot_is_learner[i];
-                        // Boot new nodes at snapshot_index + 1, retaining match_index for existing ones if possible
                         r->next_index[r->num_peers] = r->snapshot_index + 1;
                         r->match_index[r->num_peers] = 0;
                         r->recent_active[r->num_peers] = false;
@@ -104,7 +112,6 @@ void raft_snapshot_acked(raft_t* r, bool success) {
                 }
             }
             if (!found_self) {
-                // We are no longer part of the cluster according to the latest snapshot
                 r->removed = true;
                 r->is_learner_self = true;
                 r->state = RAFT_STATE_FOLLOWER;
@@ -112,13 +119,16 @@ void raft_snapshot_acked(raft_t* r, bool success) {
         }
     }
 
-    raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
-                       .reject = !success, .index = success ? r->snapshot_index : raft_log_last_index(r) };
     raft_send_msg(r, res);
 
     if (r->pending_snapshot_data) free(r->pending_snapshot_data);
     r->pending_snapshot_data = NULL;
     r->pending_snapshot_len = 0;
-    r->pending_snapshot = false;
-    r->pending_snapshot_num_peers = 0;
+
+    if (r->pending_snapshot_done || !success) {
+        r->pending_snapshot = false;
+        r->pending_snapshot_num_peers = 0;
+        r->pending_snapshot_offset = 0;
+        r->pending_snapshot_done = false;
+    }
 }

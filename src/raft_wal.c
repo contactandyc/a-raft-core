@@ -15,12 +15,42 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <errno.h>
+
+#define WAL_V2_MAGIC 0x57414C32
+#define WAL_V2_SEG_HEADER_SIZE 20
+#define WAL_V2_FRAME_HEADER_SIZE 41
+#define WAL_V2_MAX_PAYLOAD_SIZE (8 * 1024 * 1024)
+
+// -----------------------------------------------------------------------------
+// PORTABLE ENDIAN I/O HELPERS
+// -----------------------------------------------------------------------------
+
+static void pack_u32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)(v);
+}
+
+static void pack_u64(uint8_t* p, uint64_t v) {
+    p[0] = (uint8_t)(v >> 56); p[1] = (uint8_t)(v >> 48);
+    p[2] = (uint8_t)(v >> 40); p[3] = (uint8_t)(v >> 32);
+    p[4] = (uint8_t)(v >> 24); p[5] = (uint8_t)(v >> 16);
+    p[6] = (uint8_t)(v >> 8);  p[7] = (uint8_t)(v);
+}
+
+static uint32_t unpack_u32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t unpack_u64(const uint8_t* p) {
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) | ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) | ((uint64_t)p[6] << 8)  | (uint64_t)p[7];
+}
 
 // -----------------------------------------------------------------------------
 // INTERNAL UTILITIES
 // -----------------------------------------------------------------------------
 
-// PHASE 2: Separated update from finalize so we can chain the CRC safely
 static uint32_t crc32_update(uint32_t crc, const void *buf, size_t size) {
     const uint8_t *p = buf;
     while (size--) {
@@ -30,8 +60,48 @@ static uint32_t crc32_update(uint32_t crc, const void *buf, size_t size) {
     return crc;
 }
 
-static uint32_t crc32(const void *buf, size_t size) {
-    return ~crc32_update(~0U, buf, size);
+static ssize_t safe_pread(int fd, void *buf, size_t count, off_t offset) {
+    size_t total = 0;
+    while (total < count) {
+        ssize_t res = pread(fd, (uint8_t*)buf + total, count - total, offset + total);
+        if (res < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (res == 0) break;
+        total += res;
+    }
+    return total;
+}
+
+static ssize_t safe_pwrite(int fd, const void *buf, size_t count, off_t offset) {
+    size_t total = 0;
+    while (total < count) {
+        ssize_t res = pwrite(fd, (const uint8_t*)buf + total, count - total, offset + total);
+        if (res < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (res == 0) break;
+        total += res;
+    }
+    return total;
+}
+
+static bool sync_file(int fd) {
+#ifdef __APPLE__
+    return fcntl(fd, F_FULLFSYNC, 0) == 0;
+#else
+    return fdatasync(fd) == 0;
+#endif
+}
+
+static bool sync_dir(const char* dir_path) {
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd < 0) return false;
+    bool ok = sync_file(dir_fd);
+    close(dir_fd);
+    return ok;
 }
 
 static int preallocate_file(int fd, uint64_t size) {
@@ -45,15 +115,37 @@ static int preallocate_file(int fd, uint64_t size) {
 }
 
 static void get_segment_path(raft_wal_t* wal, uint64_t seg_id, char* out_path) {
-    snprintf(out_path, 1024, "%s/%010llu.wal", wal->base_dir, seg_id);
+    snprintf(out_path, 1024, "%s/%010llu.wal", wal->base_dir, (unsigned long long)seg_id);
 }
 
-static void ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
+static bool read_segment_header(int fd, uint64_t expected_seg_id, uint64_t* out_start_index) {
+    uint8_t hdr[WAL_V2_SEG_HEADER_SIZE];
+
+    if (safe_pread(fd, hdr, sizeof(hdr), 0) != sizeof(hdr)) return false;
+
+    uint32_t magic = unpack_u32(hdr);
+    uint64_t seg_id = unpack_u64(hdr + 4);
+    uint64_t start_index = unpack_u64(hdr + 12);
+
+    if (magic != WAL_V2_MAGIC) return false;
+    if (expected_seg_id != 0 && seg_id != expected_seg_id) return false;
+    if (start_index == 0) return false;
+
+    if (out_start_index) *out_start_index = start_index;
+    return true;
+}
+
+static bool ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
     if (index >= wal->offsets_cap) {
         uint64_t new_cap = wal->offsets_cap == 0 ? 1024 : wal->offsets_cap * 2;
-        while (index >= new_cap) new_cap *= 2;
+        while (index >= new_cap) {
+            if (new_cap > UINT64_MAX / 2) return false;
+            new_cap *= 2;
+        }
 
         raft_wal_loc_t* new_offsets = aml_calloc(new_cap, sizeof(raft_wal_loc_t));
+        if (!new_offsets) return false;
+
         if (wal->offsets) {
             memcpy(new_offsets, wal->offsets, wal->offsets_cap * sizeof(raft_wal_loc_t));
             aml_free(wal->offsets);
@@ -61,96 +153,156 @@ static void ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
         wal->offsets = new_offsets;
         wal->offsets_cap = new_cap;
     }
+    return true;
 }
 
 // -----------------------------------------------------------------------------
 // LIFECYCLE & RECOVERY
 // -----------------------------------------------------------------------------
+
 int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, uint32_t max_standby) {
+    if (!wal) return -1;
+
     memset(wal, 0, sizeof(raft_wal_t));
-    strncpy(wal->base_dir, dir, sizeof(wal->base_dir) - 1);
-    wal->segment_size_bytes = segment_size_mb * 1024 * 1024;
-    wal->max_standby = max_standby;
-    wal->standby_paths = aml_malloc(sizeof(char*) * max_standby);
-    wal->batch_cap = 65536;
-    wal->batch_buf = aml_malloc(wal->batch_cap);
+    wal->active_fd = -1;
     wal->read_fd = -1;
 
-    mkdir(dir, 0755);
+    if (!dir || segment_size_mb == 0) return -1;
+
+    uint64_t seg_bytes = segment_size_mb * 1024 * 1024;
+    // CRITICAL: Ensure segment size fits safely within a uint32_t offset map boundary
+    if (seg_bytes > UINT32_MAX || seg_bytes < WAL_V2_SEG_HEADER_SIZE + WAL_V2_FRAME_HEADER_SIZE) {
+        return -1;
+    }
+
+    strncpy(wal->base_dir, dir, sizeof(wal->base_dir) - 1);
+    wal->segment_size_bytes = seg_bytes;
+    wal->max_standby = max_standby;
+
+    wal->standby_paths = max_standby > 0 ? aml_malloc(sizeof(char*) * max_standby) : NULL;
+    if (max_standby > 0 && !wal->standby_paths) goto init_fail;
+
+    wal->batch_cap = 65536;
+    wal->batch_buf = aml_malloc(wal->batch_cap);
+    if (!wal->batch_buf) goto init_fail;
+
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) goto init_fail;
+    if (!sync_dir(dir)) goto init_fail;
 
     uint64_t min_seg = UINT64_MAX, max_seg = 0;
     DIR *dp = opendir(dir);
-    struct dirent *ep;
+    if (!dp) goto init_fail;
 
-    if (dp) {
-        while ((ep = readdir(dp))) {
-            if (strncmp(ep->d_name, "standby_", 8) == 0) {
-                if (wal->standby_count < wal->max_standby) {
-                    wal->standby_paths[wal->standby_count++] = aml_strdupf("%s/%s", dir, ep->d_name);
-                } else {
-                    char excess[1024]; snprintf(excess, 1024, "%s/%s", dir, ep->d_name);
-                    unlink(excess);
-                }
-            } else if (strstr(ep->d_name, ".wal")) {
-                uint64_t seg_id;
-                if (sscanf(ep->d_name, "%llu.wal", (unsigned long long*)&seg_id) == 1) {
-                    if (seg_id < min_seg) min_seg = seg_id;
-                    if (seg_id > max_seg) max_seg = seg_id;
-                }
+    struct dirent *ep;
+    while ((ep = readdir(dp))) {
+        if (strncmp(ep->d_name, "standby_", 8) == 0) {
+            if (wal->standby_count < wal->max_standby) {
+                char* sp = aml_strdupf("%s/%s", dir, ep->d_name);
+                if (sp) wal->standby_paths[wal->standby_count++] = sp;
+            } else {
+                char excess[1024]; snprintf(excess, 1024, "%s/%s", dir, ep->d_name);
+                unlink(excess);
+            }
+        } else if (strstr(ep->d_name, ".wal")) {
+            uint64_t seg_id;
+            if (sscanf(ep->d_name, "%llu.wal", (unsigned long long*)&seg_id) == 1) {
+                if (seg_id < min_seg) min_seg = seg_id;
+                if (seg_id > max_seg) max_seg = seg_id;
             }
         }
-        closedir(dp);
     }
+    closedir(dp);
 
     if (max_seg == 0) {
         wal->oldest_seg_id = 1;
         wal->current_seg_id = 1;
-        wal->file_offset = RAFT_WAL_SEG_HEADER_SIZE;
+        wal->file_offset = WAL_V2_SEG_HEADER_SIZE;
+        wal->max_disk_index = 0;
 
-        char path[1024]; get_segment_path(wal, 1, path);
-        wal->active_fd = open(path, O_RDWR | O_CREAT, 0644);
-        preallocate_file(wal->active_fd, wal->segment_size_bytes);
+        // Temp-then-rename for initial creation guarantees durability bounds
+        char tmp_path[1024]; snprintf(tmp_path, 1024, "%s/init.tmp", wal->base_dir);
+        char final_path[1024]; get_segment_path(wal, 1, final_path);
 
-        uint32_t magic = RAFT_WAL_MAGIC;
-        uint64_t start_idx = 1;
-        pwrite(wal->active_fd, &magic, 4, 0);
-        pwrite(wal->active_fd, &wal->current_seg_id, 8, 4);
-        pwrite(wal->active_fd, &start_idx, 8, 12);
+        int fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) goto init_fail;
+
+        if (preallocate_file(fd, wal->segment_size_bytes) != 0) { close(fd); goto init_fail; }
+
+        uint8_t hdr[WAL_V2_SEG_HEADER_SIZE];
+        pack_u32(hdr, WAL_V2_MAGIC);
+        pack_u64(hdr + 4, wal->current_seg_id);
+        pack_u64(hdr + 12, 1);
+
+        if (safe_pwrite(fd, hdr, WAL_V2_SEG_HEADER_SIZE, 0) != WAL_V2_SEG_HEADER_SIZE) { close(fd); goto init_fail; }
+        if (!sync_file(fd)) { close(fd); goto init_fail; }
+
+        if (rename(tmp_path, final_path) != 0) { close(fd); goto init_fail; }
+        if (!sync_dir(wal->base_dir)) { close(fd); goto init_fail; }
+
+        wal->active_fd = fd;
         return 0;
     }
 
     wal->oldest_seg_id = min_seg;
     wal->current_seg_id = max_seg;
+    uint64_t expected_index = 0;
+    bool index_established = false;
 
     for (uint64_t seg = min_seg; seg <= max_seg; seg++) {
         char path[1024]; get_segment_path(wal, seg, path);
         int fd = open(path, O_RDWR);
-        if (fd < 0) continue;
+        if (fd < 0) goto init_fail;
 
-        uint64_t offset = RAFT_WAL_SEG_HEADER_SIZE;
+        uint64_t seg_start_index;
+        if (!read_segment_header(fd, seg, &seg_start_index)) {
+            close(fd); goto init_fail;
+        }
+
+        if (!index_established) {
+            expected_index = seg_start_index;
+            index_established = true;
+            wal->max_disk_index = expected_index - 1;
+        } else if (seg_start_index != expected_index) {
+            close(fd); goto init_fail;
+        }
+
+        uint64_t offset = WAL_V2_SEG_HEADER_SIZE;
         bool torn_write = false;
 
         while (offset < wal->segment_size_bytes) {
-            uint8_t header[RAFT_WAL_FRAME_HEADER_SIZE];
-            if (pread(fd, header, RAFT_WAL_FRAME_HEADER_SIZE, offset) != RAFT_WAL_FRAME_HEADER_SIZE) break;
+            uint8_t header[WAL_V2_FRAME_HEADER_SIZE];
+            if (safe_pread(fd, header, WAL_V2_FRAME_HEADER_SIZE, offset) != WAL_V2_FRAME_HEADER_SIZE) break;
 
-            uint32_t stored_crc, len; uint64_t term, index; uint8_t type;
-            memcpy(&stored_crc, header, 4); memcpy(&len, header + 4, 4);
-            memcpy(&term, header + 8, 8); memcpy(&index, header + 16, 8);
-            type = header[24];
-            (void)type;
+            uint32_t stored_crc = unpack_u32(header);
+            uint32_t len = unpack_u32(header + 4);
+            uint64_t index = unpack_u64(header + 16);
 
-            if (len == 0 && index == 0) break;
+            if (len == 0 && index == 0) break; // End of valid data stream
 
-            uint8_t* payload = len > 0 ? aml_malloc(len) : NULL;
-            if (len > 0 && pread(fd, payload, len, offset + RAFT_WAL_FRAME_HEADER_SIZE) != len) {
+            uint64_t frame_total = (uint64_t)WAL_V2_FRAME_HEADER_SIZE + len;
+            if (len > WAL_V2_MAX_PAYLOAD_SIZE || frame_total > wal->segment_size_bytes - offset) {
                 torn_write = true;
-                if (payload) aml_free(payload);
                 break;
             }
 
-            // PHASE 7 FIX: Calculate CRC over the new 37-byte metadata slice!
-            uint32_t computed_crc = crc32_update(~0U, header + 4, 37);
+            if (index == 0 || index <= wal->max_disk_index || index != expected_index) {
+                close(fd); goto init_fail;
+            }
+
+            uint8_t* payload = NULL;
+            if (len > 0) {
+                payload = aml_malloc(len);
+                if (!payload) {
+                    close(fd); goto init_fail;
+                }
+                if (safe_pread(fd, payload, len, offset + WAL_V2_FRAME_HEADER_SIZE) != len) {
+                    torn_write = true;
+                    aml_free(payload);
+                    break;
+                }
+            }
+
+            uint32_t computed_crc = crc32_update(~0U, header + 4, WAL_V2_FRAME_HEADER_SIZE - 4);
             if (len > 0) computed_crc = crc32_update(computed_crc, payload, len);
             computed_crc = ~computed_crc;
 
@@ -161,70 +313,121 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
             }
             if (payload) aml_free(payload);
 
-            ensure_offset_capacity(wal, index);
+            if (!ensure_offset_capacity(wal, index)) { close(fd); goto init_fail; }
             wal->offsets[index].seg_id = seg;
             wal->offsets[index].offset = offset;
             wal->max_disk_index = index;
+            expected_index++;
 
-            offset += RAFT_WAL_FRAME_HEADER_SIZE + len;
+            offset += frame_total;
         }
 
-        if (torn_write || seg == max_seg) {
+        if (torn_write) {
+            if (seg < max_seg) {
+                close(fd); goto init_fail;
+            }
+
             wal->current_seg_id = seg;
             wal->active_fd = fd;
             wal->file_offset = offset;
-            ftruncate(fd, offset);
 
-            for (uint64_t bad_seg = seg + 1; bad_seg <= max_seg; bad_seg++) {
-                char bad_path[1024]; get_segment_path(wal, bad_seg, bad_path);
-                unlink(bad_path);
-            }
+            if (ftruncate(fd, offset) != 0) goto init_fail;
+            if (!sync_file(fd)) goto init_fail;
+
             break;
         }
-        close(fd);
+
+        if (seg == max_seg) {
+            wal->active_fd = fd;
+            wal->file_offset = offset;
+        } else {
+            close(fd);
+        }
     }
     return 0;
+
+init_fail:
+    raft_wal_close(wal);
+    return -1;
 }
 
 // -----------------------------------------------------------------------------
 // APPEND & ROTATE
 // -----------------------------------------------------------------------------
 
-static void raft_wal_rotate(raft_wal_t* wal, uint64_t next_seq) {
+static int raft_wal_rotate(raft_wal_t* wal, uint64_t next_seq) {
+    if (!wal || wal->active_fd < 0) return -1;
+
     close(wal->active_fd);
+    wal->active_fd = -1;
     wal->current_seg_id++;
 
-    char new_path[1024]; get_segment_path(wal, wal->current_seg_id, new_path);
+    char tmp_path[1024];
+    snprintf(tmp_path, 1024, "%s/rotate_%010llu.tmp", wal->base_dir, (unsigned long long)wal->current_seg_id);
+    char final_path[1024];
+    get_segment_path(wal, wal->current_seg_id, final_path);
+
+    int fd = -1;
 
     if (wal->standby_count > 0) {
+        uint32_t slot = wal->standby_count - 1;
+        char* standby_path = wal->standby_paths[slot];
+
+        if (rename(standby_path, tmp_path) != 0) return -1;
+
         wal->standby_count--;
-        char* standby_path = wal->standby_paths[wal->standby_count];
-        rename(standby_path, new_path);
+        wal->standby_paths[slot] = NULL;
         aml_free(standby_path);
-        wal->active_fd = open(new_path, O_RDWR);
+
+        fd = open(tmp_path, O_RDWR);
+        if (fd < 0) return -1;
+
+        if (ftruncate(fd, 0) != 0) { close(fd); return -1; }
     } else {
-        wal->active_fd = open(new_path, O_RDWR | O_CREAT, 0644);
-        preallocate_file(wal->active_fd, wal->segment_size_bytes);
+        fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return -1;
     }
 
-    uint32_t magic = RAFT_WAL_MAGIC;
-    pwrite(wal->active_fd, &magic, 4, 0);
-    pwrite(wal->active_fd, &wal->current_seg_id, 8, 4);
-    pwrite(wal->active_fd, &next_seq, 8, 12);
+    if (preallocate_file(fd, wal->segment_size_bytes) != 0) { close(fd); return -1; }
 
-    wal->file_offset = RAFT_WAL_SEG_HEADER_SIZE;
+    uint8_t hdr[WAL_V2_SEG_HEADER_SIZE];
+    pack_u32(hdr, WAL_V2_MAGIC);
+    pack_u64(hdr + 4, wal->current_seg_id);
+    pack_u64(hdr + 12, next_seq);
+
+    if (safe_pwrite(fd, hdr, WAL_V2_SEG_HEADER_SIZE, 0) != WAL_V2_SEG_HEADER_SIZE) { close(fd); return -1; }
+    if (!sync_file(fd)) { close(fd); return -1; }
+
+    // Atomic promotion to final segment prevents crash window corruption
+    if (rename(tmp_path, final_path) != 0) { close(fd); return -1; }
+    if (!sync_dir(wal->base_dir)) { close(fd); return -1; }
+
+    wal->active_fd = fd;
+    wal->file_offset = WAL_V2_SEG_HEADER_SIZE;
+    return 0;
 }
 
 int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type, uint64_t client_id, uint64_t client_seq, const uint8_t* payload, uint32_t len) {
-    uint32_t total_size = RAFT_WAL_FRAME_HEADER_SIZE + len;
+    if (!wal || wal->active_fd < 0 || !wal->batch_buf) return -1;
+    if (len > 0 && !payload) return -1;
+    if (len > WAL_V2_MAX_PAYLOAD_SIZE) return -1;
+    if (index == 0 || index != wal->max_disk_index + 1) return -1;
+
+    uint64_t total_size = (uint64_t)WAL_V2_FRAME_HEADER_SIZE + len;
+    if (total_size > wal->segment_size_bytes - WAL_V2_SEG_HEADER_SIZE) return -1;
 
     if (wal->file_offset + wal->batch_len + total_size > wal->segment_size_bytes) {
-        raft_wal_flush_batch(wal);
-        raft_wal_rotate(wal, index);
+        if (raft_wal_flush_batch(wal) != 0) return -1;
+        if (raft_wal_rotate(wal, index) != 0) return -1;
     }
 
-    if (wal->batch_len + total_size > wal->batch_cap) {
-        size_t new_cap = (wal->batch_len + total_size) * 2;
+    size_t needed = wal->batch_len + total_size;
+    if (needed > wal->batch_cap) {
+        size_t new_cap = wal->batch_cap;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) return -1;
+            new_cap *= 2;
+        }
         uint8_t *new_buf = aml_realloc(wal->batch_buf, new_cap);
         if (!new_buf) return -1;
         wal->batch_buf = new_buf;
@@ -233,21 +436,22 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
 
     uint8_t* ptr = wal->batch_buf + wal->batch_len;
 
-    memcpy(ptr + 4, &len, 4);
-    memcpy(ptr + 8, &term, 8);
-    memcpy(ptr + 16, &index, 8);
+    pack_u32(ptr + 4, len);
+    pack_u64(ptr + 8, term);
+    pack_u64(ptr + 16, index);
     ptr[24] = type;
-    memcpy(ptr + 25, &client_id, 8);
-    memcpy(ptr + 33, &client_seq, 8);
-    if (len > 0) memcpy(ptr + RAFT_WAL_FRAME_HEADER_SIZE, payload, len);
+    pack_u64(ptr + 25, client_id);
+    pack_u64(ptr + 33, client_seq);
 
-    uint32_t crc = crc32_update(~0U, ptr + 4, 37);
+    if (len > 0) memcpy(ptr + WAL_V2_FRAME_HEADER_SIZE, payload, len);
+
+    uint32_t crc = crc32_update(~0U, ptr + 4, WAL_V2_FRAME_HEADER_SIZE - 4);
     if (len > 0) crc = crc32_update(crc, payload, len);
     crc = ~crc;
 
-    memcpy(ptr, &crc, 4);
+    pack_u32(ptr, crc);
 
-    ensure_offset_capacity(wal, index);
+    if (!ensure_offset_capacity(wal, index)) return -1;
     wal->offsets[index].seg_id = wal->current_seg_id;
     wal->offsets[index].offset = wal->file_offset + wal->batch_len;
     wal->max_disk_index = index;
@@ -256,105 +460,160 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
 }
 
 int raft_wal_flush_batch(raft_wal_t* wal) {
+    if (!wal || wal->active_fd < 0 || !wal->batch_buf) return -1;
     if (wal->batch_len == 0) return 0;
-    if (pwrite(wal->active_fd, wal->batch_buf, wal->batch_len, wal->file_offset) != wal->batch_len) return -1;
-    wal->file_offset += wal->batch_len;
+
+    uint32_t batch_len = wal->batch_len;
+    uint64_t offset = wal->file_offset;
+
+    if (safe_pwrite(wal->active_fd, wal->batch_buf, batch_len, offset) != batch_len) {
+        return -1;
+    }
+
+    if (!sync_file(wal->active_fd)) {
+        return -1;
+    }
+
+    wal->file_offset += batch_len;
     wal->batch_len = 0;
-#ifdef __APPLE__
-    fcntl(wal->active_fd, F_FULLFSYNC, 0);
-#else
-    fdatasync(wal->active_fd);
-#endif
     return 0;
 }
 
 // -----------------------------------------------------------------------------
 // READ CACHE
 // -----------------------------------------------------------------------------
+
 int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint64_t* out_cid, uint64_t* out_cseq, uint8_t** out_payload, uint32_t* out_len) {
-    if (target_index == 0 || target_index > wal->max_disk_index) return 0;
+    if (!wal || !out_term || !out_type || !out_cid || !out_cseq || !out_payload || !out_len) return 0;
+    if (target_index == 0 || target_index > wal->max_disk_index || target_index >= wal->offsets_cap) return 0;
 
     raft_wal_loc_t loc = wal->offsets[target_index];
     if (loc.seg_id == 0) return 0;
 
+    if (loc.offset > wal->segment_size_bytes) return 0;
+    if (WAL_V2_FRAME_HEADER_SIZE > wal->segment_size_bytes - loc.offset) return 0;
+
     if (wal->read_seg_id != loc.seg_id) {
-        if (wal->read_fd >= 0) close(wal->read_fd);
+        if (wal->read_fd >= 0) {
+            close(wal->read_fd);
+            wal->read_fd = -1;
+            wal->read_seg_id = 0;
+        }
+
         char path[1024]; get_segment_path(wal, loc.seg_id, path);
-        wal->read_fd = open(path, O_RDONLY);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return 0;
+
+        wal->read_fd = fd;
         wal->read_seg_id = loc.seg_id;
     }
 
-    uint8_t header[RAFT_WAL_FRAME_HEADER_SIZE];
-    if (pread(wal->read_fd, header, RAFT_WAL_FRAME_HEADER_SIZE, loc.offset) != RAFT_WAL_FRAME_HEADER_SIZE) return 0;
+    uint8_t header[WAL_V2_FRAME_HEADER_SIZE];
+    if (safe_pread(wal->read_fd, header, WAL_V2_FRAME_HEADER_SIZE, loc.offset) != WAL_V2_FRAME_HEADER_SIZE) return 0;
 
-    uint32_t stored_crc, len;
-    memcpy(&stored_crc, header, 4);
-    memcpy(&len, header + 4, 4);
-    memcpy(out_term, header + 8, 8);
-    *out_type = header[24];
-    memcpy(out_cid, header + 25, 8);
-    memcpy(out_cseq, header + 33, 8);
-    *out_len = len;
+    uint32_t stored_crc = unpack_u32(header);
+    uint32_t len = unpack_u32(header + 4);
+    uint64_t term = unpack_u64(header + 8);
+    uint64_t frame_index = unpack_u64(header + 16);
+
+    if (frame_index != target_index) return 0;
+
+    uint64_t frame_total = (uint64_t)WAL_V2_FRAME_HEADER_SIZE + len;
+    if (len > WAL_V2_MAX_PAYLOAD_SIZE || frame_total > wal->segment_size_bytes - loc.offset) return 0;
+
+    uint8_t type = header[24];
+    uint64_t cid = unpack_u64(header + 25);
+    uint64_t cseq = unpack_u64(header + 33);
+    uint8_t* payload = NULL;
 
     if (len > 0) {
-        *out_payload = aml_malloc(len);
-        if (!*out_payload) return 0;
-        if (pread(wal->read_fd, *out_payload, len, loc.offset + RAFT_WAL_FRAME_HEADER_SIZE) != len) {
-            aml_free(*out_payload);
-            *out_payload = NULL;
+        payload = aml_malloc(len);
+        if (!payload) return 0;
+        if (safe_pread(wal->read_fd, payload, len, loc.offset + WAL_V2_FRAME_HEADER_SIZE) != len) {
+            aml_free(payload);
             return 0;
         }
-    } else {
-        *out_payload = NULL;
     }
 
-    uint32_t computed_crc = crc32_update(~0U, header + 4, 37);
-    if (len > 0) computed_crc = crc32_update(computed_crc, *out_payload, len);
+    uint32_t computed_crc = crc32_update(~0U, header + 4, WAL_V2_FRAME_HEADER_SIZE - 4);
+    if (len > 0) computed_crc = crc32_update(computed_crc, payload, len);
     computed_crc = ~computed_crc;
 
     if (stored_crc != computed_crc) {
-        if (*out_payload) aml_free(*out_payload);
-        *out_payload = NULL;
+        if (payload) aml_free(payload);
         return 0;
     }
 
+    *out_term = term;
+    *out_type = type;
+    *out_cid = cid;
+    *out_cseq = cseq;
+    *out_len = len;
+    *out_payload = payload;
+
     return 1;
 }
+
 // -----------------------------------------------------------------------------
 // TAIL TRUNCATION (Raft Conflicts)
 // -----------------------------------------------------------------------------
 
 int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
-    if (truncate_from_index > wal->max_disk_index) return 0;
+    if (!wal || wal->active_fd < 0) return -1;
+    if (truncate_from_index == 0 || truncate_from_index > wal->max_disk_index || truncate_from_index >= wal->offsets_cap) return -1;
 
-    raft_wal_flush_batch(wal);
     raft_wal_loc_t loc = wal->offsets[truncate_from_index];
+    if (loc.seg_id == 0) return -1;
+
+    if (raft_wal_flush_batch(wal) != 0) return -1;
 
     if (wal->current_seg_id != loc.seg_id) {
-        close(wal->active_fd);
+        if (wal->active_fd >= 0) {
+            close(wal->active_fd);
+            wal->active_fd = -1;
+        }
 
         for (uint64_t bad_seg = wal->current_seg_id; bad_seg > loc.seg_id; bad_seg--) {
             char bad_path[1024]; get_segment_path(wal, bad_seg, bad_path);
+
+            if (wal->read_fd >= 0 && wal->read_seg_id == bad_seg) {
+                close(wal->read_fd);
+                wal->read_fd = -1;
+                wal->read_seg_id = 0;
+            }
+
             if (wal->standby_count < wal->max_standby) {
-                char* standby_path = aml_strdupf("%s/standby_%llu_%u.wal", wal->base_dir, (unsigned long long)time(NULL), wal->standby_count);
-                rename(bad_path, standby_path);
-                wal->standby_paths[wal->standby_count++] = standby_path;
+                char* standby_path = aml_strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)bad_seg, wal->standby_count);
+                if (standby_path && rename(bad_path, standby_path) == 0) {
+                    wal->standby_paths[wal->standby_count++] = standby_path;
+                } else {
+                    if (standby_path) aml_free(standby_path);
+                    if (unlink(bad_path) != 0) return -1;
+                }
             } else {
-                unlink(bad_path);
+                if (unlink(bad_path) != 0) return -1;
             }
         }
+        if (!sync_dir(wal->base_dir)) return -1;
 
         char path[1024]; get_segment_path(wal, loc.seg_id, path);
         wal->active_fd = open(path, O_RDWR);
+        if (wal->active_fd < 0) return -1;
         wal->current_seg_id = loc.seg_id;
     }
 
-    ftruncate(wal->active_fd, loc.offset);
-#ifdef __APPLE__
-    fcntl(wal->active_fd, F_FULLFSYNC, 0);
-#else
-    fdatasync(wal->active_fd);
-#endif
+    if (wal->read_fd >= 0 && wal->read_seg_id >= loc.seg_id) {
+        close(wal->read_fd);
+        wal->read_fd = -1;
+        wal->read_seg_id = 0;
+    }
+
+    if (ftruncate(wal->active_fd, loc.offset) != 0) return -1;
+    if (!sync_file(wal->active_fd)) return -1;
+
+    for (uint64_t i = truncate_from_index; i <= wal->max_disk_index; i++) {
+        if (i < wal->offsets_cap) wal->offsets[i] = (raft_wal_loc_t){0};
+    }
 
     wal->file_offset = loc.offset;
     wal->max_disk_index = truncate_from_index - 1;
@@ -364,46 +623,77 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
 // -----------------------------------------------------------------------------
 // HEAD PURGING (Garbage Collection)
 // -----------------------------------------------------------------------------
-void raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
-    // PHASE 8: Two-Phase snapshot durability proven. Safe to truncate WAL history!
+
+int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
+    if (!wal) return -1;
+
     while (wal->oldest_seg_id < wal->current_seg_id) {
         char path[1024]; get_segment_path(wal, wal->oldest_seg_id, path);
 
         char next_path[1024]; get_segment_path(wal, wal->oldest_seg_id + 1, next_path);
         int next_fd = open(next_path, O_RDONLY);
-        if (next_fd < 0) break;
+        if (next_fd < 0) return -1;
 
         uint64_t next_start_idx;
-        pread(next_fd, &next_start_idx, 8, 12);
+        bool valid_hdr = read_segment_header(next_fd, wal->oldest_seg_id + 1, &next_start_idx);
         close(next_fd);
 
+        if (!valid_hdr) return -1;
+
         if (next_start_idx <= safe_checkpoint_index) {
+            if (wal->read_fd >= 0 && wal->read_seg_id == wal->oldest_seg_id) {
+                close(wal->read_fd);
+                wal->read_fd = -1;
+                wal->read_seg_id = 0;
+            }
+
+            bool removed = false;
             if (wal->standby_count < wal->max_standby) {
-                char* standby_path = aml_strdupf("%s/standby_%llu_%u.wal", wal->base_dir, (unsigned long long)time(NULL), wal->standby_count);
-                rename(path, standby_path);
-                wal->standby_paths[wal->standby_count++] = standby_path;
-            } else {
-                unlink(path);
+                char* standby_path = aml_strdupf("%s/standby_%010llu_%u.wal", wal->base_dir, (unsigned long long)wal->oldest_seg_id, wal->standby_count);
+                if (standby_path && rename(path, standby_path) == 0) {
+                    wal->standby_paths[wal->standby_count++] = standby_path;
+                    removed = true;
+                } else {
+                    if (standby_path) aml_free(standby_path);
+                }
+            }
+
+            if (!removed) {
+                if (unlink(path) != 0) return -1;
             }
 
             for (uint64_t i = 0; i < next_start_idx; i++) {
-                if (i < wal->offsets_cap) wal->offsets[i].seg_id = 0;
+                if (i < wal->offsets_cap) wal->offsets[i] = (raft_wal_loc_t){0};
             }
 
             wal->oldest_seg_id++;
+            if (!sync_dir(wal->base_dir)) return -1;
         } else {
             break;
         }
     }
+    return 0;
 }
 
 void raft_wal_close(raft_wal_t* wal) {
-    raft_wal_flush_batch(wal);
-    if (wal->active_fd >= 0) close(wal->active_fd);
-    if (wal->read_fd >= 0) close(wal->read_fd);
+    if (!wal) return;
 
-    for (uint32_t i = 0; i < wal->standby_count; i++) aml_free(wal->standby_paths[i]);
-    aml_free(wal->standby_paths);
-    if (wal->offsets) aml_free(wal->offsets);
-    if (wal->batch_buf) aml_free(wal->batch_buf);
+    if (wal->active_fd >= 0) raft_wal_flush_batch(wal);
+
+    if (wal->active_fd >= 0) { close(wal->active_fd); wal->active_fd = -1; }
+    if (wal->read_fd >= 0) { close(wal->read_fd); wal->read_fd = -1; }
+
+    if (wal->standby_paths) {
+        for (uint32_t i = 0; i < wal->standby_count; i++) {
+            if (wal->standby_paths[i]) aml_free(wal->standby_paths[i]);
+        }
+        aml_free(wal->standby_paths);
+        wal->standby_paths = NULL;
+    }
+    if (wal->offsets) { aml_free(wal->offsets); wal->offsets = NULL; }
+    if (wal->batch_buf) { aml_free(wal->batch_buf); wal->batch_buf = NULL; }
+
+    wal->standby_count = 0;
+    wal->batch_len = 0;
+    wal->batch_cap = 0;
 }

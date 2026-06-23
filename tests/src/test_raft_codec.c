@@ -71,7 +71,8 @@ MACRO_TEST(codec_roundtrips_with_snapshot_topology) {
     raft_msg_t msg = {
         .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2,
         .snapshot_data = (uint8_t*)"STATE", .snapshot_len = 5,
-        .snapshot_peers = peers, .snapshot_is_learner = lrn, .snapshot_num_peers = 2
+        .snapshot_peers = peers, .snapshot_is_learner = lrn, .snapshot_num_peers = 2,
+        .snapshot_done = true
     };
 
     size_t sz = raft_msg_encoded_size(&msg);
@@ -84,6 +85,7 @@ MACRO_TEST(codec_roundtrips_with_snapshot_topology) {
     MACRO_ASSERT_EQ_INT(out.snapshot_num_peers, 2);
     MACRO_ASSERT_EQ_INT(out.snapshot_peers[1], 3);
     MACRO_ASSERT_TRUE(out.snapshot_is_learner[1]);
+    MACRO_ASSERT_TRUE(out.snapshot_done);
     MACRO_ASSERT_TRUE(memcmp(out.snapshot_data, "STATE", 5) == 0);
 
     raft_msg_free_payloads(&out);
@@ -91,8 +93,8 @@ MACRO_TEST(codec_roundtrips_with_snapshot_topology) {
 }
 
 MACRO_TEST(codec_rejects_malicious_num_entries_oom_dos) {
-    // 86 byte valid base frame
-    uint8_t buf[86] = {0};
+    // 95 byte valid base frame (updated for snapshot chunking)
+    uint8_t buf[95] = {0};
 
     // Correct offset for num_entries is 74. We inject a massive number.
     buf[74] = 0x1D;
@@ -102,7 +104,7 @@ MACRO_TEST(codec_rejects_malicious_num_entries_oom_dos) {
 
     raft_msg_t out;
     // Protocol strictly rejects exceeding RAFT_MAX_MSG_ENTRIES limit
-    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 86, &out));
+    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 95, &out));
 }
 
 MACRO_TEST(codec_safely_aborts_on_truncated_packet) {
@@ -139,11 +141,11 @@ MACRO_TEST(codec_rejects_null_buffer) {
 }
 
 MACRO_TEST(codec_rejects_invalid_message_type) {
-    uint8_t buf[86] = {0};
+    uint8_t buf[95] = {0};
     buf[0] = 99; // Invalid type
 
     raft_msg_t out;
-    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 86, &out));
+    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 95, &out));
 }
 
 MACRO_TEST(codec_rejects_invalid_entry_type) {
@@ -157,7 +159,9 @@ MACRO_TEST(codec_rejects_invalid_entry_type) {
     raft_msg_t hack = msg;
     hack.entries[0].type = ENTRY_NORMAL;
     raft_msg_encode(&hack, buf, sz);
-    buf[86 + 16] = 99; // Manually overwrite the serialized entry type
+
+    // Header is 95 bytes. Entry offset for type is 16 bytes in (8 term + 8 index).
+    buf[95 + 16] = 99;
 
     raft_msg_t out;
     MACRO_ASSERT_FALSE(raft_msg_decode(buf, sz, &out));
@@ -166,11 +170,11 @@ MACRO_TEST(codec_rejects_invalid_entry_type) {
 }
 
 MACRO_TEST(codec_rejects_reject_byte_not_bool) {
-    uint8_t buf[86] = {0};
+    uint8_t buf[95] = {0};
     buf[73] = 2; // Invalid boolean byte
 
     raft_msg_t out;
-    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 86, &out));
+    MACRO_ASSERT_FALSE(raft_msg_decode(buf, 95, &out));
 }
 
 MACRO_TEST(codec_rejects_learner_flag_not_bool) {
@@ -216,13 +220,13 @@ MACRO_TEST(codec_encode_rejects_snapshot_topology_count_with_null_arrays) {
 MACRO_TEST(codec_decode_rejects_frame_larger_than_max) {
     raft_msg_t out;
     uint8_t dummy[10] = {0};
-    // If a frame claims it exceeds our 1MB system limit, immediately drop it
-    MACRO_ASSERT_FALSE(raft_msg_decode(dummy, 2000000, &out));
+    // If a frame claims it exceeds our limit, immediately drop it
+    MACRO_ASSERT_FALSE(raft_msg_decode(dummy, 20000000, &out));
 }
 
 MACRO_TEST(codec_roundtrips_big_endian_known_bytes) {
     raft_msg_t msg = { .type = MSG_APPEND_ENTRIES, .to = 0x0102030405060708ULL };
-    uint8_t buf[86] = {0};
+    uint8_t buf[95] = {0};
 
     MACRO_ASSERT_TRUE(raft_msg_encode(&msg, buf, sizeof(buf)));
 

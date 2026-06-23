@@ -10,9 +10,8 @@
 #include <stdbool.h>
 #include "a-raft-library/raft.h"
 
-// Hard limits to prevent memory exhaustion or malicious packet overflow
-#define RAFT_MAX_FRAME_SIZE  (1024 * 1024 * 10) // 10 MB maximum frame
-#define RAFT_MAX_MSG_ENTRIES 10000              // Prevent billion-entry attacks
+// Prevent billion-entry attacks
+#define RAFT_MAX_MSG_ENTRIES 100000
 
 // Returns 0 on success, -1 if the payload is malformed or out of bounds
 int  raft_codec_serialize_msg(raft_msg_t* m, uint8_t** out_buf, uint32_t* out_len);

@@ -11,7 +11,6 @@
 // MESSAGE OWNERSHIP & MEMORY HELPERS
 // ============================================================================
 
-// Releases all owned heap allocations inside msg and resets ownership fields.
 static void free_message_allocations(raft_msg_t* msg) {
     if (msg->entries) {
         for (size_t i = 0; i < msg->num_entries; i++) {
@@ -33,7 +32,6 @@ static void free_message_allocations(raft_msg_t* msg) {
     msg->snapshot_num_peers = 0;
 }
 
-// Attempts to expand the outbound message queue, returning false on OOM or overflow.
 static bool ensure_msg_queue_capacity(raft_t* r) {
     if (r->msg_queue_len < r->msg_queue_cap) return true;
 
@@ -49,8 +47,6 @@ static bool ensure_msg_queue_capacity(raft_t* r) {
     return true;
 }
 
-// Builds a shallow Ready slice. Payloads remain owned by the log.
-// Caller frees only the returned array. Fails closed on allocation failure or overflow.
 static raft_entry_t* create_shallow_log_slice(raft_t* r, uint64_t start_idx, uint64_t end_idx, size_t* out_count) {
     *out_count = 0;
     if (end_idx <= start_idx) return NULL;
@@ -82,7 +78,6 @@ static raft_entry_t* create_shallow_log_slice(raft_t* r, uint64_t start_idx, uin
     return slice;
 }
 
-// Wipes the entire outbound queue.
 static void free_all_pending_messages(raft_t* r) {
     if (!r->msg_queue) return;
     for (size_t i = 0; i < r->msg_queue_len; i++) {
@@ -91,7 +86,6 @@ static void free_all_pending_messages(raft_t* r) {
     r->msg_queue_len = 0;
 }
 
-// Deeply releases the entire internal Raft log.
 static void free_entire_log_array(raft_t* r) {
     for (size_t i = 0; i < r->log_len; i++) {
         free(r->log[i].data);
@@ -102,19 +96,17 @@ static void free_entire_log_array(raft_t* r) {
     r->log_cap = 0;
 }
 
-// Gets the required buffer size for exporting the cluster topology.
 static size_t calculate_total_topology_size(raft_t* r) {
     return r->num_peers + (!r->removed ? 1 : 0);
 }
 
-// Deep-copies a verified sequence of restored log entries into the core's memory.
 static bool load_restored_log_entries(raft_t* r, raft_entry_t* entries, size_t num_entries) {
     for (size_t i = 0; i < num_entries; i++) {
         if (entries[i].index <= r->snapshot_index) continue;
 
         raft_entry_t* e = &r->log[r->log_len++];
         *e = entries[i];
-        e->data = NULL; // Explicitly clear borrowed pointer to prevent double-free on malloc failure
+        e->data = NULL;
 
         if (entries[i].data_len > 0) {
             if (!entries[i].data) return false;
@@ -130,7 +122,6 @@ static bool load_restored_log_entries(raft_t* r, raft_entry_t* entries, size_t n
 // RESTORE & MEMBERSHIP HELPERS
 // ============================================================================
 
-// Validates the initial peer list for a brand new node. Self ID is strictly forbidden.
 static bool is_valid_initial_topology(uint64_t self_id, uint64_t* peers, size_t num_peers) {
     if (num_peers > MAX_REMOTE_PEERS) return false;
     if (num_peers > 0 && !peers) return false;
@@ -144,7 +135,6 @@ static bool is_valid_initial_topology(uint64_t self_id, uint64_t* peers, size_t 
     return true;
 }
 
-// Validates the topology array read from disk. Restored topologies include the local ID.
 static bool is_valid_restore_topology(uint64_t self_id, uint64_t* peers, size_t num_peers) {
     if (num_peers > MAX_PEERS) return false;
     if (num_peers > 0 && !peers) return false;
@@ -159,9 +149,6 @@ static bool is_valid_restore_topology(uint64_t self_id, uint64_t* peers, size_t 
     return remote_count <= MAX_REMOTE_PEERS;
 }
 
-// Ensures that a sequence of log entries read from disk is mathematically contiguous
-// and does not contain terms exceeding the node's current term or dipping below the snapshot.
-// Real log entries strictly cannot have a term of 0.
 static bool is_valid_restore_log_sequence(uint64_t snapshot_index, uint64_t snapshot_term, uint64_t current_term, raft_entry_t* entries, size_t num_entries) {
     if (snapshot_index == UINT64_MAX) return false;
     if (num_entries == 0) return true;
@@ -181,7 +168,6 @@ static bool is_valid_restore_log_sequence(uint64_t snapshot_index, uint64_t snap
     return true;
 }
 
-// Applies a validated disk topology to the core. Flags removal if self ID is absent.
 static void apply_restore_topology(raft_t* r, uint64_t id, uint64_t* peers, bool* is_learners, size_t num_peers) {
     bool found_self = false;
     for (size_t i = 0; i < num_peers; i++) {
@@ -202,7 +188,6 @@ static void apply_restore_topology(raft_t* r, uint64_t id, uint64_t* peers, bool
     }
 }
 
-// Checks if the given node ID exists in the cluster topology (including learners).
 static bool is_known_cluster_member(raft_t* r, uint64_t node_id) {
     if (node_id == r->id && !r->removed) return true;
     for (size_t i = 0; i < r->num_peers; i++) {
@@ -211,7 +196,6 @@ static bool is_known_cluster_member(raft_t* r, uint64_t node_id) {
     return false;
 }
 
-// Checks if the given node ID is a voting member (excludes learners).
 static bool is_known_voting_member(raft_t* r, uint64_t node_id) {
     if (node_id == r->id && !r->removed && !r->is_learner_self) return true;
     for (size_t i = 0; i < r->num_peers; i++) {
@@ -220,7 +204,6 @@ static bool is_known_voting_member(raft_t* r, uint64_t node_id) {
     return false;
 }
 
-// Determines if a message type is strictly local to the node.
 static bool is_local_message_type(msg_type_t type) {
     return type == MSG_HUP ||
            type == MSG_TICK ||
@@ -229,9 +212,6 @@ static bool is_local_message_type(msg_type_t type) {
            type == MSG_CHECK_QUORUM;
 }
 
-// Security gatekeeper for inbound network RPCs. Strictly requires authoritative
-// or term-mutating messages to originate from known voters, and actively drops
-// any remote local-only events.
 static bool is_remote_message_sender_allowed(raft_t* r, raft_msg_t* msg) {
     switch (msg->type) {
         case MSG_REQUEST_VOTE:
@@ -252,8 +232,6 @@ static bool is_remote_message_sender_allowed(raft_t* r, raft_msg_t* msg) {
     }
 }
 
-// Determines if a given message is allowed to force the local node to step down
-// and adopt a newer term. Prevents learners from inadvertently deposing a leader.
 static bool message_can_advance_term(raft_t* r, raft_msg_t* msg) {
     switch (msg->type) {
         case MSG_APPEND_RES:
@@ -263,12 +241,10 @@ static bool message_can_advance_term(raft_t* r, raft_msg_t* msg) {
     }
 }
 
-// True if a message's term is older than the node's current term.
 static bool is_message_term_stale(raft_t* r, uint64_t msg_term) {
     return msg_term > 0 && msg_term < r->current_term;
 }
 
-// Constructs and queues a rejection response for an incoming message with a stale term.
 static void reject_stale_message(raft_t* r, raft_msg_t* msg) {
     raft_msg_t res = { .to = msg->from, .term = r->current_term, .reject = true };
     if (msg->type == MSG_APPEND_ENTRIES || msg->type == MSG_INSTALL_SNAPSHOT) {
@@ -284,15 +260,12 @@ static void reject_stale_message(raft_t* r, raft_msg_t* msg) {
     }
 }
 
-// Forces the node to relinquish candidate/leader status and adopt the new term.
 static void step_down_to_follower(raft_t* r, uint64_t new_term) {
     r->current_term = new_term;
     r->voted_for = 0;
     r->state = RAFT_STATE_FOLLOWER;
 }
 
-// Applies any membership configurations found in newly committed entries.
-// Fails closed if a committed entry is unexpectedly missing from the log.
 static void apply_committed_configurations(raft_t* r, uint64_t applied_index) {
     for (uint64_t i = r->last_applied + 1; i <= applied_index; i++) {
         raft_entry_t* e = raft_log_get(r, i);
@@ -311,12 +284,6 @@ static void apply_committed_configurations(raft_t* r, uint64_t applied_index) {
 // PUBLIC RAFT API
 // ============================================================================
 
-// All queued message payloads MUST be heap-owned by the message. Submodules
-// must deep-copy data payloads and must NEVER queue pointers borrowed directly
-// from the Raft log.
-// raft_send_msg consumes ownership of msg.entries, msg.snapshot_data,
-// msg.snapshot_peers, and msg.snapshot_is_learner. On success it queues them;
-// on failure it sets the fatal error flag and frees them.
 void raft_send_msg(raft_t* r, raft_msg_t msg) {
     if (!ensure_msg_queue_capacity(r)) {
         free_message_allocations(&msg);
@@ -341,6 +308,7 @@ raft_t* raft_create(uint64_t id, uint64_t* peers, size_t num_peers) {
         r->peers[i] = peers[i];
         r->is_learner[i] = false;
         r->next_index[i] = 1;
+        r->snapshot_offset[i] = 0;
     }
 
     r->log_cap = 16;
@@ -441,8 +409,6 @@ raft_t* raft_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num
     return r;
 }
 
-// Processes strictly local events generated by the node itself or the host
-// application. Discards network metadata to prevent injection attacks.
 void raft_step_local(raft_t* r, raft_msg_t* msg) {
     if (r->fatal_error) return;
     if (msg->to != 0 && msg->to != r->id) return;
@@ -467,7 +433,6 @@ void raft_step_local(raft_t* r, raft_msg_t* msg) {
     }
 }
 
-// Processes inbound RPCs from the network, enforcing strict membership validation.
 void raft_step_remote(raft_t* r, raft_msg_t* msg) {
     if (r->fatal_error) return;
     if (msg->to != r->id) return;
@@ -480,7 +445,6 @@ void raft_step_remote(raft_t* r, raft_msg_t* msg) {
         return;
     }
 
-    // Mark the peer as active for quorum checks since it passed authentication
     for (size_t i = 0; i < r->num_peers; i++) {
         if (r->peers[i] == msg->from) {
             r->recent_active[i] = true;
@@ -552,13 +516,12 @@ raft_ready_t raft_get_ready(raft_t* r) {
     ready.snapshot_term = r->pending_snapshot_msg_term;
     ready.snapshot_data = r->pending_snapshot_data;
     ready.snapshot_len = r->pending_snapshot_len;
+    ready.snapshot_offset = r->pending_snapshot_offset;
+    ready.snapshot_done = r->pending_snapshot_done;
 
     return ready;
 }
 
-// Acknowledges that the host application has successfully processed a specific
-// chunk of history. Validates indices to prevent corrupt host applications from
-// silently skipping states or violating write-ahead log boundaries.
 void raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index) {
     if (r->fatal_error) return;
 
@@ -590,8 +553,6 @@ void raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index) {
     r->activity_accepted = false;
 }
 
-// For unit testing only. Automatically applies all uncommitted data directly
-// to the internal state, bypassing the durability and host application contracts.
 void raft_advance_all_for_tests_only(raft_t* r) {
     if (r->fatal_error) return;
     raft_ready_t ready = raft_get_ready(r);
@@ -600,9 +561,6 @@ void raft_advance_all_for_tests_only(raft_t* r) {
     raft_advance(r, raft_log_last_index(r), raft_commit_index(r));
 }
 
-// Truncates the in-memory Raft log to reclaim space after the host application
-// has safely written a state machine snapshot to disk. Uses strict boundary checks
-// and requires the corresponding term to ensure the external snapshot durability contract.
 void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term) {
     if (r->fatal_error) return;
     if (compact_index <= r->snapshot_index || compact_index > r->last_applied) return;
@@ -668,11 +626,6 @@ size_t raft_peers(raft_t* r, uint64_t* out_peers) {
     return r->num_peers;
 }
 
-// Exports the full cluster topology into user-provided arrays. The caller must
-// ensure that out_peers and out_is_learners are allocated to a capacity greater
-// than or equal to the required size returned by this function (via
-// calculate_total_topology_size). If out_cap is insufficient, the function
-// returns the required size without modifying the arrays.
 size_t raft_peers_ext(raft_t* r, uint64_t* out_peers, bool* out_is_learners, size_t out_cap) {
     size_t required = calculate_total_topology_size(r);
 

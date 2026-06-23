@@ -11,6 +11,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+// ============================================================================
+// INTERNAL TYPES & FORWARD DECLARATIONS
+// ============================================================================
+
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
@@ -30,14 +34,20 @@ typedef struct {
 } raft_meta_peer_t;
 #pragma pack(pop)
 
-// Custom wrapper to prevent memory leaks if a socket closes mid-write
 typedef struct {
     uv_write_t req;
     uv_buf_t buf;
 } write_req_t;
 
+// Forward declarations
 void raft_node_pump(raft_node_t* node);
 static void attempt_reconnect(uv_timer_t* handle);
+static void remove_peer(raft_server_t* server, peer_connection_t* peer);
+static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t target_node_id, uint8_t* payload, uint32_t len);
+
+// ============================================================================
+// DISK I/O & PERSISTENCE HELPERS
+// ============================================================================
 
 static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint64_t commit, uint64_t applied, uint64_t snap_idx, uint64_t snap_term) {
     char tmp_path[512], meta_path[512], dir_path[512];
@@ -60,12 +70,16 @@ static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint
     hdr.num_peers = (uint32_t)raft_peers_ext(node->core, peers, is_learner, RAFT_MAX_PEERS);
 
     if (fwrite(&hdr, sizeof(raft_meta_header_t), 1, f) != 1) { fclose(f); return false; }
+
     for (uint32_t i = 0; i < hdr.num_peers; i++) {
         raft_meta_peer_t p = { .peer_id = peers[i], .is_learner = is_learner[i] ? 1 : 0 };
         if (fwrite(&p, sizeof(raft_meta_peer_t), 1, f) != 1) { fclose(f); return false; }
     }
 
-    fflush(f); fsync(fileno(f)); fclose(f);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
     if (rename(tmp_path, meta_path) != 0) return false;
 
     int dir_fd = open(dir_path, O_RDONLY);
@@ -80,32 +94,9 @@ static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint
     return true;
 }
 
-static void on_write_done(uv_write_t* req, int status) {
-    (void)status;
-    write_req_t* wr = (write_req_t*)req;
-    if (wr->buf.base) free(wr->buf.base);
-    free(wr);
-}
-
-static void on_client_close(uv_handle_t* handle) {
-    peer_connection_t* peer = (peer_connection_t*)handle;
-
-    if (peer->kp) {
-        peer->kp->conn = NULL;
-        uv_timer_start(&peer->kp->reconnect_timer, (uv_timer_cb)attempt_reconnect, 1000, 0);
-    }
-
-    if (peer->buffer) free(peer->buffer);
-    free(peer);
-}
-
-static void on_election_timeout(uv_timer_t* handle);
-
-static void reset_election_timer(raft_node_t* node) {
-    uv_timer_stop(&node->election_timer);
-    uint64_t timeout = 150 + (rand() % 150);
-    uv_timer_start(&node->election_timer, (uv_timer_cb)on_election_timeout, timeout, 0);
-}
+// ============================================================================
+// TIMERS & SCHEDULING
+// ============================================================================
 
 static void on_election_timeout(uv_timer_t* handle) {
     raft_node_t* n = (raft_node_t*)handle->data;
@@ -120,26 +111,247 @@ static void on_election_timeout(uv_timer_t* handle) {
     raft_node_pump(n);
 }
 
+static void reset_election_timer(raft_node_t* node) {
+    uv_timer_stop(&node->election_timer);
+    uint64_t timeout = 150 + (rand() % 150);
+    uv_timer_start(&node->election_timer, (uv_timer_cb)on_election_timeout, timeout, 0);
+}
+
 static void on_heartbeat_tick(uv_timer_t* handle) {
     raft_node_t* n = (raft_node_t*)handle->data;
     raft_msg_t tick = { .type = MSG_TICK };
     raft_step_local(n->core, &tick);
-
     raft_node_pump(n);
 }
 
-static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    (void)handle;
-    buf->base = malloc(suggested_size);
-    if (!buf->base) buf->len = 0;
-    else buf->len = suggested_size;
+static void pump_update_timers(raft_node_t* node) {
+    if (raft_state(node->core) == RAFT_STATE_LEADER) {
+        if (!uv_is_active((uv_handle_t*)&node->heartbeat_timer)) {
+            uv_timer_start(&node->heartbeat_timer, (uv_timer_cb)on_heartbeat_tick, 50, 50);
+        }
+        if (!uv_is_active((uv_handle_t*)&node->election_timer)) reset_election_timer(node);
+    } else {
+        if (uv_is_active((uv_handle_t*)&node->heartbeat_timer)) uv_timer_stop(&node->heartbeat_timer);
+        if (!uv_is_active((uv_handle_t*)&node->election_timer)) reset_election_timer(node);
+    }
+}
+
+// ============================================================================
+// PUMP SUBSYSTEMS (EVENT LOOP LOGIC)
+// ============================================================================
+
+static void pump_queue_pending_reads(raft_node_t* node, raft_ready_t* ready) {
+    for (size_t i = 0; i < ready->num_read_states; i++) {
+        if (node->num_pending_reads < 128) {
+            node->pending_reads[node->num_pending_reads++] = ready->read_states[i];
+        }
+    }
+}
+
+static void pump_handle_snapshots(raft_node_t* node, raft_ready_t* ready, uint64_t* actual_applied_idx, uint64_t* actual_saved_idx) {
+    if (!ready->install_snapshot) return;
+
+    bool snap_success = true;
+    char tmp_snap[512], dat_snap[512];
+    snprintf(tmp_snap, sizeof(tmp_snap), "%s/snap_grp%llu.tmp", node->server->data_dir, (unsigned long long)node->group_id);
+    snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+
+    FILE* sf = fopen(tmp_snap, ready->snapshot_offset > 0 ? "ab" : "wb");
+    if (!sf) {
+        snap_success = false;
+    } else {
+        if (ready->snapshot_len > 0) fwrite(ready->snapshot_data, 1, ready->snapshot_len, sf);
+        fflush(sf); fsync(fileno(sf)); fclose(sf);
+
+        if (ready->snapshot_done) {
+            if (rename(tmp_snap, dat_snap) == 0 &&
+                (!node->snap_cb || node->snap_cb(node->snap_ctx, ready->snapshot_index, ready->snapshot_term, NULL, 0) == RAFT_SNAPSHOT_OK)) {
+
+                if (save_hardstate(node, raft_term(node->core), raft_voted_for(node->core), ready->snapshot_index, ready->snapshot_index, ready->snapshot_index, ready->snapshot_term)) {
+                    node->saved_snap_idx = ready->snapshot_index;
+                    node->saved_snap_term = ready->snapshot_term;
+                    node->saved_applied = ready->snapshot_index;
+                    node->saved_commit = ready->snapshot_index;
+
+                    raft_wal_purge_head(&node->wal, ready->snapshot_index);
+
+                    *actual_applied_idx = ready->snapshot_index > *actual_applied_idx ? ready->snapshot_index : *actual_applied_idx;
+                    *actual_saved_idx = ready->snapshot_index > *actual_saved_idx ? ready->snapshot_index : *actual_saved_idx;
+                } else snap_success = false;
+            } else snap_success = false;
+        }
+    }
+
+    raft_snapshot_acked(node->core, snap_success);
+    if (ready->snapshot_done && !snap_success) {
+        fprintf(stderr, "[ERROR] Snapshot installation failed. WAL intact.\n");
+    }
+}
+
+static bool pump_persist_entries(raft_node_t* node, raft_ready_t* ready, uint64_t* actual_saved_idx) {
+    if (ready->num_entries_to_save > 0) {
+        if (!raft_io_save(&node->wal, ready)) {
+            fprintf(stderr, "[ERROR] Raft Disk I/O failed! Halting pump cycle.\n");
+            return false;
+        }
+        *actual_saved_idx = raft_last_index(node->core);
+    }
+    return true;
+}
+
+static bool pump_sync_core_metadata(raft_node_t* node, uint64_t actual_applied_idx) {
+    uint64_t current_term = raft_term(node->core);
+    uint64_t voted_for = raft_voted_for(node->core);
+    uint64_t commit_idx = raft_commit_index(node->core);
+    uint64_t snap_idx = raft_snapshot_index(node->core);
+    uint64_t snap_term = raft_snapshot_term(node->core);
+
+    if (current_term != node->saved_term || voted_for != node->saved_vote || commit_idx > node->saved_commit || snap_idx > node->saved_snap_idx) {
+        if (!save_hardstate(node, current_term, voted_for, commit_idx, actual_applied_idx, snap_idx, snap_term)) {
+            fprintf(stderr, "[ERROR] Pre-Network Meta Disk I/O failed! Halting pump.\n");
+            return false;
+        }
+        node->saved_term = current_term; node->saved_vote = voted_for;
+        node->saved_commit = commit_idx; node->saved_snap_idx = snap_idx; node->saved_snap_term = snap_term;
+    }
+    return true;
+}
+
+static void pump_dispatch_network_messages(raft_node_t* node, raft_ready_t* ready) {
+    for (size_t i = 0; i < ready->num_messages; i++) {
+        raft_msg_t* m = &ready->messages[i];
+
+        // Dynamically load chunked snapshots from disk
+        if (m->type == MSG_INSTALL_SNAPSHOT && m->snapshot_len == 0 && !m->snapshot_done) {
+            char dat_snap[512];
+            snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+            FILE* sf = fopen(dat_snap, "rb");
+            if (sf) {
+                fseek(sf, m->snapshot_offset, SEEK_SET);
+                size_t chunk_size = 1048576; // 1MB chunks
+                m->snapshot_data = malloc(chunk_size);
+                if (m->snapshot_data) {
+                    size_t bytes_read = fread(m->snapshot_data, 1, chunk_size, sf);
+                    m->snapshot_len = bytes_read;
+                    m->snapshot_done = (bytes_read < chunk_size);
+                }
+                fclose(sf);
+            } else {
+                m->snapshot_done = true;
+            }
+        }
+
+        size_t enc_sz = raft_msg_encoded_size(m);
+        uint8_t* payload = malloc(enc_sz);
+        if (payload) {
+            if (raft_msg_encode(m, payload, enc_sz)) {
+                router_send_rpc(node->server, node->group_id, m->to, payload, (uint32_t)enc_sz);
+            } else free(payload);
+        }
+
+        if (m->type == MSG_INSTALL_SNAPSHOT && m->snapshot_data) {
+            free(m->snapshot_data); m->snapshot_data = NULL;
+        }
+    }
+}
+
+static bool pump_apply_state_machine(raft_node_t* node, raft_ready_t* ready, uint64_t* actual_applied_idx) {
+    bool applied_changed = false;
+    uint64_t current_term = raft_term(node->core);
+
+    if (ready->num_committed_entries > 0) {
+        for (size_t i = 0; i < ready->num_committed_entries; i++) {
+            raft_entry_t* e = &ready->committed_entries[i];
+
+            if (e->index <= *actual_applied_idx) continue;
+
+            if (node->apply_cb) {
+                int res = node->apply_cb(node->apply_ctx, e, current_term);
+                if (res == RAFT_APPLY_TRANSIENT) break;
+                else if (res == RAFT_APPLY_FATAL) {
+                    node->fatal_error = true;
+                    raft_msg_t hup = { .type = MSG_CHECK_QUORUM };
+                    raft_step_local(node->core, &hup);
+                    break;
+                }
+            }
+            *actual_applied_idx = e->index;
+            applied_changed = true;
+        }
+    }
+    return applied_changed;
+}
+
+static void pump_resolve_read_indices(raft_node_t* node, uint64_t actual_applied_idx) {
+    for (size_t i = 0; i < node->num_pending_reads; ) {
+        if (node->pending_reads[i].index <= actual_applied_idx) {
+            if (node->read_cb) node->read_cb(node->read_ctx, node->pending_reads[i].read_seq);
+
+            node->num_pending_reads--;
+            if (i < node->num_pending_reads) {
+                node->pending_reads[i] = node->pending_reads[node->num_pending_reads];
+            }
+        } else i++;
+    }
+}
+
+static void pump_cleanup_ready(raft_ready_t* ready) {
+    if (ready->num_entries_to_save > 0 && ready->entries_to_save) free(ready->entries_to_save);
+    if (ready->num_committed_entries > 0 && ready->committed_entries) free(ready->committed_entries);
+}
+
+// ----------------------------------------------------------------------------
+// PRIMARY EVENT LOOP ORCHESTRATOR
+// ----------------------------------------------------------------------------
+
+void raft_node_pump(raft_node_t* node) {
+    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return;
+
+    raft_ready_t ready = raft_get_ready(node->core);
+    uint64_t actual_saved_idx = raft_last_index(node->core) - ready.num_entries_to_save;
+    uint64_t actual_applied_idx = node->saved_applied;
+
+    pump_queue_pending_reads(node, &ready);
+    pump_handle_snapshots(node, &ready, &actual_applied_idx, &actual_saved_idx);
+
+    if (!pump_persist_entries(node, &ready, &actual_saved_idx)) goto cleanup;
+    if (!pump_sync_core_metadata(node, actual_applied_idx)) goto cleanup;
+
+    pump_dispatch_network_messages(node, &ready);
+
+    bool applied_changed = pump_apply_state_machine(node, &ready, &actual_applied_idx);
+    pump_resolve_read_indices(node, actual_applied_idx);
+
+    raft_advance(node->core, actual_saved_idx, actual_applied_idx);
+
+    if (applied_changed || actual_applied_idx > node->saved_applied) {
+        if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, actual_applied_idx, node->saved_snap_idx, node->saved_snap_term)) {
+            fprintf(stderr, "[ERROR] Post-Apply Meta Disk I/O failed! Halting pump.\n");
+            goto cleanup;
+        }
+        node->saved_applied = actual_applied_idx;
+    }
+
+    pump_update_timers(node);
+
+cleanup:
+    pump_cleanup_ready(&ready);
+}
+
+// ============================================================================
+// OUTBOUND NETWORKING SUBSYSTEM
+// ============================================================================
+
+static void on_write_done(uv_write_t* req, int status) {
+    (void)status;
+    write_req_t* wr = (write_req_t*)req;
+    if (wr->buf.base) free(wr->buf.base);
+    free(wr);
 }
 
 static void flush_outbound(known_peer_t* kp) {
     if (!kp->conn || kp->out_queue_len == 0) return;
 
-    // BACKPRESSURE LIMIT: If the OS TCP buffer is struggling to flush, stop
-    // handing it memory and queue it in userspace until it catches up.
     if (kp->conn->handle.write_queue_size > 10 * 1024 * 1024) return;
 
     write_req_t* wr = malloc(sizeof(write_req_t));
@@ -148,7 +360,6 @@ static void flush_outbound(known_peer_t* kp) {
     wr->buf = uv_buf_init((char*)kp->out_queue, kp->out_queue_len);
 
     if (uv_write(&wr->req, (uv_stream_t*)&kp->conn->handle, &wr->buf, 1, on_write_done) != 0) {
-        // Synchronous failure: The callback will NOT be invoked. Free memory instantly.
         free(wr->buf.base);
         free(wr);
     }
@@ -156,6 +367,25 @@ static void flush_outbound(known_peer_t* kp) {
     kp->out_queue_cap = 65536;
     kp->out_queue = malloc(kp->out_queue_cap);
     kp->out_queue_len = 0;
+}
+
+static bool enqueue_outbound_frame(known_peer_t* kp, uint8_t* frame, uint32_t frame_size) {
+    size_t needed = kp->out_queue_len + frame_size;
+
+    if (needed < kp->out_queue_len || needed > 50 * 1024 * 1024) return false;
+
+    if (kp->out_queue_cap < needed) {
+        size_t new_cap = kp->out_queue_cap > 0 ? kp->out_queue_cap * 2 : 65536;
+        while (new_cap < needed) new_cap *= 2;
+        uint8_t* new_q = realloc(kp->out_queue, new_cap);
+        if (!new_q) return false;
+        kp->out_queue = new_q;
+        kp->out_queue_cap = new_cap;
+    }
+
+    memcpy(kp->out_queue + kp->out_queue_len, frame, frame_size);
+    kp->out_queue_len += frame_size;
+    return true;
 }
 
 static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t target_node_id, uint8_t* payload, uint32_t len) {
@@ -177,43 +407,25 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
     h->sender_id = server->physical_node_id;
     memcpy(frame + sizeof(raft_net_header_t), payload, len);
 
-    // Payload bytes are securely stored in the frame buffer, free the original instantly
     free(payload);
 
+    // Route to Known Peers (Outbound connections)
     for (uint32_t i = 0; i < server->known_peer_count; i++) {
         known_peer_t* kp = server->known_peers[i];
         if (kp->node_id == target_node_id) {
-            size_t needed = kp->out_queue_len + frame_size;
-
-            // Drop packet if the userspace queue hits 50MB (Death Spiral protection)
-            if (needed < kp->out_queue_len || needed > 50 * 1024 * 1024) {
-                free(frame); return;
-            }
-
-            if (kp->out_queue_cap < needed) {
-                size_t new_cap = kp->out_queue_cap > 0 ? kp->out_queue_cap * 2 : 65536;
-                while (new_cap < needed) new_cap *= 2;
-                uint8_t* new_q = realloc(kp->out_queue, new_cap);
-                if (!new_q) { free(frame); return; }
-                kp->out_queue = new_q;
-                kp->out_queue_cap = new_cap;
-            }
-
-            memcpy(kp->out_queue + kp->out_queue_len, frame, frame_size);
-            kp->out_queue_len += frame_size;
-            free(frame);
-
-            if (kp->conn) {
+            if (enqueue_outbound_frame(kp, frame, frame_size) && kp->conn) {
                 flush_outbound(kp);
             }
+            free(frame);
             return;
         }
     }
 
+    // Route to Active Peers (Inbound connections)
     for (uint32_t i = 0; i < server->active_peer_count; i++) {
         peer_connection_t* peer = server->active_peers[i];
         if (peer->remote_node_id == target_node_id) {
-            // Drop packet if OS write buffer exceeds 10MB (Death Spiral protection)
+
             if (peer->handle.write_queue_size > 10 * 1024 * 1024) {
                 free(frame); return;
             }
@@ -230,181 +442,28 @@ static void router_send_rpc(raft_server_t* server, uint64_t group_id, uint64_t t
         }
     }
 
-    free(frame);
+    free(frame); // Drop if peer not found
 }
 
-void raft_node_pump(raft_node_t* node) {
-    if (node->fatal_error) return;
+// ============================================================================
+// INBOUND NETWORKING SUBSYSTEM
+// ============================================================================
 
-    raft_ready_t ready = raft_get_ready(node->core);
-    uint64_t actual_saved_idx = raft_last_index(node->core) - ready.num_entries_to_save;
-    uint64_t actual_applied_idx = node->saved_applied;
+static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+    (void)handle;
+    buf->base = malloc(suggested_size);
+    if (!buf->base) buf->len = 0;
+    else buf->len = suggested_size;
+}
 
-    for (size_t i = 0; i < ready.num_read_states; i++) {
-        if (node->num_pending_reads < 128) {
-            node->pending_reads[node->num_pending_reads++] = ready.read_states[i];
-        }
+static void on_client_close(uv_handle_t* handle) {
+    peer_connection_t* peer = (peer_connection_t*)handle;
+    if (peer->kp) {
+        peer->kp->conn = NULL;
+        uv_timer_start(&peer->kp->reconnect_timer, (uv_timer_cb)attempt_reconnect, 1000, 0);
     }
-
-    if (ready.install_snapshot) {
-        bool snap_success = false;
-
-        char tmp_snap[512], dat_snap[512];
-        snprintf(tmp_snap, sizeof(tmp_snap), "%s/snap_grp%llu.tmp", node->server->data_dir, (unsigned long long)node->group_id);
-        snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
-
-        FILE* sf = fopen(tmp_snap, "wb");
-        if (sf) {
-            if (ready.snapshot_len > 0) fwrite(ready.snapshot_data, 1, ready.snapshot_len, sf);
-            fflush(sf); fsync(fileno(sf)); fclose(sf);
-
-            if (rename(tmp_snap, dat_snap) == 0) {
-                if (!node->snap_cb || node->snap_cb(node->snap_ctx, ready.snapshot_index, ready.snapshot_term, ready.snapshot_data, ready.snapshot_len) == RAFT_SNAPSHOT_OK) {
-
-                    if (save_hardstate(node, raft_term(node->core), raft_voted_for(node->core), ready.snapshot_index, ready.snapshot_index, ready.snapshot_index, ready.snapshot_term)) {
-                        node->saved_snap_idx = ready.snapshot_index;
-                        node->saved_snap_term = ready.snapshot_term;
-                        node->saved_applied = ready.snapshot_index;
-                        node->saved_commit = ready.snapshot_index;
-
-                        raft_wal_purge_head(&node->wal, ready.snapshot_index);
-
-                        actual_applied_idx = ready.snapshot_index > actual_applied_idx ? ready.snapshot_index : actual_applied_idx;
-                        actual_saved_idx = ready.snapshot_index > actual_saved_idx ? ready.snapshot_index : actual_saved_idx;
-                        snap_success = true;
-                    }
-                }
-            }
-        }
-
-        raft_snapshot_acked(node->core, snap_success);
-        if (!snap_success) {
-            fprintf(stderr, "[ERROR] Snapshot installation failed. WAL intact.\n");
-        }
-    }
-
-    if (ready.num_entries_to_save > 0) {
-        if (!raft_io_save(&node->wal, &ready)) {
-            fprintf(stderr, "[ERROR] Raft Disk I/O failed! Halting pump cycle.\n");
-            goto pump_cleanup;
-        }
-        actual_saved_idx = raft_last_index(node->core);
-    }
-
-    uint64_t current_term = raft_term(node->core);
-    uint64_t voted_for = raft_voted_for(node->core);
-    uint64_t commit_idx = raft_commit_index(node->core);
-    uint64_t snap_idx = raft_snapshot_index(node->core);
-    uint64_t snap_term = raft_snapshot_term(node->core);
-
-    if (current_term != node->saved_term || voted_for != node->saved_vote ||
-        commit_idx > node->saved_commit || snap_idx > node->saved_snap_idx) {
-
-        if (!save_hardstate(node, current_term, voted_for, commit_idx, actual_applied_idx, snap_idx, snap_term)) {
-            fprintf(stderr, "[ERROR] Pre-Network Meta Disk I/O failed! Halting pump.\n");
-            goto pump_cleanup;
-        }
-
-        node->saved_term = current_term; node->saved_vote = voted_for;
-        node->saved_commit = commit_idx;
-        node->saved_snap_idx = snap_idx; node->saved_snap_term = snap_term;
-    }
-
-    for (size_t i = 0; i < ready.num_messages; i++) {
-        if (ready.messages[i].type == MSG_INSTALL_SNAPSHOT && ready.messages[i].snapshot_len == 0) {
-            char dat_snap[512];
-            snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
-            FILE* sf = fopen(dat_snap, "rb");
-            if (sf) {
-                fseek(sf, 0, SEEK_END);
-                long fsize = ftell(sf);
-                fseek(sf, 0, SEEK_SET);
-                if (fsize > 0) {
-                    ready.messages[i].snapshot_data = malloc(fsize);
-                    if (ready.messages[i].snapshot_data) {
-                        ready.messages[i].snapshot_len = fsize;
-                        fread(ready.messages[i].snapshot_data, 1, fsize, sf);
-                    }
-                }
-                fclose(sf);
-            }
-        }
-
-        // INTEGRATE NEW CODEC
-        size_t enc_sz = raft_msg_encoded_size(&ready.messages[i]);
-        uint8_t* payload = malloc(enc_sz);
-        if (payload) {
-            if (raft_msg_encode(&ready.messages[i], payload, enc_sz)) {
-                router_send_rpc(node->server, node->group_id, ready.messages[i].to, payload, (uint32_t)enc_sz);
-            } else {
-                free(payload);
-            }
-        }
-
-        if (ready.messages[i].type == MSG_INSTALL_SNAPSHOT && ready.messages[i].snapshot_data) {
-            free(ready.messages[i].snapshot_data);
-            ready.messages[i].snapshot_data = NULL;
-        }
-    }
-
-    bool applied_changed = false;
-    if (ready.num_committed_entries > 0) {
-        for (size_t i = 0; i < ready.num_committed_entries; i++) {
-            raft_entry_t* e = &ready.committed_entries[i];
-
-            if (e->index <= actual_applied_idx) continue;
-
-            if (node->apply_cb) {
-                int res = node->apply_cb(node->apply_ctx, e, current_term);
-                if (res == RAFT_APPLY_TRANSIENT) break;
-                else if (res == RAFT_APPLY_FATAL) {
-                    node->fatal_error = true;
-                    raft_msg_t hup = { .type = MSG_CHECK_QUORUM };
-                    raft_step_local(node->core, &hup);
-                    break;
-                }
-            }
-            actual_applied_idx = e->index;
-            applied_changed = true;
-        }
-    }
-
-    for (size_t i = 0; i < node->num_pending_reads; ) {
-        if (node->pending_reads[i].index <= actual_applied_idx) {
-            if (node->read_cb) {
-                node->read_cb(node->read_ctx, node->pending_reads[i].read_seq);
-            }
-            node->num_pending_reads--;
-            if (i < node->num_pending_reads) {
-                node->pending_reads[i] = node->pending_reads[node->num_pending_reads];
-            }
-        } else {
-            i++;
-        }
-    }
-
-    raft_advance(node->core, actual_saved_idx, actual_applied_idx);
-
-    if (applied_changed || actual_applied_idx > node->saved_applied) {
-        if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, actual_applied_idx, node->saved_snap_idx, node->saved_snap_term)) {
-            fprintf(stderr, "[ERROR] Post-Apply Meta Disk I/O failed! Halting pump.\n");
-            goto pump_cleanup;
-        }
-        node->saved_applied = actual_applied_idx;
-    }
-
-    raft_state_t state = raft_state(node->core);
-    if (state == RAFT_STATE_LEADER) {
-        if (!uv_is_active((uv_handle_t*)&node->heartbeat_timer)) uv_timer_start(&node->heartbeat_timer, (uv_timer_cb)on_heartbeat_tick, 50, 50);
-        if (!uv_is_active((uv_handle_t*)&node->election_timer)) reset_election_timer(node);
-    } else {
-        if (uv_is_active((uv_handle_t*)&node->heartbeat_timer)) uv_timer_stop(&node->heartbeat_timer);
-        if (!uv_is_active((uv_handle_t*)&node->election_timer)) reset_election_timer(node);
-    }
-
-pump_cleanup:
-    if (ready.num_entries_to_save > 0 && ready.entries_to_save) free(ready.entries_to_save);
-    if (ready.num_committed_entries > 0 && ready.committed_entries) free(ready.committed_entries);
+    if (peer->buffer) free(peer->buffer);
+    free(peer);
 }
 
 static void remove_peer(raft_server_t* server, peer_connection_t* peer) {
@@ -416,60 +475,45 @@ static void remove_peer(raft_server_t* server, peer_connection_t* peer) {
     }
 }
 
-static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
-    peer_connection_t *peer = (peer_connection_t *)client;
+static void register_peer(raft_server_t* server, peer_connection_t* peer) {
+    if (server->active_peer_count < RAFT_MAX_PEERS) {
+        server->active_peers[server->active_peer_count++] = peer;
+    }
+}
 
-    if (nread <= 0 || peer->server->network_isolated) {
-        remove_peer(peer->server, peer);
-        uv_close((uv_handle_t*)client, on_client_close);
-        if (buf->base) free(buf->base);
-        return;
+static void close_and_cleanup_peer(peer_connection_t* peer, const uv_buf_t* buf) {
+    remove_peer(peer->server, peer);
+    uv_close((uv_handle_t*)&peer->handle, on_client_close);
+    if (buf->base) free(buf->base);
+}
+
+static bool ensure_peer_buffer_capacity(peer_connection_t* peer, size_t needed) {
+    if (needed < peer->buffer_len) return false; // Overflow
+
+    size_t new_cap = peer->buffer_cap > 0 ? peer->buffer_cap * 2 : 65536;
+    while (new_cap < needed) {
+        size_t old_cap = new_cap;
+        new_cap *= 2;
+        if (new_cap < old_cap) return false; // Overflow
     }
 
-    if (peer->buffer_len + nread > peer->buffer_cap) {
-        size_t needed = peer->buffer_len + nread;
-        if (needed < peer->buffer_len) {
-            remove_peer(peer->server, peer);
-            uv_close((uv_handle_t*)client, on_client_close);
-            if (buf->base) free(buf->base);
-            return;
-        }
+    size_t max_allowed = RAFT_MAX_FRAME_SIZE + sizeof(raft_net_header_t);
+    if (new_cap > max_allowed) new_cap = max_allowed;
 
-        size_t new_cap = peer->buffer_cap > 0 ? peer->buffer_cap * 2 : 65536;
-        while (new_cap < needed) {
-            size_t old_cap = new_cap;
-            new_cap *= 2;
-            if (new_cap < old_cap) {
-                new_cap = needed;
-                break;
-            }
-        }
-
-        size_t max_allowed = RAFT_MAX_FRAME_SIZE + sizeof(raft_net_header_t);
-        if (new_cap > max_allowed) new_cap = max_allowed;
-
-        if (needed > new_cap) {
-            fprintf(stderr, "[WARN] Disconnecting peer: Buffer capacity exceeded max frame size.\n");
-            remove_peer(peer->server, peer);
-            uv_close((uv_handle_t*)client, on_client_close);
-            if (buf->base) free(buf->base);
-            return;
-        }
-
-        uint8_t* temp = realloc(peer->buffer, new_cap);
-        if (!temp) {
-             fprintf(stderr, "[ERROR] Memory allocation failure on read buffer. Disconnecting.\n");
-             remove_peer(peer->server, peer);
-             uv_close((uv_handle_t*)client, on_client_close);
-             if (buf->base) free(buf->base);
-             return;
-        }
-        peer->buffer = temp;
-        peer->buffer_cap = new_cap;
+    if (needed > new_cap) {
+        fprintf(stderr, "[WARN] Buffer capacity exceeded max frame size.\n");
+        return false;
     }
 
-    memcpy(peer->buffer + peer->buffer_len, buf->base, nread);
-    peer->buffer_len += nread;
+    uint8_t* temp = realloc(peer->buffer, new_cap);
+    if (!temp) return false;
+
+    peer->buffer = temp;
+    peer->buffer_cap = new_cap;
+    return true;
+}
+
+static size_t parse_peer_frames(peer_connection_t* peer) {
     size_t offset = 0;
 
     while (peer->buffer_len - offset >= sizeof(raft_net_header_t)) {
@@ -477,46 +521,34 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
 
         if (h->payload_len > RAFT_MAX_FRAME_SIZE) {
             fprintf(stderr, "[WARN] Disconnecting peer: Frame size exceeds limit.\n");
-            remove_peer(peer->server, peer);
-            uv_close((uv_handle_t*)client, on_client_close);
-            if (buf->base) free(buf->base);
-            return;
+            return SIZE_MAX; // Signal fatal parsing error
         }
 
         uint32_t frame_size = sizeof(raft_net_header_t) + h->payload_len;
-        if (peer->buffer_len - offset < frame_size) break;
+        if (peer->buffer_len - offset < frame_size) break; // Frame incomplete
 
         if (peer->remote_node_id != 0 && peer->remote_node_id != h->sender_id) {
             fprintf(stderr, "[WARN] Sender ID mismatch. Dropping connection.\n");
-            remove_peer(peer->server, peer);
-            uv_close((uv_handle_t*)client, on_client_close);
-            if (buf->base) free(buf->base);
-            return;
+            return SIZE_MAX;
         }
         peer->remote_node_id = h->sender_id;
 
         uint8_t *payload = peer->buffer + offset + sizeof(raft_net_header_t);
         if (h->group_id < peer->server->max_groups && peer->server->groups[h->group_id]) {
             raft_node_t* target_node = peer->server->groups[h->group_id];
-
             raft_msg_t msg;
-            // INTEGRATE NEW CODEC
-            if (raft_msg_decode(payload, h->payload_len, &msg)) {
 
-                // SECURITY BOUNDARY: Overwrite stated identity with TLS/TCP verified sender identity.
+            if (raft_msg_decode(payload, h->payload_len, &msg)) {
                 msg.from = h->sender_id;
 
                 if (msg.to != target_node->server->physical_node_id) {
                     fprintf(stderr, "[WARN] Dropped frame not addressed to this node.\n");
                 } else {
-                    // Strict routing to the protected remote API. Prevents injection of local ticks/proposals.
                     raft_step_remote(target_node->core, &msg);
-
                     if (raft_activity_accepted(target_node->core)) {
                         reset_election_timer(target_node);
                     }
                 }
-
                 raft_msg_free_payloads(&msg);
                 raft_node_pump(target_node);
             } else {
@@ -525,19 +557,45 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         }
         offset += frame_size;
     }
+    return offset;
+}
+
+static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
+    peer_connection_t *peer = (peer_connection_t *)client;
+
+    if (nread <= 0 || peer->server->network_isolated) {
+        close_and_cleanup_peer(peer, buf);
+        return;
+    }
+
+    if (peer->buffer_len + nread > peer->buffer_cap) {
+        if (!ensure_peer_buffer_capacity(peer, peer->buffer_len + nread)) {
+            close_and_cleanup_peer(peer, buf);
+            return;
+        }
+    }
+
+    memcpy(peer->buffer + peer->buffer_len, buf->base, nread);
+    peer->buffer_len += nread;
+
+    size_t offset = parse_peer_frames(peer);
+
+    if (offset == SIZE_MAX) { // Fatal parsing failure triggered
+        close_and_cleanup_peer(peer, buf);
+        return;
+    }
 
     if (offset > 0 && offset < peer->buffer_len) {
         memmove(peer->buffer, peer->buffer + offset, peer->buffer_len - offset);
     }
     peer->buffer_len -= offset;
+
     if (buf->base) free(buf->base);
 }
 
-static void register_peer(raft_server_t* server, peer_connection_t* peer) {
-    if (server->active_peer_count < RAFT_MAX_PEERS) {
-        server->active_peers[server->active_peer_count++] = peer;
-    }
-}
+// ============================================================================
+// CONNECTION LIFECYCLE
+// ============================================================================
 
 static void on_new_connection(uv_stream_t *server_stream, int status) {
     if (status < 0) return;
@@ -601,7 +659,13 @@ static void attempt_reconnect(uv_timer_t* handle) {
     }
 }
 
+// ============================================================================
+// PUBLIC SERVER API
+// ============================================================================
+
 int raft_server_init(raft_server_t* server, uv_loop_t* loop, uint64_t node_id, uint32_t max_groups, const char* data_dir) {
+    if (node_id == 0 || max_groups == 0) return -1; // Phase 1: Reject strictly invalid inputs
+
     memset(server, 0, sizeof(*server));
     server->physical_node_id = node_id;
     server->loop = loop;
@@ -639,13 +703,19 @@ void raft_server_connect(raft_server_t* server, const char* ip, int port, uint64
     kp->reconnect_timer.data = kp;
 
     server->known_peers[server->known_peer_count++] = kp;
-
     attempt_reconnect(&kp->reconnect_timer);
 }
+
+// ============================================================================
+// PUBLIC NODE API
+// ============================================================================
 
 void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id, uint64_t* init_peers, size_t num_peers,
                     raft_apply_fn apply_cb, void* apply_ctx, raft_read_cb read_cb, void* read_ctx,
                     raft_snapshot_fn snap_cb, void* snap_ctx) {
+
+    if (group_id >= server->max_groups) return; // Phase 1: Prevent out-of-bounds corruption
+
     memset(node, 0, sizeof(*node));
     node->group_id = group_id;
     node->server = server;
@@ -664,9 +734,14 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     uint64_t saved_term = 0, saved_vote = 0, saved_commit = 0, saved_applied = 0;
     uint64_t snap_idx = 0, snap_term = 0;
 
-    uint64_t load_peers[RAFT_MAX_PEERS]; bool load_learners[RAFT_MAX_PEERS];
+    uint64_t load_peers[RAFT_MAX_PEERS];
+    bool load_learners[RAFT_MAX_PEERS];
     size_t active_peers = num_peers;
-    for (size_t i = 0; i < num_peers; i++) { load_peers[i] = init_peers[i]; load_learners[i] = false; }
+
+    for (size_t i = 0; i < num_peers; i++) {
+        load_peers[i] = init_peers[i];
+        load_learners[i] = false;
+    }
 
     char meta_path[512];
     snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", server->data_dir, (unsigned long long)group_id);
@@ -699,7 +774,14 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
     node->saved_commit = saved_commit; node->saved_applied = saved_applied;
     node->saved_snap_idx = snap_idx; node->saved_snap_term = snap_term;
 
-    node->core = raft_io_boot(&node->wal, server->physical_node_id, load_peers, load_learners, active_peers, saved_term, saved_vote, saved_commit, saved_applied, snap_idx, snap_term);
+    node->core = raft_io_boot(&node->wal, server->physical_node_id, load_peers, load_learners, active_peers,
+                              saved_term, saved_vote, saved_commit, saved_applied, snap_idx, snap_term);
+
+    // Phase 1: Fail closed if the core mathematical validation rejected the boot sequences
+    if (!node->core) {
+        node->fatal_error = true;
+        return;
+    }
 
     uv_timer_init(server->loop, &node->election_timer); node->election_timer.data = node;
     uv_timer_init(server->loop, &node->heartbeat_timer); node->heartbeat_timer.data = node;
@@ -707,6 +789,8 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
 }
 
 int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, uint64_t client_id, uint64_t client_seq, uint64_t* out_leader_id) {
+    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_ERR_NOT_LEADER; // Phase 1: Unified Fatal Check
+
     if (raft_state(node->core) != RAFT_STATE_LEADER) {
         if (out_leader_id) *out_leader_id = raft_leader_id(node->core);
         return RAFT_ERR_NOT_LEADER;
@@ -730,6 +814,8 @@ int raft_node_propose(raft_node_t* node, const uint8_t* payload, uint32_t len, u
 }
 
 int raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_leader_id) {
+    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_ERR_NOT_LEADER; // Phase 1: Unified Fatal Check
+
     if (raft_state(node->core) != RAFT_STATE_LEADER) {
         if (out_leader_id) *out_leader_id = raft_leader_id(node->core);
         return RAFT_ERR_NOT_LEADER;
@@ -743,6 +829,8 @@ int raft_node_read_index(raft_node_t* node, uint64_t read_seq, uint64_t* out_lea
 }
 
 int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
+    if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return RAFT_APPLY_FATAL; // Phase 1: Unified Fatal Check
+
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
     uint64_t term = raft_log_term(node->core, compact_index);

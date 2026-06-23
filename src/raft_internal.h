@@ -12,7 +12,6 @@
 #define MAX_PEERS 64
 #define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
-#define RAFT_MAX_FRAME_SIZE (1024 * 1024) // 1MB maximum network frame size
 
 typedef struct {
     uint64_t read_seq;
@@ -40,11 +39,12 @@ struct raft_s {
     uint64_t commit_index;
     uint64_t last_applied;
 
-    uint64_t peers[MAX_REMOTE_PEERS]; // Constrained to remote only
+    uint64_t peers[MAX_REMOTE_PEERS];
     size_t num_peers;
 
     uint64_t next_index[MAX_PEERS];
     uint64_t match_index[MAX_PEERS];
+    uint64_t snapshot_offset[MAX_PEERS]; // Leader tracks snapshot progress
 
     size_t votes_received;
     bool voted_for_me[MAX_PEERS];
@@ -73,8 +73,10 @@ struct raft_s {
     uint64_t leader_id;
 
     bool pending_snapshot;
-    uint8_t* pending_snapshot_data;
+    uint8_t* pending_snapshot_data; // Holds the current streaming chunk
     size_t pending_snapshot_len;
+    uint64_t pending_snapshot_offset;
+    bool pending_snapshot_done;
     uint64_t pending_snapshot_from;
     uint64_t pending_snapshot_msg_index;
     uint64_t pending_snapshot_msg_term;
@@ -83,7 +85,7 @@ struct raft_s {
     bool pending_snapshot_is_learner[MAX_PEERS];
     size_t pending_snapshot_num_peers;
 
-    bool fatal_error; // Exposes core invariants breaches
+    bool fatal_error;
 };
 
 // Internal Submodule APIs
@@ -111,7 +113,6 @@ void raft_read_index_step(raft_t* r, raft_msg_t* msg);
 void raft_read_index_ack(raft_t* r, size_t peer_idx, uint64_t read_seq);
 void raft_membership_apply_config(raft_t* r, uint64_t index);
 
-// Safe Internal Topology Mutations
 void raft_add_learner(raft_t* r, uint64_t peer_id);
 void raft_promote_learner(raft_t* r, uint64_t peer_id);
 
