@@ -79,12 +79,23 @@ static void queue_local_msg(raft_node_t* node, msg_type_t type) {
 // ============================================================================
 // DISK I/O & PERSISTENCE HELPERS
 // ============================================================================
+static bool sync_parent_dir(const char* dir_path) {
+    int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) return false;
+    bool ok = false;
+#ifdef __APPLE__
+    ok = (fcntl(dir_fd, F_FULLFSYNC, 0) != -1);
+#else
+    ok = (fsync(dir_fd) == 0);
+#endif
+    close(dir_fd);
+    return ok;
+}
 
 static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint64_t commit, uint64_t applied, uint64_t snap_idx, uint64_t snap_term) {
-    char tmp_path[512], meta_path[512], dir_path[512];
+    char tmp_path[512], meta_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s/meta_grp%llu.tmp", node->server->data_dir, (unsigned long long)node->group_id);
     snprintf(meta_path, sizeof(meta_path), "%s/meta_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
-    snprintf(dir_path, sizeof(dir_path), "%s", node->server->data_dir);
 
     FILE* f = fopen(tmp_path, "wb");
     if (!f) return false;
@@ -106,21 +117,24 @@ static bool save_hardstate(raft_node_t* node, uint64_t term, uint64_t vote, uint
         if (fwrite(&p, sizeof(raft_meta_peer_t), 1, f) != 1) { fclose(f); return false; }
     }
 
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
+    // Mathematically verify every system call
+    bool ok = true;
+    if (fflush(f) != 0) ok = false;
+    if (ok && fsync(fileno(f)) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+
+    if (!ok) {
+        unlink(tmp_path);
+        return false;
+    }
 
     if (rename(tmp_path, meta_path) != 0) return false;
 
-    int dir_fd = open(dir_path, O_RDONLY);
-    if (dir_fd >= 0) {
-#ifdef __APPLE__
-        fcntl(dir_fd, F_FULLFSYNC, 0);
-#else
-        fsync(dir_fd);
-#endif
-        close(dir_fd);
+    // FIX 3: Strict directory fsync. Fail closed if the directory is not durably synced!
+    if (!sync_parent_dir(node->server->data_dir)) {
+        return false;
     }
+
     return true;
 }
 
@@ -280,23 +294,42 @@ static void pump_worker_thread(uv_work_t* req) {
         snprintf(tmp_snap, sizeof(tmp_snap), "%s/snap_grp%llu.tmp", node->server->data_dir, (unsigned long long)node->group_id);
         snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
 
-        FILE* sf = fopen(tmp_snap, ready->snapshot_offset > 0 ? "ab" : "wb");
-        if (!sf) {
+        // FIX 2: Use O_TRUNC to wipe stale tmp files on chunk 0
+        int flags = O_CREAT | O_WRONLY;
+        if (ready->snapshot_offset == 0) flags |= O_TRUNC;
+
+        int fd = open(tmp_snap, flags, 0644);
+        if (fd < 0) {
             ctx->snap_success = false;
         } else {
-            // Strict cryptographic verification of disk durability bounds
             bool ok = true;
             if (ready->snapshot_len > 0) {
-                ok = (fwrite(ready->snapshot_data, 1, ready->snapshot_len, sf) == ready->snapshot_len);
+                ssize_t written = pwrite(fd, ready->snapshot_data, ready->snapshot_len, ready->snapshot_offset);
+                if (written < 0 || (size_t)written != ready->snapshot_len) {
+                    ok = false;
+                }
             }
-            if (ok) ok = (fflush(sf) == 0);
-            if (ok) ok = (fsync(fileno(sf)) == 0);
-            if (fclose(sf) != 0) ok = false;
+
+            // FIX 2: Chop off trailing garbage bytes if a previous larger snapshot aborted
+            if (ready->snapshot_done && ok) {
+                off_t final_size = ready->snapshot_offset + ready->snapshot_len;
+                if (ftruncate(fd, final_size) != 0) ok = false;
+            }
+
+            if (ok && fsync(fd) != 0) ok = false;
+            if (close(fd) != 0) ok = false;
 
             if (!ok) {
                 ctx->snap_success = false;
             } else if (ready->snapshot_done) {
-                if (rename(tmp_snap, dat_snap) != 0) ctx->snap_success = false;
+                if (rename(tmp_snap, dat_snap) != 0) {
+                    ctx->snap_success = false;
+                } else {
+                    // FIX 5: Directory Fsync to guarantee the rename survived!
+                    if (!sync_parent_dir(node->server->data_dir)) {
+                        ctx->snap_success = false;
+                    }
+                }
             }
         }
     }
@@ -1001,16 +1034,26 @@ int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
 
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
+    // Capture boundary state BEFORE requesting compaction
+    uint64_t old_snap = raft_snapshot_index(node->core);
     uint64_t term = raft_log_term(node->core, compact_index);
+
     raft_compact_after_snapshot(node->core, compact_index, term);
 
     if (raft_has_fatal_error(node->core)) return RAFT_APPLY_FATAL;
 
-    if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, node->saved_applied, raft_snapshot_index(node->core), raft_snapshot_term(node->core))) {
+    // FIX 1: Verify the core successfully validated and advanced the snapshot
+    uint64_t new_snap = raft_snapshot_index(node->core);
+    if (new_snap == old_snap || new_snap != compact_index) {
+        return -1; // Core rejected the compaction (e.g., index != last_applied). Abort!
+    }
+
+    if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, node->saved_applied, new_snap, raft_snapshot_term(node->core))) {
         return -1;
     }
 
-    raft_wal_purge_head(&node->wal, compact_index);
+    // Safe to purge the physical file, the core successfully shifted its boundaries
+    raft_wal_purge_head(&node->wal, new_snap);
     return RAFT_OK;
 }
 

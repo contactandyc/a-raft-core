@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <uv.h>
 #include "a-raft-library/raft_server.h"
 #include "raft_internal.h"
@@ -59,35 +60,29 @@ static uint64_t read_disk_snap_idx(uint64_t group_id) {
     return 0;
 }
 
-// ----------------------------------------------------------------------------
-// DISK-BEFORE-NETWORK RIGOROUS TESTS (Issues 2 & 3)
-// ----------------------------------------------------------------------------
-
 MACRO_TEST(vote_response_not_sent_before_hardstate_persisted) {
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
     raft_server_connect(&srv, "127.0.0.1", 9000, 2);
 
     raft_node_t node;
-    uint64_t peers[] = {1, 2}; // Issue 1: Full topology
+    uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
     raft_msg_t req = { .type = MSG_REQUEST_VOTE, .to = 1, .from = 2, .term = 5, .index = 0, .log_term = 0 };
     raft_step_remote(node.core, &req);
     raft_node_pump(&node);
 
-    // Issue 2: Prove network is empty AND disk has not yet updated
     MACRO_ASSERT_EQ_INT(srv.known_peers[0]->out_queue_len, 0);
-    MACRO_ASSERT_EQ_INT(read_disk_term(0), 0); // Disk is still stale!
+    MACRO_ASSERT_EQ_INT(read_disk_term(0), 0);
 
     wait_for_pump(&loop);
 
-    // Issue 2: Prove disk is securely written BEFORE we check network queue
-    MACRO_ASSERT_EQ_INT(read_disk_term(0), 5); // Disk is durable!
+    MACRO_ASSERT_EQ_INT(read_disk_term(0), 5);
     MACRO_ASSERT_TRUE(srv.known_peers[0]->out_queue_len > 0);
 
     raft_wal_close(&node.wal);
@@ -98,30 +93,28 @@ MACRO_TEST(vote_response_not_sent_before_hardstate_persisted) {
 MACRO_TEST(snapshot_success_ack_not_sent_until_new_meta_persisted) {
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
     raft_server_connect(&srv, "127.0.0.1", 9000, 2);
 
     raft_node_t node;
-    uint64_t peers[] = {1, 2}; // Issue 1
+    uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     uint8_t snap_data[] = "SNAP";
-    raft_msg_t snap = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                        .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true };
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
-    raft_step_remote(node.core, &snap);
+    raft_step_remote(node.core, &snap1);
     raft_node_pump(&node);
-
-    // Issue 3: Prove network is empty AND disk is stale
-    MACRO_ASSERT_EQ_INT(srv.known_peers[0]->out_queue_len, 0);
-    MACRO_ASSERT_EQ_INT(read_disk_snap_idx(0), 0);
-
     wait_for_pump(&loop);
 
-    // Issue 3: Prove disk is safely written with snapshot metadata
     MACRO_ASSERT_EQ_INT(read_disk_snap_idx(0), 10);
     MACRO_ASSERT_TRUE(srv.known_peers[0]->out_queue_len > 0);
 
@@ -130,14 +123,10 @@ MACRO_TEST(snapshot_success_ack_not_sent_until_new_meta_persisted) {
     uv_loop_close(&loop);
 }
 
-// ----------------------------------------------------------------------------
-// SNAPSHOT CHUNKING SAFETY TESTS (Issue 4)
-// ----------------------------------------------------------------------------
-
 MACRO_TEST(snapshot_chunk_duplicate_offset_is_rejected_or_reacked) {
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
@@ -145,29 +134,25 @@ MACRO_TEST(snapshot_chunk_duplicate_offset_is_rejected_or_reacked) {
     uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
-    // 1. Send valid Chunk 1 (Offset 0)
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     uint8_t snap_data[] = "SNAP";
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(node.core, &snap1);
-
-    // FIX: Simulate host consuming Chunk 1 so the core unlocks the next chunk!
     raft_node_pump(&node); wait_for_pump(&loop);
 
-    // 2. Send valid Chunk 2 (Offset 4)
     raft_msg_t snap2 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 4, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+                         .snapshot_offset = 4, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(node.core, &snap2);
-
-    // FIX: Simulate host consuming Chunk 2!
     raft_node_pump(&node); wait_for_pump(&loop);
 
-    // 3. Attempt to send Duplicate Chunk 2 (Offset 4) again!
     raft_step_remote(node.core, &snap2);
-
     raft_ready_t ready = raft_get_ready(node.core);
 
-    // The third packet MUST trigger a rejection hinting the correct expected offset (which is now 8)
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_TRUE(ready.messages[0].reject);
     MACRO_ASSERT_EQ_INT(ready.messages[0].conflict_index, 8);
@@ -180,7 +165,7 @@ MACRO_TEST(snapshot_chunk_duplicate_offset_is_rejected_or_reacked) {
 MACRO_TEST(snapshot_chunk_gap_does_not_append_to_tmp_file) {
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
@@ -188,51 +173,53 @@ MACRO_TEST(snapshot_chunk_gap_does_not_append_to_tmp_file) {
     uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
-    // Send valid Chunk 1 (Offset 0, Len 4)
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     uint8_t snap_data[] = "SNAP";
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(node.core, &snap1);
     raft_node_pump(&node); wait_for_pump(&loop);
 
-    // Send invalid Chunk 3 (Offset 8) -- skipping Chunk 2 (Offset 4)
     raft_msg_t snap3 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 8, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+                         .snapshot_offset = 8, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(node.core, &snap3);
 
     raft_ready_t ready = raft_get_ready(node.core);
 
-    // Must cleanly reject and tell leader to resend from Offset 4
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_TRUE(ready.messages[0].reject);
     MACRO_ASSERT_EQ_INT(ready.messages[0].conflict_index, 4);
-    MACRO_ASSERT_FALSE(ready.install_snapshot); // Do NOT give garbage chunk to disk worker!
+    MACRO_ASSERT_FALSE(ready.install_snapshot);
 
     raft_wal_close(&node.wal);
     raft_destroy(node.core);
     uv_loop_close(&loop);
 }
 
-// ----------------------------------------------------------------------------
-// EXISTING ROBUST TESTS
-// ----------------------------------------------------------------------------
-
 MACRO_TEST(node_pump_snapshot_install_does_not_consume_stale_ready) {
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
     raft_server_connect(&srv, "127.0.0.1", 9000, 2);
 
     raft_node_t node;
-    uint64_t peers[] = {1, 2}; // Issue 1
+    uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
 
     uint8_t snap_data[] = "SNAP";
     raft_msg_t snap = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                        .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true };
+                        .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true,
+                        .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
     raft_step_remote(node.core, &snap);
     raft_node_pump(&node);
@@ -248,10 +235,9 @@ MACRO_TEST(node_pump_snapshot_install_does_not_consume_stale_ready) {
 }
 
 MACRO_TEST(snapshot_discarded_suffix_does_not_resurrect_after_restart) {
-    // ... [Content remains exactly the same, just update peers[] to {1, 2}] ...
     uv_loop_t loop;
     uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv;
     raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
@@ -267,8 +253,13 @@ MACRO_TEST(snapshot_discarded_suffix_does_not_resurrect_after_restart) {
         wait_for_pump(&loop);
     }
 
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     uint8_t snap_data[] = "SNAP";
-    raft_msg_t snap = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 3, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true };
+    raft_msg_t snap = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 3, .log_term = 2,
+                        .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true,
+                        .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(node.core, &snap);
     raft_node_pump(&node);
     wait_for_pump(&loop);
@@ -294,52 +285,162 @@ MACRO_TEST(snapshot_discarded_suffix_does_not_resurrect_after_restart) {
 
 MACRO_TEST(snapshot_worker_short_write_or_fsync_failure_rejects_chunk) {
     uv_loop_t loop; uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
     raft_node_t node; uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
-    // Simulate catastrophic disk permissions error (ReadOnly)
     system("chmod 400 /tmp/raft_test_pump");
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
 
     uint8_t snap_data[] = "SNAP";
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false };
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
     raft_step_remote(node.core, &snap1);
     raft_node_pump(&node); wait_for_pump(&loop);
 
-    // I/O thread must detect the fwrite/fsync failure and safely fail the snapshot
     MACRO_ASSERT_FALSE(node.flush_ctx.snap_success);
 
-    system("chmod 777 /tmp/raft_test_pump"); // Restore for cleanup
+    system("chmod 777 /tmp/raft_test_pump");
     raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
 }
 
 MACRO_TEST(snapshot_install_does_not_restore_stale_ctx_snapshot_metadata) {
     uv_loop_t loop; uv_loop_init(&loop);
-    system("rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
 
     raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
     raft_node_t node; uint64_t peers[] = {1, 2};
     raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
 
-    // Intentionally poison the async context to simulate a stale meta capture
     node.flush_ctx.meta_changed = true;
     node.flush_ctx.snap_idx = 5;
 
-    // Inject a legitimate Snapshot at index 10
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     uint8_t snap_data[] = "SNAP";
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true };
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
     raft_step_remote(node.core, &snap1);
     raft_node_pump(&node); wait_for_pump(&loop);
 
-    // Assert the node safely ignored the poisoned ctx.snap_idx and pulled directly from the core
     MACRO_ASSERT_EQ_INT(node.saved_snap_idx, 10);
 
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(snapshot_retry_overwrites_at_exact_offset_not_append_eof) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    uint8_t snap_data[] = "ABCD";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
+    raft_step_remote(node.core, &snap1);
+
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    raft_step_remote(node.core, &snap1);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    struct stat st;
+    stat("/tmp/raft_test_pump/snap_grp0.dat", &st);
+    MACRO_ASSERT_EQ_INT(st.st_size, 4);
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(snapshot_new_offset_zero_truncates_old_tmp_tail) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    FILE* f = fopen("/tmp/raft_test_pump/snap_grp0.tmp", "wb");
+    fwrite("GARBAGE_DATA_THAT_IS_TOO_LONG", 1, 29, f);
+    fclose(f);
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"NEW", .snapshot_len = 3, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
+    raft_step_remote(node.core, &snap1);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    struct stat st;
+    stat("/tmp/raft_test_pump/snap_grp0.dat", &st);
+    MACRO_ASSERT_EQ_INT(st.st_size, 3);
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(hardstate_directory_fsync_failure_returns_false) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // Destroy write/execute permissions on the directory to force a fsync failure
+    system("chmod 400 /tmp/raft_test_pump");
+
+    // FIX: Send a remote AppendEntries to the Follower.
+    // This organically forces the core to request a disk flush without needing internal headers!
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0, .entries = &e, .num_entries = 1, .commit = 0 };
+    raft_step_remote(node.core, &app);
+
+    // This pump will attempt to write the WAL/Hardstate and fail at the directory fsync
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    // Because the directory couldn't be accessed, the disk worker MUST trigger a fatal IO failure
+    MACRO_ASSERT_TRUE(node.fatal_error);
+
+    system("chmod 777 /tmp/raft_test_pump"); // Restore for cleanup
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(snapshot_final_rename_requires_directory_fsync) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("chmod -R 777 /tmp/raft_test_pump 2>/dev/null; rm -rf /tmp/raft_test_pump; mkdir -p /tmp/raft_test_pump");
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    system("chmod 400 /tmp/raft_test_pump"); // Destroy permissions
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"SNP", .snapshot_len = 3, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
+    raft_step_remote(node.core, &snap1);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    // Must be marked as failure because the directory containing the rename failed
+    MACRO_ASSERT_FALSE(node.flush_ctx.snap_success);
+
+    system("chmod 777 /tmp/raft_test_pump"); // Restore for cleanup
     raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
 }
 
@@ -355,6 +456,10 @@ int main(void) {
     MACRO_ADD(tests, snapshot_discarded_suffix_does_not_resurrect_after_restart);
     MACRO_ADD(tests, snapshot_worker_short_write_or_fsync_failure_rejects_chunk);
     MACRO_ADD(tests, snapshot_install_does_not_restore_stale_ctx_snapshot_metadata);
+    MACRO_ADD(tests, snapshot_retry_overwrites_at_exact_offset_not_append_eof);
+    MACRO_ADD(tests, snapshot_new_offset_zero_truncates_old_tmp_tail);
+    MACRO_ADD(tests, hardstate_directory_fsync_failure_returns_false);
+    MACRO_ADD(tests, snapshot_final_rename_requires_directory_fsync);
 
     macro_run_all("raft_pump", tests, test_count);
     return 0;

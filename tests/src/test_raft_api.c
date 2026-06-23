@@ -186,6 +186,28 @@ MACRO_TEST(inbound_queue_cap_exactly_10000_does_not_grow) {
     free(node.inbound_queue);
 }
 
+MACRO_TEST(node_compact_noops_must_not_purge_wal) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_test_api; mkdir -p /tmp/raft_test_api");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_api");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // A freshly initialized node has last_applied = 0.
+    // Attempting to compact at index 100 must be rejected by the core
+    // because 100 != last_applied.
+    int err = raft_node_compact(&node, 100);
+
+    // The node API must detect that the core refused to compact,
+    // abort the WAL purge, and return the error code (-1).
+    MACRO_ASSERT_EQ_INT(err, -1);
+
+    raft_wal_close(&node.wal);
+    raft_destroy(node.core);
+    uv_loop_close(&loop);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -199,6 +221,8 @@ int main(void) {
     MACRO_ADD(tests, node_propose_null_payload_with_nonzero_len_returns_error);
     MACRO_ADD(tests, read_index_queue_failure_returns_error);
     MACRO_ADD(tests, inbound_queue_cap_exactly_10000_does_not_grow);
+    MACRO_ADD(tests, node_compact_noops_must_not_purge_wal);
+
     macro_run_all("raft_api", tests, test_count);
     return 0;
 }

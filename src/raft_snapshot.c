@@ -38,18 +38,33 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
 
                 // Reject explicitly bad payloads before taking action
                 if (msg->snapshot_len > 0 && !msg->snapshot_data) {
-                    raft_msg_t res = {
-                        .type = MSG_APPEND_RES,
-                        .to = msg->from,
-                        .term = r->current_term,
-                        .reject = true,
-                        .conflict_index = r->expected_snapshot_offset
-                    };
+                    raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = r->expected_snapshot_offset };
                     raft_send_msg(r, res);
                     return;
                 }
 
                 if (msg->snapshot_offset == 0) {
+                    // FIX 4: Aggressively validate snapshot ConfState topology before acceptance
+                    if (msg->snapshot_num_peers == 0 || msg->snapshot_num_peers > MAX_PEERS) {
+                        raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
+                        raft_send_msg(r, res);
+                        return;
+                    }
+                    for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
+                        if (msg->snapshot_peers[i] == 0) {
+                            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
+                            raft_send_msg(r, res);
+                            return;
+                        }
+                        for (size_t j = i + 1; j < msg->snapshot_num_peers; j++) {
+                            if (msg->snapshot_peers[i] == msg->snapshot_peers[j]) {
+                                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
+                                raft_send_msg(r, res);
+                                return;
+                            }
+                        }
+                    }
+
                     r->expected_snapshot_offset = 0;
                     r->pending_snapshot = true;
 
@@ -105,11 +120,20 @@ void raft_snapshot_acked(raft_t* r, bool success) {
     // Blocker 2: Mark chunk consumed so we don't re-process it!
     r->pending_snapshot_chunk_ready = false;
 
+    // FIX 1: If the disk worker failed, backtrack the conflict index to the start of the chunk
+    // and reset the expected offset so the follower accepts the retry.
+    uint64_t next_offset = success ? r->pending_snapshot_offset + r->pending_snapshot_len
+                                   : r->pending_snapshot_offset;
+
+    if (!success) {
+        r->expected_snapshot_offset = r->pending_snapshot_offset;
+    }
+
     raft_msg_t res = { .type = MSG_APPEND_RES, .to = r->pending_snapshot_from, .term = r->current_term,
                        .reject = !success,
                        .index = (success && r->pending_snapshot_done) ? r->pending_snapshot_msg_index : raft_log_last_index(r),
                        .snapshot_done = r->pending_snapshot_done,
-                       .conflict_index = r->pending_snapshot_offset + r->pending_snapshot_len };
+                       .conflict_index = next_offset };
 
     if (success && r->pending_snapshot_done) {
         bool suffix_match = false;

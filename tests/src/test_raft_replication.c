@@ -1296,7 +1296,7 @@ MACRO_TEST(leader_resends_snapshot_from_conflict_index_on_chunk_reject) {
     raft_step_remote(r, &vote);
     raft_advance_all_for_tests_only(r);
 
-    // FIX: Seed the log with 10 entries so it can actually be compacted!
+    // Seed the log with 10 entries so it can actually be compacted!
     for (int i=0; i<10; i++) {
         raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
         raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
@@ -1306,8 +1306,8 @@ MACRO_TEST(leader_resends_snapshot_from_conflict_index_on_chunk_reject) {
     }
     raft_advance_all_for_tests_only(r);
 
-    // Force application up to the end of the log to unlock compaction
-    r->last_applied = 11;
+    // FIX: Enforce exact boundary required by the new safety rules!
+    r->last_applied = 10;
 
     // Now we can successfully compact at index 10
     raft_compact_after_snapshot(r, 10, 1);
@@ -1330,7 +1330,6 @@ MACRO_TEST(leader_resends_snapshot_from_conflict_index_on_chunk_reject) {
 
     raft_destroy(r);
 }
-
 
 int main(void) {
     macro_test_case tests[256];

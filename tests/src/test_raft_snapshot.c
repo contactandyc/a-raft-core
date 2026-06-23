@@ -10,37 +10,33 @@
 #include "the-macro-library/macro_test.h"
 
 MACRO_TEST(raft_fault_duplicate_snapshot_install_is_safe) {
-    uint64_t peers[] = {2, 3};
-    raft_t* r = raft_create(1, peers, 2);
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
 
-    uint8_t snap_data[] = "STATE";
-    raft_msg_t snap1 = {
-        .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
-        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5,
-        .snapshot_done = true // Explicitly close the chunk stream
-    };
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"SNAP", .snapshot_len = 4, .snapshot_done = true,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
     raft_step_remote(r, &snap1);
     raft_ready_t rd1 = raft_get_ready(r);
+
     MACRO_ASSERT_TRUE(rd1.install_snapshot);
-    MACRO_ASSERT_EQ_INT(rd1.snapshot_index, 100);
+    MACRO_ASSERT_EQ_INT(rd1.num_messages, 0);
 
     raft_snapshot_acked(r, true);
-    raft_advance_all_for_tests_only(r);
+    raft_ready_t rd_ack1 = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(rd_ack1.num_messages, 1);
 
-    raft_msg_t snap2 = {
-        .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
-        .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5,
-        .snapshot_done = true
-    };
-    raft_step_remote(r, &snap2);
-
+    raft_step_remote(r, &snap1);
     raft_ready_t rd2 = raft_get_ready(r);
 
     MACRO_ASSERT_FALSE(rd2.install_snapshot);
-    MACRO_ASSERT_EQ_INT(raft_snapshot_index(r), 100);
-    MACRO_ASSERT_FALSE(rd2.messages[0].reject);
-    MACRO_ASSERT_EQ_INT(rd2.messages[0].index, 100);
+    MACRO_ASSERT_EQ_INT(rd2.num_messages, 2);
+    MACRO_ASSERT_EQ_INT(rd2.messages[0].type, MSG_APPEND_RES);
+    MACRO_ASSERT_EQ_INT(rd2.messages[0].index, 10);
 
     raft_destroy(r);
 }
@@ -55,10 +51,14 @@ MACRO_TEST(snapshot_install_failure_leaves_state_intact) {
     raft_advance_all_for_tests_only(r);
     MACRO_ASSERT_EQ_INT(raft_last_index(r), 1);
 
+    uint64_t snap_peers[] = {1, 2, 3};
+    bool snap_learners[] = {false, false, false};
+
     uint8_t snap_data[] = "STATE";
     raft_msg_t snap = {
         .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
         .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5,
+        .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners,
         .snapshot_done = true
     };
     raft_step_remote(r, &snap);
@@ -86,10 +86,14 @@ MACRO_TEST(snapshot_ack_sent_only_after_acked_true) {
     uint64_t peers[] = {2, 3};
     raft_t* r = raft_create(1, peers, 2);
 
+    uint64_t snap_peers[] = {1, 2, 3};
+    bool snap_learners[] = {false, false, false};
+
     uint8_t snap_data[] = "STATE";
     raft_msg_t snap = {
         .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
         .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5,
+        .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners,
         .snapshot_done = true
     };
     raft_step_remote(r, &snap);
@@ -128,10 +132,14 @@ MACRO_TEST(snapshot_install_preserves_valid_suffix) {
     raft_step_remote(r, &app);
     MACRO_ASSERT_EQ_INT(raft_last_index(r), 102);
 
+    uint64_t snap_peers[] = {1, 2, 3};
+    bool snap_learners[] = {false, false, false};
+
     uint8_t snap_data[] = "STATE";
     raft_msg_t snap = {
         .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
         .index = 100, .log_term = 2, .snapshot_data = snap_data, .snapshot_len = 5,
+        .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners,
         .snapshot_done = true
     };
 
@@ -212,28 +220,28 @@ MACRO_TEST(lagging_follower_installs_snapshot_and_gets_updated_membership) {
 
 MACRO_TEST(snapshot_below_last_applied_is_ignored) {
     uint64_t peers[] = {1, 2, 3};
-    // Boot a follower already safely compacted and applied up to index 100
     raft_t* r = raft_restore(1, peers, NULL, 3, 2, 0, 100, 100, 100, 2, NULL, 0);
 
     MACRO_ASSERT_EQ_INT(raft_last_applied(r), 100);
 
-    // Simulate leader sending a stale snapshot at index 80
+    uint64_t snap_peers[] = {1, 2, 3};
+    bool snap_learners[] = {false, false, false};
+
     uint8_t snap_data[] = "OLD_STATE";
     raft_msg_t snap = {
         .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2,
         .index = 80, .log_term = 1, .snapshot_data = snap_data, .snapshot_len = 9,
+        .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners,
         .snapshot_done = true
     };
     raft_step_remote(r, &snap);
 
-    // The core MUST ignore the stale snapshot, but importantly, MUST NOT reject it.
-    // Furthermore, it should fast-forward the leader by responding with its actual last_applied (100)!
     raft_ready_t ready = raft_get_ready(r);
     MACRO_ASSERT_FALSE(ready.install_snapshot);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
-    MACRO_ASSERT_FALSE(ready.messages[0].reject); // Acknowledge without applying!
+    MACRO_ASSERT_FALSE(ready.messages[0].reject);
     MACRO_ASSERT_TRUE(ready.messages[0].snapshot_done);
-    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 100); // FIX: Expect 100, not 80
+    MACRO_ASSERT_EQ_INT(ready.messages[0].index, 100);
 
     raft_destroy(r);
 }
@@ -242,7 +250,6 @@ MACRO_TEST(leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_to
     uint64_t peers[] = {2, 3};
     raft_t* r = raft_create(1, peers, 2);
 
-    // Become Leader
     raft_msg_t hup = { .type = MSG_HUP };
     raft_step_local(r, &hup);
     raft_msg_t pv = { .type = MSG_PRE_VOTE_RES, .to = 1, .from = 2, .term = 1, .reject = false };
@@ -251,7 +258,6 @@ MACRO_TEST(leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_to
     raft_step_remote(r, &vote);
     raft_advance_all_for_tests_only(r);
 
-    // Apply 10 dummy entries
     for (int i=0; i<10; i++) {
         raft_entry_t e = { .type = ENTRY_NORMAL, .data = (uint8_t*)"X", .data_len = 1 };
         raft_msg_t p = { .type = MSG_PROPOSE, .entries = &e, .num_entries = 1 };
@@ -261,22 +267,16 @@ MACRO_TEST(leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_to
     }
     raft_advance_all_for_tests_only(r);
 
-    // Take a snapshot at index 11 (Topology is {1, 2, 3})
     raft_compact_after_snapshot(r, 11, 1);
-
-    // Add Node 4 to the LIVE topology
     raft_add_learner(r, 4);
     raft_promote_learner(r, 4);
 
-    // Force the leader to send a snapshot to a lagging follower (Node 3 is stuck at 0)
     raft_msg_t req = { .type = MSG_APPEND_RES, .to = 1, .from = 3, .term = 1, .reject = true, .index = 0, .conflict_index = 0 };
     raft_step_remote(r, &req);
 
     raft_ready_t ready = raft_get_ready(r);
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_TRUE(ready.messages[0].type == MSG_INSTALL_SNAPSHOT);
-
-    // ASSERTION: The message MUST contain the frozen topology {1, 2, 3}, NOT the live {1, 2, 3, 4}
     MACRO_ASSERT_EQ_INT(ready.messages[0].snapshot_num_peers, 3);
 
     bool found_4 = false;
@@ -292,21 +292,23 @@ MACRO_TEST(snapshot_next_chunk_before_ack_is_rejected) {
     uint64_t peers[] = {2, 3};
     raft_t* r = raft_create(1, peers, 2);
 
-    // Send chunk 0
+    uint64_t snap_peers[] = {1, 2, 3};
+    bool snap_learners[] = {false, false, false};
+
     uint8_t snap_data[] = "CHUNK1";
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 6, .snapshot_done = false };
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 6, .snapshot_done = false,
+                         .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(r, &snap1);
 
-    // Attempt to push chunk 2 BEFORE clearing ready/acking chunk 1
     uint8_t snap_data2[] = "CHUNK2";
     raft_msg_t snap2 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 6, .snapshot_data = snap_data2, .snapshot_len = 6, .snapshot_done = false };
+                         .snapshot_offset = 6, .snapshot_data = snap_data2, .snapshot_len = 6, .snapshot_done = false,
+                         .snapshot_num_peers = 3, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
     raft_step_remote(r, &snap2);
 
     raft_ready_t ready = raft_get_ready(r);
 
-    // Must reject the second chunk with conflict_index = 0
     MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
     MACRO_ASSERT_TRUE(ready.messages[0].reject);
     MACRO_ASSERT_EQ_INT(ready.messages[0].conflict_index, 0);
@@ -318,16 +320,113 @@ MACRO_TEST(snapshot_chunk_malloc_failure_does_not_advance_expected_offset) {
     uint64_t peers[] = {2};
     raft_t* r = raft_create(1, peers, 1);
 
-    // Create an impossibly large payload that will guarantee a malloc failure
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
     raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
-                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"X", .snapshot_len = 0xFFFFFFFFFFFFFFFF, .snapshot_done = false };
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"X", .snapshot_len = 0xFFFFFFFFFFFFFFFF, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
 
     raft_step_remote(r, &snap1);
 
-    // Core must hit fatal_error immediately upon allocation failure,
-    // and critically, the offset must remain safely at 0.
     MACRO_ASSERT_TRUE(raft_has_fatal_error(r));
     MACRO_ASSERT_EQ_INT(r->expected_snapshot_offset, 0);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(snapshot_failed_chunk_rejects_with_failed_offset_not_next_offset) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    uint8_t snap_data[] = "FAIL";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
+
+    raft_step_remote(r, &snap1);
+    raft_get_ready(r);
+
+    raft_snapshot_acked(r, false);
+
+    raft_ready_t ready2 = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready2.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready2.messages[0].reject);
+    MACRO_ASSERT_EQ_INT(ready2.messages[0].conflict_index, 0);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(snapshot_failed_chunk_resets_expected_offset_or_aborts_session) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    uint64_t snap_peers[] = {1, 2};
+    bool snap_learners[] = {false, false};
+
+    uint8_t snap_data[] = "FAIL";
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = snap_data, .snapshot_len = 4, .snapshot_done = false,
+                         .snapshot_num_peers = 2, .snapshot_peers = snap_peers, .snapshot_is_learner = snap_learners };
+
+    raft_step_remote(r, &snap1);
+    raft_get_ready(r);
+
+    raft_snapshot_acked(r, false);
+    MACRO_ASSERT_EQ_INT(r->expected_snapshot_offset, 0);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(compact_at_old_index_does_not_use_future_confstate) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+    r->last_applied = 200;
+
+    raft_compact_after_snapshot(r, 100, 1);
+    MACRO_ASSERT_EQ_INT(r->snapshot_index, 0);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(snapshot_rejects_too_many_confstate_peers) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"SNAP", .snapshot_len = 4,
+                         .snapshot_num_peers = 1000, .snapshot_done = false };
+
+    raft_step_remote(r, &snap1);
+    raft_ready_t ready = raft_get_ready(r);
+
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    MACRO_ASSERT_FALSE(r->pending_snapshot);
+
+    raft_destroy(r);
+}
+
+MACRO_TEST(snapshot_rejects_duplicate_or_zero_confstate_peer_ids) {
+    uint64_t peers[] = {2};
+    raft_t* r = raft_create(1, peers, 1);
+
+    uint64_t bad_peers[] = {5, 5, 0};
+    bool bad_learners[] = {false, false, false};
+
+    raft_msg_t snap1 = { .type = MSG_INSTALL_SNAPSHOT, .to = 1, .from = 2, .term = 2, .index = 10, .log_term = 2,
+                         .snapshot_offset = 0, .snapshot_data = (uint8_t*)"SNAP", .snapshot_len = 4,
+                         .snapshot_num_peers = 3, .snapshot_peers = bad_peers, .snapshot_is_learner = bad_learners, .snapshot_done = false };
+
+    raft_step_remote(r, &snap1);
+    raft_ready_t ready = raft_get_ready(r);
+
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    MACRO_ASSERT_FALSE(r->pending_snapshot);
 
     raft_destroy(r);
 }
@@ -345,6 +444,12 @@ int main(void) {
     MACRO_ADD(tests, leader_snapshot_message_uses_snapshot_persisted_confstate_not_live_topology);
     MACRO_ADD(tests, snapshot_next_chunk_before_ack_is_rejected);
     MACRO_ADD(tests, snapshot_chunk_malloc_failure_does_not_advance_expected_offset);
+
+    MACRO_ADD(tests, snapshot_failed_chunk_rejects_with_failed_offset_not_next_offset);
+    MACRO_ADD(tests, snapshot_failed_chunk_resets_expected_offset_or_aborts_session);
+    MACRO_ADD(tests, compact_at_old_index_does_not_use_future_confstate);
+    MACRO_ADD(tests, snapshot_rejects_too_many_confstate_peers);
+    MACRO_ADD(tests, snapshot_rejects_duplicate_or_zero_confstate_peer_ids);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;

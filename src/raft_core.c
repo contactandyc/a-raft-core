@@ -571,6 +571,11 @@ void raft_advance_all_for_tests_only(raft_t* r) {
 
 void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term) {
     if (!r || r->fatal_error) return;
+
+    // FIX 4: Strictly enforce compaction ONLY at the exact boundary of last_applied.
+    // This prevents future configuration changes from bleeding into historical snapshots.
+    if (compact_index != r->last_applied) return;
+
     if (compact_index <= r->snapshot_index || compact_index > r->last_applied) return;
 
     if (compact_index > raft_log_last_index(r)) return;
