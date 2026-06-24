@@ -431,6 +431,41 @@ MACRO_TEST(snapshot_rejects_duplicate_or_zero_confstate_peer_ids) {
     raft_destroy(r);
 }
 
+MACRO_TEST(snapshot_confstate_with_64_remote_peers_is_rejected) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    uint64_t snap_peers[MAX_PEERS];
+    bool learners[MAX_PEERS] = {0};
+
+    // Deliberately omit self=1. This creates 64 remote peers.
+    for (size_t i = 0; i < MAX_PEERS; i++) {
+        snap_peers[i] = 100 + i;
+    }
+
+    raft_msg_t snap = {
+        .type = MSG_INSTALL_SNAPSHOT,
+        .to = 1,
+        .from = 2,
+        .term = 1,
+        .index = 10,
+        .log_term = 1,
+        .snapshot_offset = 0,
+        .snapshot_done = true,
+        .snapshot_peers = snap_peers,
+        .snapshot_is_learner = learners,
+        .snapshot_num_peers = MAX_PEERS
+    };
+
+    raft_step_remote(r, &snap);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.num_messages > 0);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -450,6 +485,7 @@ int main(void) {
     MACRO_ADD(tests, compact_at_old_index_does_not_use_future_confstate);
     MACRO_ADD(tests, snapshot_rejects_too_many_confstate_peers);
     MACRO_ADD(tests, snapshot_rejects_duplicate_or_zero_confstate_peer_ids);
+    MACRO_ADD(tests, snapshot_confstate_with_64_remote_peers_is_rejected);
 
     macro_run_all("raft_snapshot", tests, test_count);
     return 0;

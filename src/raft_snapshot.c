@@ -7,6 +7,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool validate_snapshot_confstate(raft_t* r, raft_msg_t* msg) {
+    if (msg->snapshot_num_peers == 0 || msg->snapshot_num_peers > MAX_PEERS) return false;
+
+    size_t remote_count = 0;
+
+    for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
+        if (msg->snapshot_peers[i] == 0) return false;
+
+        if (msg->snapshot_peers[i] != r->id) {
+            remote_count++;
+            if (remote_count > MAX_REMOTE_PEERS) return false;
+        }
+
+        for (size_t j = i + 1; j < msg->snapshot_num_peers; j++) {
+            if (msg->snapshot_peers[i] == msg->snapshot_peers[j]) return false;
+        }
+    }
+
+    return true;
+}
+
 void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
     if (msg->type == MSG_INSTALL_SNAPSHOT) {
         if (msg->term >= r->current_term) {
@@ -14,7 +35,6 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
             r->activity_accepted = true;
             r->leader_id = msg->from;
 
-            // Release the leader from stale snapshots instantly
             if (msg->index <= r->last_applied) {
                 uint64_t clamp_idx = msg->index > r->last_applied ? msg->index : r->last_applied;
                 raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = false, .index = clamp_idx, .snapshot_done = true };
@@ -23,20 +43,12 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
             }
 
             if (msg->index > r->snapshot_index) {
-                // Reject new chunks if the pump hasn't consumed the current one
                 if (r->pending_snapshot_chunk_ready) {
-                    raft_msg_t res = {
-                        .type = MSG_APPEND_RES,
-                        .to = msg->from,
-                        .term = r->current_term,
-                        .reject = true,
-                        .conflict_index = r->expected_snapshot_offset - r->pending_snapshot_len
-                    };
+                    raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = r->expected_snapshot_offset - r->pending_snapshot_len };
                     raft_send_msg(r, res);
                     return;
                 }
 
-                // Reject explicitly bad payloads before taking action
                 if (msg->snapshot_len > 0 && !msg->snapshot_data) {
                     raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = r->expected_snapshot_offset };
                     raft_send_msg(r, res);
@@ -44,30 +56,15 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                 }
 
                 if (msg->snapshot_offset == 0) {
-                    // FIX 4: Aggressively validate snapshot ConfState topology before acceptance
-                    if (msg->snapshot_num_peers == 0 || msg->snapshot_num_peers > MAX_PEERS) {
+                    // Safe ConfState bounds validation before staging
+                    if (!validate_snapshot_confstate(r, msg)) {
                         raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
                         raft_send_msg(r, res);
                         return;
                     }
-                    for (size_t i = 0; i < msg->snapshot_num_peers; i++) {
-                        if (msg->snapshot_peers[i] == 0) {
-                            raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
-                            raft_send_msg(r, res);
-                            return;
-                        }
-                        for (size_t j = i + 1; j < msg->snapshot_num_peers; j++) {
-                            if (msg->snapshot_peers[i] == msg->snapshot_peers[j]) {
-                                raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = 0 };
-                                raft_send_msg(r, res);
-                                return;
-                            }
-                        }
-                    }
 
                     r->expected_snapshot_offset = 0;
                     r->pending_snapshot = true;
-
                     r->pending_snapshot_from = msg->from;
                     r->pending_snapshot_msg_index = msg->index;
                     r->pending_snapshot_msg_term = msg->log_term;
@@ -77,13 +74,11 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                         r->pending_snapshot_is_learner[i] = msg->snapshot_is_learner[i];
                     }
                 } else if (!r->pending_snapshot || msg->snapshot_offset != r->expected_snapshot_offset) {
-                    // Reject out-of-order chunk and hint expected offset
                     raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .conflict_index = r->expected_snapshot_offset };
                     raft_send_msg(r, res);
                     return;
                 }
 
-                // Safely allocate FIRST. If it fails, abort before corrupting state.
                 uint8_t* chunk = NULL;
                 if (msg->snapshot_len > 0) {
                     chunk = malloc(msg->snapshot_len);
@@ -97,7 +92,7 @@ void raft_snapshot_step(raft_t* r, raft_msg_t* msg) {
                 if (r->pending_snapshot_data) free(r->pending_snapshot_data);
                 r->pending_snapshot_data = chunk;
 
-                r->expected_snapshot_offset += msg->snapshot_len; // Advance expected offset
+                r->expected_snapshot_offset += msg->snapshot_len;
                 r->pending_snapshot_len = msg->snapshot_len;
                 r->pending_snapshot_offset = msg->snapshot_offset;
                 r->pending_snapshot_done = msg->snapshot_done;
@@ -179,7 +174,7 @@ void raft_snapshot_acked(raft_t* r, bool success) {
                     r->removed = false;
                     found_self = true;
                 } else {
-                    if (r->num_peers < MAX_PEERS) {
+                    if (r->num_peers < MAX_REMOTE_PEERS) {
                         r->peers[r->num_peers] = r->pending_snapshot_peers[i];
                         r->is_learner[r->num_peers] = r->pending_snapshot_is_learner[i];
                         r->next_index[r->num_peers] = r->snapshot_index + 1;

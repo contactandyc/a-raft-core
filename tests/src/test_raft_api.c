@@ -169,6 +169,39 @@ MACRO_TEST(read_index_queue_failure_returns_error) {
     MACRO_ASSERT_EQ_INT(err, -1); // Must fail cleanly
 }
 
+static bool contains(uint64_t* arr, size_t len, uint64_t target) {
+    for (size_t i = 0; i < len; i++) {
+        if (arr[i] == target) return true;
+    }
+    return false;
+}
+
+MACRO_TEST(node_init_remote_only_topology_is_rejected_or_converted) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("chmod -R 777 /tmp/raft_test_api 2>/dev/null; rm -rf /tmp/raft_test_api; mkdir -p /tmp/raft_test_api");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_api");
+
+    raft_node_t node;
+    uint64_t remote_only_peers[] = {2, 3}; // Missing physical node '1'
+
+    raft_node_init(&node, &srv, 0, remote_only_peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    MACRO_ASSERT_FALSE(node.fatal_error);
+
+    uint64_t full_peers[3];
+    bool learners[3];
+
+    // Use the ext bounds to retrieve both full ID array and learner mappings
+    size_t count = raft_peers_ext(node.core, full_peers, learners, 3);
+
+    MACRO_ASSERT_EQ_INT(count, 3);
+    MACRO_ASSERT_TRUE(contains(full_peers, count, 1)); // Engine automatically injected self
+    MACRO_ASSERT_TRUE(contains(full_peers, count, 2));
+    MACRO_ASSERT_TRUE(contains(full_peers, count, 3));
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
 
 int main(void) {
     macro_test_case tests[256];
@@ -182,6 +215,7 @@ int main(void) {
     MACRO_ADD(tests, node_propose_single_allocation_no_leak_and_queue_failure_checked);
     MACRO_ADD(tests, node_propose_null_payload_with_nonzero_len_returns_error);
     MACRO_ADD(tests, read_index_queue_failure_returns_error);
+    MACRO_ADD(tests, node_init_remote_only_topology_is_rejected_or_converted);
 
     macro_run_all("raft_api", tests, test_count);
     return 0;
