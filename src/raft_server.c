@@ -479,7 +479,7 @@ finalize:
 
 void raft_node_pump(raft_node_t* node) {
     if (node->fatal_error || !node->core || raft_has_fatal_error(node->core)) return;
-    if (node->is_flushing) return; // Prevent thread collision
+    if (node->is_flushing) return;
 
     raft_ready_t ready = raft_get_ready(node->core);
     uint64_t actual_saved_idx = raft_last_index(node->core) - ready.num_entries_to_save;
@@ -511,15 +511,28 @@ void raft_node_pump(raft_node_t* node) {
         node->flush_ctx.io_failed = false;
 
         node->flush_work.data = node;
-        uv_queue_work(node->server->loop, &node->flush_work, pump_worker_thread, pump_after_work);
+
+        // FIX 3: Check uv_queue_work return value and safely abort if the thread pool is overwhelmed
+        int rc = uv_queue_work(node->server->loop, &node->flush_work, pump_worker_thread, pump_after_work);
+        if (rc != 0) {
+            node->is_flushing = false;
+            pump_cleanup_ready(&ready);
+            node->fatal_error = true;
+            return;
+        }
     } else {
-        // Fast-path: Skip the thread pool entirely for network-only updates
         pump_dispatch_network_messages(node, &ready);
         bool applied_changed = pump_apply_state_machine(node, &ready, &actual_applied_idx);
         pump_resolve_read_indices(node, actual_applied_idx);
         raft_advance(node->core, actual_saved_idx, actual_applied_idx);
+
         if (applied_changed || actual_applied_idx > node->saved_applied) {
-            save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, actual_applied_idx, node->saved_snap_idx, node->saved_snap_term);
+            // FIX 4: Fast-path hardstate must fail closed if the directory or file metadata sync fails
+            if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, actual_applied_idx, node->saved_snap_idx, node->saved_snap_term)) {
+                node->fatal_error = true;
+                pump_cleanup_ready(&ready);
+                return;
+            }
             node->saved_applied = actual_applied_idx;
         }
         pump_update_timers(node);
@@ -889,10 +902,15 @@ void raft_node_init(raft_node_t* node, raft_server_t* server, uint64_t group_id,
                     raft_apply_fn apply_cb, void* apply_ctx, raft_read_cb read_cb, void* read_ctx,
                     raft_snapshot_fn snap_cb, void* snap_ctx) {
 
-    // Fix: Zero-initialize the memory FIRST so node->core is safely NULL on early exit
     memset(node, 0, sizeof(*node));
 
     if (group_id >= server->max_groups) return;
+
+    // FIX 1: Prevent stack buffer overflow and null pointer dereference before copying topology
+    if (num_peers > RAFT_MAX_PEERS || (num_peers > 0 && !init_peers)) {
+        node->fatal_error = true;
+        return;
+    }
 
     node->group_id = group_id;
     node->server = server;
@@ -1034,7 +1052,6 @@ int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
 
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
-    // Capture boundary state BEFORE requesting compaction
     uint64_t old_snap = raft_snapshot_index(node->core);
     uint64_t term = raft_log_term(node->core, compact_index);
 
@@ -1042,18 +1059,25 @@ int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
 
     if (raft_has_fatal_error(node->core)) return RAFT_APPLY_FATAL;
 
-    // FIX 1: Verify the core successfully validated and advanced the snapshot
     uint64_t new_snap = raft_snapshot_index(node->core);
     if (new_snap == old_snap || new_snap != compact_index) {
-        return -1; // Core rejected the compaction (e.g., index != last_applied). Abort!
-    }
-
-    if (!save_hardstate(node, node->saved_term, node->saved_vote, node->saved_commit, node->saved_applied, new_snap, raft_snapshot_term(node->core))) {
         return -1;
     }
 
-    // Safe to purge the physical file, the core successfully shifted its boundaries
-    raft_wal_purge_head(&node->wal, new_snap);
+    // FIX 2: Ensure the hardstate receives the exact post-compaction bounds from the core
+    uint64_t commit = raft_commit_index(node->core);
+    uint64_t applied = raft_last_applied(node->core);
+
+    if (!save_hardstate(node, raft_term(node->core), raft_voted_for(node->core), commit, applied, new_snap, raft_snapshot_term(node->core))) {
+        return -1;
+    }
+
+    node->saved_commit = commit;
+    node->saved_applied = applied;
+    node->saved_snap_idx = new_snap;
+    node->saved_snap_term = raft_snapshot_term(node->core);
+
+    if (raft_wal_purge_head(&node->wal, new_snap) != 0) return -1;
     return RAFT_OK;
 }
 

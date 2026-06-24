@@ -29,6 +29,17 @@ typedef struct {
 } test_meta_header_t;
 #pragma pack(pop)
 
+// Blazing fast loop drainer that exits the microsecond the async thread finishes
+static void drain_pump(raft_node_t* node, uv_loop_t* loop) {
+    // Run the loop continuously until the async flush flag clears
+    while (node->is_flushing) {
+        uv_run(loop, UV_RUN_NOWAIT);
+        usleep(100); // 0.1ms sleep just to prevent CPU pegging
+    }
+    // One final sweep to clear the network/actor mailboxes
+    uv_run(loop, UV_RUN_NOWAIT);
+}
+
 static void wait_for_pump(uv_loop_t* loop) {
     for (int i = 0; i < 50; i++) {
         uv_run(loop, UV_RUN_NOWAIT);
@@ -444,6 +455,71 @@ MACRO_TEST(snapshot_final_rename_requires_directory_fsync) {
     raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
 }
 
+MACRO_TEST(inbound_queue_cap_exactly_10000_does_not_grow) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_test_pump_q; mkdir -p /tmp/raft_test_pump_q");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump_q");
+    raft_node_t node; uint64_t peers[] = {1, 2};
+    raft_node_init(&node, &srv, 0, peers, 2, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    // Promote to Leader
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(node.core, &hup);
+    raft_node_pump(&node); wait_for_pump(&loop);
+
+    // Setup boundary conditions artificially for the test
+    node.inbound_queue_cap = 10000;
+    node.inbound_queue_len = 10000;
+    node.inbound_queue = malloc(sizeof(raft_msg_t));
+
+    // Force into queue_inbound_msg path
+    node.is_flushing = true;
+    int err = raft_node_read_index(&node, 1, NULL);
+
+    // Must fail without attempting to realloc due to the 10000 ceiling
+    MACRO_ASSERT_EQ_INT(err, -1);
+    MACRO_ASSERT_EQ_INT(node.inbound_queue_cap, 10000);
+
+    free(node.inbound_queue);
+    node.inbound_queue = NULL;
+    node.inbound_queue_len = 0;
+    node.inbound_queue_cap = 0;
+    node.is_flushing = false;
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
+MACRO_TEST(node_compact_noops_must_not_purge_wal) {
+    uv_loop_t loop; uv_loop_init(&loop);
+    system("rm -rf /tmp/raft_test_pump_c; mkdir -p /tmp/raft_test_pump_c");
+
+    raft_server_t srv; raft_server_init(&srv, &loop, 1, 1, "/tmp/raft_test_pump_c");
+    raft_node_t node; uint64_t peers[] = {1};
+    raft_node_init(&node, &srv, 0, peers, 1, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    raft_msg_t hup = { .type = MSG_HUP };
+    raft_step_local(node.core, &hup);
+    raft_node_pump(&node); drain_pump(&node, &loop);
+
+    // Brutal Stress Test: 500 individual proposals, pumps, and disk flushes
+    // With drain_pump, this will execute in milliseconds instead of timing out!
+    for (int i=0; i<500; i++) {
+        raft_node_propose(&node, (uint8_t*)"X", 1, 1, 1, NULL);
+        raft_node_pump(&node);
+        drain_pump(&node, &loop);
+    }
+
+    MACRO_ASSERT_TRUE(node.wal.max_disk_index >= 500);
+
+    int err = raft_node_compact(&node, 100);
+
+    MACRO_ASSERT_EQ_INT(err, -1);
+    MACRO_ASSERT_EQ_INT(raft_snapshot_index(node.core), 0);
+
+    raft_wal_close(&node.wal); raft_destroy(node.core); uv_loop_close(&loop);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -460,6 +536,8 @@ int main(void) {
     MACRO_ADD(tests, snapshot_new_offset_zero_truncates_old_tmp_tail);
     MACRO_ADD(tests, hardstate_directory_fsync_failure_returns_false);
     MACRO_ADD(tests, snapshot_final_rename_requires_directory_fsync);
+    MACRO_ADD(tests, inbound_queue_cap_exactly_10000_does_not_grow);
+    MACRO_ADD(tests, node_compact_noops_must_not_purge_wal);
 
     macro_run_all("raft_pump", tests, test_count);
     return 0;
