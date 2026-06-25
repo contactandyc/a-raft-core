@@ -152,8 +152,6 @@ static void handle_read_index_response(raft_t* r, raft_msg_t* msg) {
 void raft_read_index_step(raft_t* r, raft_msg_t* msg) {
     switch (msg->type) {
         case MSG_READ_INDEX:
-            // Since this API now accepts remote MSG_READ_INDEX via raft_step_remote,
-            // we track the remote forwarder using msg->from.
             handle_read_index_request(r, msg);
             break;
         case MSG_READ_INDEX_RES:

@@ -6,14 +6,11 @@
 #ifndef RAFT_INTERNAL_H
 #define RAFT_INTERNAL_H
 
-#include "a-raft-library/raft.h"
+#include "a-raft-core/raft.h"
 
 #define MAX_PEERS 64
 #define MAX_REMOTE_PEERS (MAX_PEERS - 1)
 #define MAX_PENDING_READS 128
-
-// BLOCKER 6: Unified Batch Limit for Public API and Internal Replication
-#define RAFT_MAX_PAYLOAD_SIZE (1048576)
 
 typedef struct {
     uint64_t read_seq;
@@ -57,7 +54,6 @@ struct raft_s {
 
     uint64_t last_saved_index;
     bool activity_accepted;
-
     uint64_t uncommitted_bytes;
 
     bool recent_active[MAX_PEERS];
@@ -89,11 +85,9 @@ struct raft_s {
     bool pending_snapshot_is_learner[MAX_PEERS];
     size_t pending_snapshot_num_peers;
 
-    // BLOCKERS 2 & 3: Snapshot chunk tracking
     uint64_t expected_snapshot_offset;
     bool pending_snapshot_chunk_ready;
 
-    // BLOCKER 5: Topology cache for snapshot artifact binding
     uint64_t snapshot_peers_cache[MAX_PEERS];
     bool snapshot_learners_cache[MAX_PEERS];
     size_t snapshot_peers_count;
@@ -101,32 +95,27 @@ struct raft_s {
     bool fatal_error;
 };
 
-// Internal Submodule APIs
+// Internal Dispatch
 void raft_send_msg(raft_t* r, raft_msg_t msg);
 uint64_t raft_log_last_index(raft_t* r);
 uint64_t raft_log_term(raft_t* r, uint64_t index);
 raft_entry_t* raft_log_get(raft_t* r, uint64_t index);
-
 bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, uint64_t cseq, const uint8_t* data, size_t data_len);
 void raft_log_truncate(raft_t* r, uint64_t index);
 uint64_t raft_uncommitted_bytes(raft_t* r);
 
 void raft_election_step(raft_t* r, raft_msg_t* msg);
 void raft_election_become_leader(raft_t* r);
-
 void raft_replication_step(raft_t* r, raft_msg_t* msg);
 void raft_replication_bcast_append(raft_t* r);
 void raft_replication_advance_commit(raft_t* r, uint64_t new_commit);
-
 void raft_snapshot_step(raft_t* r, raft_msg_t* msg);
 void raft_read_index_step(raft_t* r, raft_msg_t* msg);
-void raft_membership_apply_config(raft_t* r, uint64_t index);
-
-void raft_advance_all_for_tests_only(raft_t* r);
-
 void raft_read_index_ack(raft_t* r, size_t peer_idx, uint64_t read_seq);
-
+void raft_membership_apply_config(raft_t* r, uint64_t index);
 void raft_add_learner(raft_t* r, uint64_t peer_id);
 void raft_promote_learner(raft_t* r, uint64_t peer_id);
+
+void raft_advance_all_for_tests_only(raft_t* r);
 
 #endif // RAFT_INTERNAL_H

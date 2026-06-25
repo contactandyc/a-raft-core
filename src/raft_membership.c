@@ -58,7 +58,7 @@ void raft_add_learner(raft_t* r, uint64_t peer_id) {
 
         r->next_index[i] = raft_log_last_index(r) + 1;
         r->match_index[i] = 0;
-        r->snapshot_offset[i] = 0; // Phase 1/3: Reset chunk tracking for new learners
+        r->snapshot_offset[i] = 0;
 
         r->recent_active[i] = true;
         r->peer_read_seq[i] = 0;
@@ -133,7 +133,6 @@ void raft_membership_apply_config(raft_t* r, uint64_t index) {
     raft_entry_t* e = raft_log_get(r, index);
     if (!e) return;
 
-    // Phase 3: Route unsafe direct additions through the Learner pattern
     if (e->type == ENTRY_CONF_ADD ||
         e->type == ENTRY_CONF_ADD_LEARNER ||
         e->type == ENTRY_CONF_PROMOTE_LEARNER ||

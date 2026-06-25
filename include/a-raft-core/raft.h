@@ -10,13 +10,18 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// Global network limit: 10 MB maximum frame size
-#define RAFT_MAX_FRAME_SIZE (1024 * 1024 * 10)
+// Core Safety Limit: Maximum size of a single entry payload
+#define RAFT_MAX_PAYLOAD_SIZE (1048576)
 
-#define RAFT_OK 0
-#define RAFT_ERR_NOT_LEADER -1
-#define RAFT_ERR_QUEUE_FULL -2
-#define RAFT_ERR_NOMEM -3
+typedef enum {
+    RAFT_OK = 0,
+    RAFT_ERR_NOT_LEADER = -1,
+    RAFT_ERR_NOMEM = -2,
+    RAFT_ERR_QUEUE_FULL = -3,
+    RAFT_ERR_OVERSIZED_PAYLOAD = -4,
+    RAFT_ERR_CONFIG_IN_FLIGHT = -5,
+    RAFT_ERR_INVALID_ARG = -6
+} raft_err_t;
 
 typedef enum {
     RAFT_STATE_FOLLOWER,
@@ -73,7 +78,6 @@ typedef struct {
     raft_entry_t* entries;
     size_t num_entries;
 
-    // Snapshot Chunking Metadata
     uint8_t* snapshot_data;
     size_t snapshot_len;
     uint64_t snapshot_offset;
@@ -110,6 +114,7 @@ typedef struct {
     bool snapshot_done;
 } raft_ready_t;
 
+// Opaque Core Handle
 typedef struct raft_s raft_t;
 
 raft_t* raft_create(uint64_t id, uint64_t* peers, size_t num_peers);
@@ -123,34 +128,29 @@ raft_t* raft_restore(uint64_t id, uint64_t* peers, bool* is_learners, size_t num
 void    raft_step_local(raft_t* r, raft_msg_t* msg);
 void    raft_step_remote(raft_t* r, raft_msg_t* msg);
 raft_ready_t raft_get_ready(raft_t* r);
-
 void    raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index);
 
 void    raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term);
 void    raft_snapshot_acked(raft_t* r, bool success);
 
+// Observability Getters
 raft_state_t raft_state(raft_t* r);
 uint64_t     raft_term(raft_t* r);
+uint64_t     raft_log_term(raft_t* r, uint64_t index);
 uint64_t     raft_voted_for(raft_t* r);
 uint64_t     raft_commit_index(raft_t* r);
 uint64_t     raft_last_index(raft_t* r);
 uint64_t     raft_last_applied(raft_t* r);
 bool         raft_activity_accepted(raft_t* r);
-
-size_t       raft_peers(raft_t* r, uint64_t* out_peers);
 uint64_t     raft_leader_id(raft_t* r);
-
+size_t       raft_peers(raft_t* r, uint64_t* out_peers);
 size_t       raft_peers_ext(raft_t* r, uint64_t* out_peers, bool* out_is_learners, size_t out_cap);
 uint64_t     raft_snapshot_index(raft_t* r);
 uint64_t     raft_snapshot_term(raft_t* r);
 uint64_t     raft_uncommitted_bytes(raft_t* r);
 bool         raft_has_fatal_error(raft_t* r);
 
-// Safe Serialization API
-size_t raft_msg_encoded_size(const raft_msg_t* msg);
-bool raft_msg_encode(const raft_msg_t* msg, uint8_t* buf, size_t cap);
-bool raft_msg_decode(const uint8_t* buf, size_t len, raft_msg_t* out_msg);
-void raft_msg_free_payloads(raft_msg_t* msg);
-bool raft_msg_encoded_size_checked(const raft_msg_t* msg, size_t* out);
+// Testkit / Simulation hooks
+void raft_advance_all_for_tests_only(raft_t* r);
 
 #endif // RAFT_H

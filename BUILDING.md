@@ -1,6 +1,6 @@
 # BUILDING
 
-This project: **a-raft-library**
+This project: **a-raft-core**
 Version: **0.1.4**
 
 ## Local build

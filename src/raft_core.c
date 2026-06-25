@@ -40,6 +40,7 @@ static bool ensure_msg_queue_capacity(raft_t* r) {
     size_t new_cap = r->msg_queue_cap == 0 ? 16 : r->msg_queue_cap * 2;
     raft_msg_t* new_q = realloc(r->msg_queue, new_cap * sizeof(raft_msg_t));
     if (!new_q) return false;
+
     r->msg_queue = new_q;
     r->msg_queue_cap = new_cap;
     return true;
@@ -561,14 +562,6 @@ void raft_advance(raft_t* r, uint64_t saved_index, uint64_t applied_index) {
     r->activity_accepted = false;
 }
 
-void raft_advance_all_for_tests_only(raft_t* r) {
-    if (!r || r->fatal_error) return;
-    raft_ready_t ready = raft_get_ready(r);
-    if (ready.num_entries_to_save > 0) free(ready.entries_to_save);
-    if (ready.num_committed_entries > 0) free(ready.committed_entries);
-    raft_advance(r, raft_log_last_index(r), raft_commit_index(r));
-}
-
 void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t compact_term) {
     if (!r || r->fatal_error) return;
 
@@ -616,6 +609,14 @@ void raft_compact_after_snapshot(raft_t* r, uint64_t compact_index, uint64_t com
     r->log[0].client_seq = 0;
     r->log[0].data = NULL;
     r->log[0].data_len = 0;
+}
+
+void raft_advance_all_for_tests_only(raft_t* r) {
+    if (!r || r->fatal_error) return;
+    raft_ready_t ready = raft_get_ready(r);
+    if (ready.num_entries_to_save > 0) free(ready.entries_to_save);
+    if (ready.num_committed_entries > 0) free(ready.committed_entries);
+    raft_advance(r, raft_log_last_index(r), raft_commit_index(r));
 }
 
 // ----------------------------------------------------------------------------

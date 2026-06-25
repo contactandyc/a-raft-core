@@ -1,4 +1,4 @@
-project_title: a-raft-library
+project_title: a-raft-core
 version: "0.1.4"
 description: "A dynamically scaffolded c/cmake project"
 stack: c/cmake
@@ -26,11 +26,3 @@ depends_on:
   # - https://github.com/contactandyc/a-write-ahead-log.git
   - https://github.com/contactandyc/h2o-c-library.git
   - https://github.com/contactandyc/the-lz4-library.git
-
-examples:
-  multi-raft:
-    targets:
-      server:
-        - src/server.c
-      client:
-        - src/client.c

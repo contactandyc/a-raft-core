@@ -31,7 +31,6 @@ bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, 
         return false;
     }
 
-    // Blocker 9: Uncommitted Bytes Integer Overflow Protection
     if (UINT64_MAX - r->uncommitted_bytes < data_len) {
         r->fatal_error = true;
         return false;
@@ -73,7 +72,6 @@ bool raft_log_append(raft_t* r, uint64_t term, entry_type_t type, uint64_t cid, 
     e->data_len = data_len;
     e->data = payload;
 
-    // Safely add to backpressure tracker now that overflow is mathematically impossible
     r->uncommitted_bytes += data_len;
 
     return true;
@@ -84,12 +82,11 @@ void raft_log_truncate(raft_t* r, uint64_t index) {
     size_t new_len = index - r->snapshot_index;
     for (size_t i = new_len; i < r->log_len; i++) {
 
-        // Phase 2: Deduct uncommitted bytes before freeing them
         if (r->log[i].index > r->commit_index) {
             if (r->uncommitted_bytes >= r->log[i].data_len) {
                 r->uncommitted_bytes -= r->log[i].data_len;
             } else {
-                r->uncommitted_bytes = 0; // Failsafe against underflow
+                r->uncommitted_bytes = 0;
             }
         }
 
@@ -99,7 +96,6 @@ void raft_log_truncate(raft_t* r, uint64_t index) {
     if (r->last_saved_index >= index) r->last_saved_index = index - 1;
 }
 
-// Phase 2: O(1) Fetch
 uint64_t raft_uncommitted_bytes(raft_t* r) {
     return r->uncommitted_bytes;
 }

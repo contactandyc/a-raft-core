@@ -116,10 +116,10 @@ RUN set -eux; \
     rm -rf "h2o-c-library"
 
 # --- Build & install this project --------------------------------------------
-COPY --chown=dev:dev . /workspace/a-raft-library
-RUN mkdir -p /workspace/build/a-raft-library && \
-    cd /workspace/build/a-raft-library && \
-    cmake /workspace/a-raft-library && \
+COPY --chown=dev:dev . /workspace/a-raft-core
+RUN mkdir -p /workspace/build/a-raft-core && \
+    cd /workspace/build/a-raft-core && \
+    cmake /workspace/a-raft-core && \
     make -j"$(nproc)" && sudo make install
 
 CMD ["/bin/bash"]

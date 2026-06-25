@@ -6,7 +6,7 @@
 # CMakeLists.txt for libraries (regular or header-only)
 cmake_minimum_required(VERSION 3.20)
 
-project(a_raft_library
+project(a_raft_core
   VERSION 0.1.4
   LANGUAGES C
 )
@@ -54,26 +54,22 @@ find_package(the_lz4_library CONFIG REQUIRED)
 
 # ── Main Targets (Compiled Libraries) ─────────────────────────────────────────
 
-add_library(a_raft_library_debug STATIC
-  src/raft_codec.c
+add_library(a_raft_core_debug STATIC
   src/raft_core.c
   src/raft_election.c
-  src/raft_io.c
   src/raft_log.c
   src/raft_membership.c
   src/raft_read_index.c
   src/raft_replication.c
-  src/raft_server.c
   src/raft_snapshot.c
-  src/raft_wal.c
 )
 
-target_include_directories(a_raft_library_debug PUBLIC
+target_include_directories(a_raft_core_debug PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-set_target_properties(a_raft_library_debug PROPERTIES
+set_target_properties(a_raft_core_debug PROPERTIES
   C_STANDARD 23
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 17
@@ -81,40 +77,36 @@ set_target_properties(a_raft_library_debug PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-target_link_libraries(a_raft_library_debug PUBLIC
+target_link_libraries(a_raft_core_debug PUBLIC
   libuv::uv
   h2o_c_library::h2o_c_library
   the_lz4_library::the_lz4_library
 )
 
-target_compile_options(a_raft_library_debug PRIVATE ${_A_DEBUG_OPTS})
+target_compile_options(a_raft_core_debug PRIVATE ${_A_DEBUG_OPTS})
 
 
-install(TARGETS a_raft_library_debug EXPORT a_raft_libraryTargets
+install(TARGETS a_raft_core_debug EXPORT a_raft_coreTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-add_library(a_raft_library_memory STATIC
-  src/raft_codec.c
+add_library(a_raft_core_memory STATIC
   src/raft_core.c
   src/raft_election.c
-  src/raft_io.c
   src/raft_log.c
   src/raft_membership.c
   src/raft_read_index.c
   src/raft_replication.c
-  src/raft_server.c
   src/raft_snapshot.c
-  src/raft_wal.c
 )
 
-target_include_directories(a_raft_library_memory PUBLIC
+target_include_directories(a_raft_core_memory PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-set_target_properties(a_raft_library_memory PROPERTIES
+set_target_properties(a_raft_core_memory PROPERTIES
   C_STANDARD 23
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 17
@@ -122,43 +114,39 @@ set_target_properties(a_raft_library_memory PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-target_link_libraries(a_raft_library_memory PUBLIC
+target_link_libraries(a_raft_core_memory PUBLIC
   libuv::uv
   h2o_c_library::h2o_c_library
   the_lz4_library::the_lz4_library
 )
 
-target_compile_options(a_raft_library_memory PRIVATE ${_A_DEBUG_OPTS})
+target_compile_options(a_raft_core_memory PRIVATE ${_A_DEBUG_OPTS})
 
 if(A_BUILD_ENABLE_MEMORY_PROFILE)
-  target_compile_definitions(a_raft_library_memory PUBLIC ${A_BUILD_MEMORY_DEFINE})
+  target_compile_definitions(a_raft_core_memory PUBLIC ${A_BUILD_MEMORY_DEFINE})
 endif()
 
-install(TARGETS a_raft_library_memory EXPORT a_raft_libraryTargets
+install(TARGETS a_raft_core_memory EXPORT a_raft_coreTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-add_library(a_raft_library_static STATIC
-  src/raft_codec.c
+add_library(a_raft_core_static STATIC
   src/raft_core.c
   src/raft_election.c
-  src/raft_io.c
   src/raft_log.c
   src/raft_membership.c
   src/raft_read_index.c
   src/raft_replication.c
-  src/raft_server.c
   src/raft_snapshot.c
-  src/raft_wal.c
 )
 
-target_include_directories(a_raft_library_static PUBLIC
+target_include_directories(a_raft_core_static PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-set_target_properties(a_raft_library_static PROPERTIES
+set_target_properties(a_raft_core_static PROPERTIES
   C_STANDARD 23
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 17
@@ -166,40 +154,36 @@ set_target_properties(a_raft_library_static PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-target_link_libraries(a_raft_library_static PUBLIC
+target_link_libraries(a_raft_core_static PUBLIC
   libuv::uv
   h2o_c_library::h2o_c_library
   the_lz4_library::the_lz4_library
 )
 
-target_compile_options(a_raft_library_static PRIVATE ${_A_RELEASE_OPTS})
+target_compile_options(a_raft_core_static PRIVATE ${_A_RELEASE_OPTS})
 
 
-install(TARGETS a_raft_library_static EXPORT a_raft_libraryTargets
+install(TARGETS a_raft_core_static EXPORT a_raft_coreTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-add_library(a_raft_library_shared SHARED
-  src/raft_codec.c
+add_library(a_raft_core_shared SHARED
   src/raft_core.c
   src/raft_election.c
-  src/raft_io.c
   src/raft_log.c
   src/raft_membership.c
   src/raft_read_index.c
   src/raft_replication.c
-  src/raft_server.c
   src/raft_snapshot.c
-  src/raft_wal.c
 )
 
-target_include_directories(a_raft_library_shared PUBLIC
+target_include_directories(a_raft_core_shared PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-set_target_properties(a_raft_library_shared PROPERTIES
+set_target_properties(a_raft_core_shared PROPERTIES
   C_STANDARD 23
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 17
@@ -207,35 +191,35 @@ set_target_properties(a_raft_library_shared PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-target_link_libraries(a_raft_library_shared PUBLIC
+target_link_libraries(a_raft_core_shared PUBLIC
   libuv::uv
   h2o_c_library::h2o_c_library
   the_lz4_library::the_lz4_library
 )
 
-target_compile_options(a_raft_library_shared PRIVATE ${_A_RELEASE_OPTS})
+target_compile_options(a_raft_core_shared PRIVATE ${_A_RELEASE_OPTS})
 
 
-install(TARGETS a_raft_library_shared EXPORT a_raft_libraryTargets
+install(TARGETS a_raft_core_shared EXPORT a_raft_coreTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 string(REPLACE "-" "_" _variant_us "${A_BUILD_VARIANT}")
-set(_sel_tgt "a_raft_library_${_variant_us}")
+set(_sel_tgt "a_raft_core_${_variant_us}")
 if(TARGET "${_sel_tgt}")
-  add_library(a_raft_library::a_raft_library ALIAS ${_sel_tgt})
+  add_library(a_raft_core::a_raft_core ALIAS ${_sel_tgt})
 endif()
 
 
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 
-install(EXPORT a_raft_libraryTargets
-  FILE a_raft_libraryTargets.cmake
-  NAMESPACE a_raft_library::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_library)
+install(EXPORT a_raft_coreTargets
+  FILE a_raft_coreTargets.cmake
+  NAMESPACE a_raft_core::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_core)
 
 # ---- Package config with umbrella target -------------------------------------
 set(_CFG_IN "${CMAKE_CURRENT_BINARY_DIR}/config.cmake.in")
@@ -258,7 +242,7 @@ foreach(_dep IN LISTS _deps)
 endforeach()
 set(A_BUILD_VARIANT "${_save_variant}")
 
-include("${CMAKE_CURRENT_LIST_DIR}/a_raft_libraryTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/a_raft_coreTargets.cmake")
 
 set(_ns "@A_BUILD_EXPORT_NAMESPACE@")
 set(_pkg "@A_BUILD_TARGET_BASENAME@")
@@ -274,25 +258,25 @@ if(NOT TARGET ${_ns}::${_pkg})
 endif()
 ]=])
 
-set(A_BUILD_TARGET_BASENAME "a_raft_library")
-set(A_BUILD_EXPORT_NAMESPACE "a_raft_library")
+set(A_BUILD_TARGET_BASENAME "a_raft_core")
+set(A_BUILD_EXPORT_NAMESPACE "a_raft_core")
 set(A_BUILD_DEPS "libuv;h2o_c_library;the_lz4_library")
 
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   "${_CFG_IN}"
-  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_libraryConfig.cmake"
-  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_library
+  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_coreConfig.cmake"
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_core
 )
 write_basic_package_version_file(
-  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_libraryConfigVersion.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_coreConfigVersion.cmake"
   VERSION ${PROJECT_VERSION}
   COMPATIBILITY SameMajorVersion
 )
 install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_libraryConfig.cmake"
-  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_libraryConfigVersion.cmake"
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_library
+  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_coreConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/a_raft_coreConfigVersion.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/a_raft_core
 )
 # Extra project-specific targets
 
@@ -303,6 +287,5 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 endif()
 
 # Dynamically mount all subprojects (apps, examples, tests, etc.)
-# # add_subdirectory(examples/multi-raft)
 # # add_subdirectory(tests)
 # 

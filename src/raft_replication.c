@@ -32,7 +32,6 @@ static bool get_peer_index(raft_t* r, uint64_t peer_id, size_t* out_idx) {
 void raft_replication_advance_commit(raft_t* r, uint64_t new_commit) {
     if (new_commit <= r->commit_index) return;
 
-    // Phase 2: O(1) Backpressure Tracking
     for (uint64_t i = r->commit_index + 1; i <= new_commit; i++) {
         raft_entry_t* e = raft_log_get(r, i);
         if (e) {
@@ -134,7 +133,6 @@ static void send_append(raft_t* r, size_t peer_idx) {
         raft_entry_t* src = raft_log_get(r, next + i);
         if (!src) break;
 
-        // FIX 1: Use the macro and drop gracefully instead of triggering a fatal error
         if (src->data_len > RAFT_MAX_PAYLOAD_SIZE - batch_bytes) {
             if (actual_entries == 0) {
                 return;
@@ -201,7 +199,6 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
     uint64_t old_last_idx = raft_log_last_index(r);
     bool has_pending_config = false;
 
-    // Phase 3: Check the entire unapplied tail for overlapping configurations
     for (uint64_t idx = r->last_applied + 1; idx <= old_last_idx; idx++) {
         raft_entry_t* e = raft_log_get(r, idx);
         if (e && e->type != ENTRY_NORMAL) {
@@ -213,17 +210,13 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
     bool appended = false;
     for (size_t i = 0; i < msg->num_entries; i++) {
 
-        // FIX 2: Gracefully drop oversized proposals at the core level!
         if (msg->entries[i].data_len > RAFT_MAX_PAYLOAD_SIZE) {
             return;
         }
 
         if (msg->entries[i].type != ENTRY_NORMAL) {
-
-            // Safety: Only one uncommitted/unapplied configuration change at a time
             if (has_pending_config) continue;
 
-            // Phase 3: Secure Learner Promotion Guard
             if (msg->entries[i].type == ENTRY_CONF_PROMOTE_LEARNER && msg->entries[i].data_len == sizeof(uint64_t)) {
                 uint64_t target_node;
                 memcpy(&target_node, msg->entries[i].data, sizeof(uint64_t));
@@ -231,7 +224,7 @@ static void handle_propose(raft_t* r, raft_msg_t* msg) {
                 size_t p_idx;
                 if (get_peer_index(r, target_node, &p_idx)) {
                     if (r->match_index[p_idx] < r->commit_index) {
-                        continue; // Drop unsafe promotion
+                        continue;
                     }
                 }
             }
@@ -273,7 +266,6 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
     raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r), .read_seq = 0 };
     uint64_t my_last_idx = raft_log_last_index(r);
 
-    // FIX 3: Catch malicious uint64 overflow wrapping BEFORE we enter mathematical loops!
     if (msg->num_entries > 0 && msg->index > UINT64_MAX - msg->num_entries) {
         raft_send_msg(r, res);
         return;
@@ -282,12 +274,10 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
     if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && raft_log_term(r, msg->index) == msg->log_term) {
         res.reject = false;
 
-        // "Validate First, Mutate Second" pattern.
         if (msg->num_entries > 0) {
             for (size_t i = 0; i < msg->num_entries; i++) {
                 uint64_t new_idx = msg->index + 1 + i;
 
-                // FIX 3: Add strict Entry Type validation to the bounds check
                 if ((msg->entries[i].type != ENTRY_NORMAL && msg->entries[i].type != ENTRY_CONF_ADD && msg->entries[i].type != ENTRY_CONF_REMOVE && msg->entries[i].type != ENTRY_CONF_ADD_LEARNER && msg->entries[i].type != ENTRY_CONF_PROMOTE_LEARNER) ||
                     (msg->entries[i].index != 0 && msg->entries[i].index != new_idx) ||
                     (msg->entries[i].term == 0 || msg->entries[i].term > msg->term) ||
@@ -299,7 +289,6 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
             }
         }
 
-        // Rest of the function remains identical...
         if (!res.reject && msg->num_entries > 0) {
             for (size_t i = 0; i < msg->num_entries; i++) {
                 uint64_t new_idx = msg->index + 1 + i;
@@ -369,7 +358,6 @@ static void handle_append_response(raft_t* r, raft_msg_t* msg) {
     r->recent_active[peer_idx] = true;
 
     if (r->next_index[peer_idx] <= r->snapshot_index) {
-        // FIX 2: Honor rejected snapshot chunk conflict hints
         if (msg->reject) {
             r->snapshot_offset[peer_idx] = msg->conflict_index;
             send_append(r, peer_idx);
