@@ -54,18 +54,15 @@ static uint64_t unpack_u64(const uint8_t* p) {
 static char* strdupf(const char* format, ...) {
     va_list args;
 
-    // First pass: determine the required length
     va_start(args, format);
     int len = vsnprintf(NULL, 0, format, args);
     va_end(args);
 
-    if (len < 0) return NULL; // Encoding error
+    if (len < 0) return NULL;
 
-    // Allocate memory (+1 for the null terminator)
     char* str = malloc((size_t)len + 1);
     if (!str) return NULL;
 
-    // Second pass: actually format the string into the allocated buffer
     va_start(args, format);
     vsnprintf(str, (size_t)len + 1, format, args);
     va_end(args);
@@ -157,10 +154,41 @@ static bool read_segment_header(int fd, uint64_t expected_seg_id, uint64_t* out_
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// SLIDING WINDOW OFFSETS (MEMORY SAFETY)
+// -----------------------------------------------------------------------------
+
+uint64_t raft_wal_first_index(raft_wal_t* wal) {
+    return wal ? wal->offset_base_index : 0;
+}
+
+static bool wal_offset_slot(raft_wal_t* wal, uint64_t index, uint64_t* out_slot) {
+    if (!wal || index == 0) return false;
+    if (wal->offset_base_index == 0) return false;
+    if (index < wal->offset_base_index) return false; // Prevents underflow
+
+    uint64_t rel = index - wal->offset_base_index;
+    if (rel >= wal->offsets_cap) return false;
+
+    *out_slot = rel;
+    return true;
+}
+
 static bool ensure_offset_capacity(raft_wal_t* wal, uint64_t index) {
-    if (index >= wal->offsets_cap) {
+    if (index == 0) return false;
+
+    if (wal->offset_base_index == 0) {
+        wal->offset_base_index = index;
+    }
+
+    if (index < wal->offset_base_index) {
+        return false; // Do not return success for indexes below the base in write paths
+    }
+
+    uint64_t rel_idx = index - wal->offset_base_index;
+    if (rel_idx >= wal->offsets_cap) {
         uint64_t new_cap = wal->offsets_cap == 0 ? 1024 : wal->offsets_cap * 2;
-        while (index >= new_cap) {
+        while (rel_idx >= new_cap) {
             if (new_cap > UINT64_MAX / 2) return false;
             new_cap *= 2;
         }
@@ -241,7 +269,9 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
         wal->file_offset = WAL_V2_SEG_HEADER_SIZE;
         wal->max_disk_index = 0;
 
-        // Temp-then-rename for initial creation guarantees durability bounds
+        // Explicitly initialize base on a fresh cluster
+        wal->offset_base_index = 1;
+
         char tmp_path[1024]; snprintf(tmp_path, 1024, "%s/init.tmp", wal->base_dir);
         char final_path[1024]; get_segment_path(wal, 1, final_path);
 
@@ -284,6 +314,9 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
             expected_index = seg_start_index;
             index_established = true;
             wal->max_disk_index = expected_index - 1;
+
+            // Explicitly set base during recovery from first valid header
+            wal->offset_base_index = expected_index;
         } else if (seg_start_index != expected_index) {
             close(fd); goto init_fail;
         }
@@ -336,11 +369,15 @@ int raft_wal_init(raft_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
             if (payload) free(payload);
 
             if (!ensure_offset_capacity(wal, index)) { close(fd); goto init_fail; }
-            wal->offsets[index].seg_id = seg;
-            wal->offsets[index].offset = offset;
+
+            uint64_t slot;
+            if (wal_offset_slot(wal, index, &slot)) {
+                wal->offsets[slot].seg_id = seg;
+                wal->offsets[slot].offset = offset;
+            }
+
             wal->max_disk_index = index;
             expected_index++;
-
             offset += frame_total;
         }
 
@@ -474,8 +511,13 @@ int raft_wal_append(raft_wal_t* wal, uint64_t term, uint64_t index, uint8_t type
     pack_u32(ptr, crc);
 
     if (!ensure_offset_capacity(wal, index)) return -1;
-    wal->offsets[index].seg_id = wal->current_seg_id;
-    wal->offsets[index].offset = wal->file_offset + wal->batch_len;
+
+    uint64_t slot;
+    if (!wal_offset_slot(wal, index, &slot)) return -1;
+
+    wal->offsets[slot].seg_id = wal->current_seg_id;
+    wal->offsets[slot].offset = wal->file_offset + wal->batch_len;
+
     wal->max_disk_index = index;
     wal->batch_len += total_size;
     return 0;
@@ -507,9 +549,12 @@ int raft_wal_flush_batch(raft_wal_t* wal) {
 
 int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_term, uint8_t* out_type, uint64_t* out_cid, uint64_t* out_cseq, uint8_t** out_payload, uint32_t* out_len) {
     if (!wal || !out_term || !out_type || !out_cid || !out_cseq || !out_payload || !out_len) return 0;
-    if (target_index == 0 || target_index > wal->max_disk_index || target_index >= wal->offsets_cap) return 0;
+    if (target_index == 0 || target_index > wal->max_disk_index) return 0;
 
-    raft_wal_loc_t loc = wal->offsets[target_index];
+    uint64_t slot;
+    if (!wal_offset_slot(wal, target_index, &slot)) return 0;
+
+    raft_wal_loc_t loc = wal->offsets[slot];
     if (loc.seg_id == 0) return 0;
 
     if (loc.offset > wal->segment_size_bytes) return 0;
@@ -582,9 +627,16 @@ int raft_wal_read_entry(raft_wal_t* wal, uint64_t target_index, uint64_t* out_te
 
 int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
     if (!wal || wal->active_fd < 0) return -1;
-    if (truncate_from_index == 0 || truncate_from_index > wal->max_disk_index || truncate_from_index >= wal->offsets_cap) return -1;
 
-    raft_wal_loc_t loc = wal->offsets[truncate_from_index];
+    // One-past-tail is logically a successful no-op
+    if (truncate_from_index == wal->max_disk_index + 1) return 0;
+
+    if (truncate_from_index == 0 || truncate_from_index > wal->max_disk_index) return -1;
+
+    uint64_t slot;
+    if (!wal_offset_slot(wal, truncate_from_index, &slot)) return -1;
+
+    raft_wal_loc_t loc = wal->offsets[slot];
     if (loc.seg_id == 0) return -1;
 
     if (raft_wal_flush_batch(wal) != 0) return -1;
@@ -634,7 +686,10 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
     if (!sync_file(wal->active_fd)) return -1;
 
     for (uint64_t i = truncate_from_index; i <= wal->max_disk_index; i++) {
-        if (i < wal->offsets_cap) wal->offsets[i] = (raft_wal_loc_t){0};
+        uint64_t s;
+        if (wal_offset_slot(wal, i, &s)) {
+            wal->offsets[s] = (raft_wal_loc_t){0};
+        }
     }
 
     wal->file_offset = loc.offset;
@@ -643,7 +698,7 @@ int raft_wal_truncate_tail(raft_wal_t* wal, uint64_t truncate_from_index) {
 }
 
 // -----------------------------------------------------------------------------
-// HEAD PURGING (Garbage Collection)
+// HEAD PURGING (Garbage Collection & Array Rebase)
 // -----------------------------------------------------------------------------
 
 int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
@@ -662,7 +717,7 @@ int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
 
         if (!valid_hdr) return -1;
 
-        if (next_start_idx <= safe_checkpoint_index) {
+        if (next_start_idx <= safe_checkpoint_index + 1) {
             if (wal->read_fd >= 0 && wal->read_seg_id == wal->oldest_seg_id) {
                 close(wal->read_fd);
                 wal->read_fd = -1;
@@ -684,8 +739,43 @@ int raft_wal_purge_head(raft_wal_t* wal, uint64_t safe_checkpoint_index) {
                 if (unlink(path) != 0) return -1;
             }
 
-            for (uint64_t i = 0; i < next_start_idx; i++) {
-                if (i < wal->offsets_cap) wal->offsets[i] = (raft_wal_loc_t){0};
+            // Slide the window forward and reclaim the prefix memory array safely
+            if (next_start_idx > wal->offset_base_index) {
+                uint64_t shift = next_start_idx - wal->offset_base_index;
+                if (shift < wal->offsets_cap) {
+                    memmove(wal->offsets, wal->offsets + shift, (wal->offsets_cap - shift) * sizeof(raft_wal_loc_t));
+                    memset(wal->offsets + (wal->offsets_cap - shift), 0, shift * sizeof(raft_wal_loc_t));
+                } else {
+                    memset(wal->offsets, 0, wal->offsets_cap * sizeof(raft_wal_loc_t));
+                }
+                wal->offset_base_index = next_start_idx;
+
+                // Rebase and shrink the allocated array to free long-running memory
+                uint64_t live = wal->max_disk_index >= wal->offset_base_index
+                              ? wal->max_disk_index - wal->offset_base_index + 1
+                              : 0;
+
+                uint64_t desired = 1024;
+                while (desired < live) {
+                    if (desired > UINT64_MAX / 2) {
+                        desired = live;
+                        break;
+                    }
+                    desired *= 2;
+                }
+
+                if (desired < wal->offsets_cap / 2) {
+                    // Check architectural SIZE_MAX limits before allocating
+                    if (desired <= SIZE_MAX / sizeof(raft_wal_loc_t)) {
+                        raft_wal_loc_t* smaller = calloc(desired, sizeof(*smaller));
+                        if (smaller) {
+                            memcpy(smaller, wal->offsets, live * sizeof(*smaller));
+                            free(wal->offsets);
+                            wal->offsets = smaller;
+                            wal->offsets_cap = desired;
+                        }
+                    }
+                }
             }
 
             wal->oldest_seg_id++;

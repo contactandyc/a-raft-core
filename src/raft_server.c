@@ -1134,6 +1134,14 @@ int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
 
     if (compact_index <= raft_snapshot_index(node->core)) return RAFT_OK;
 
+    // FIX 2: Application Contract Guard. Verify the snapshot file actually exists!
+    char dat_snap[512];
+    snprintf(dat_snap, sizeof(dat_snap), "%s/snap_grp%llu.dat", node->server->data_dir, (unsigned long long)node->group_id);
+    struct stat st;
+    if (stat(dat_snap, &st) != 0) {
+        return -1;
+    }
+
     uint64_t old_snap = raft_snapshot_index(node->core);
     uint64_t term = raft_log_term(node->core, compact_index);
 
@@ -1146,7 +1154,6 @@ int raft_node_compact(raft_node_t* node, uint64_t compact_index) {
         return -1;
     }
 
-    // FIX 2: Ensure the hardstate receives the exact post-compaction bounds from the core
     uint64_t commit = raft_commit_index(node->core);
     uint64_t applied = raft_last_applied(node->core);
 

@@ -273,23 +273,40 @@ static void handle_append_entries(raft_t* r, raft_msg_t* msg) {
     raft_msg_t res = { .type = MSG_APPEND_RES, .to = msg->from, .term = r->current_term, .reject = true, .index = raft_log_last_index(r), .read_seq = 0 };
     uint64_t my_last_idx = raft_log_last_index(r);
 
+    // FIX 3: Catch malicious uint64 overflow wrapping BEFORE we enter mathematical loops!
+    if (msg->num_entries > 0 && msg->index > UINT64_MAX - msg->num_entries) {
+        raft_send_msg(r, res);
+        return;
+    }
+
     if (msg->index >= r->snapshot_index && msg->index <= my_last_idx && raft_log_term(r, msg->index) == msg->log_term) {
         res.reject = false;
 
+        // "Validate First, Mutate Second" pattern.
         if (msg->num_entries > 0) {
             for (size_t i = 0; i < msg->num_entries; i++) {
                 uint64_t new_idx = msg->index + 1 + i;
 
-                if ((msg->entries[i].index != 0 && msg->entries[i].index != new_idx) ||
+                // FIX 3: Add strict Entry Type validation to the bounds check
+                if ((msg->entries[i].type != ENTRY_NORMAL && msg->entries[i].type != ENTRY_CONF_ADD && msg->entries[i].type != ENTRY_CONF_REMOVE && msg->entries[i].type != ENTRY_CONF_ADD_LEARNER && msg->entries[i].type != ENTRY_CONF_PROMOTE_LEARNER) ||
+                    (msg->entries[i].index != 0 && msg->entries[i].index != new_idx) ||
                     (msg->entries[i].term == 0 || msg->entries[i].term > msg->term) ||
-                    (msg->entries[i].data_len > 0 && !msg->entries[i].data)) {
+                    (msg->entries[i].data_len > 0 && !msg->entries[i].data) ||
+                    (msg->entries[i].data_len > RAFT_MAX_PAYLOAD_SIZE)) {
                     res.reject = true;
                     break;
                 }
+            }
+        }
 
+        // Rest of the function remains identical...
+        if (!res.reject && msg->num_entries > 0) {
+            for (size_t i = 0; i < msg->num_entries; i++) {
+                uint64_t new_idx = msg->index + 1 + i;
                 my_last_idx = raft_log_last_index(r);
 
                 if (new_idx <= my_last_idx && raft_log_term(r, new_idx) == msg->entries[i].term) continue;
+
                 if (new_idx <= r->commit_index) {
                     res.reject = true;
                     break;

@@ -13,7 +13,6 @@ raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
                           uint64_t snapshot_index, uint64_t snapshot_term) {
 
     // PHASE 12: Strict Boot-Time Invariant Assertions
-    // Prevent the node from booting if the disk suffered partial sector corruption
     if (saved_applied < snapshot_index || saved_commit < saved_applied) {
         fprintf(stderr, "[FATAL] Boot invariant failed: snapshot_index <= applied_index <= commit_index violated.\n");
         return NULL;
@@ -27,10 +26,13 @@ raft_t* raft_io_boot(raft_wal_t* wal, uint64_t node_id,
         return NULL;
     }
 
+    // FIX 1: Guard against math overflow before appending + 1
+    if (snapshot_index == UINT64_MAX) return NULL;
     uint64_t start_idx = snapshot_index + 1;
-    if (wal->max_disk_index > 0) {
-        while (start_idx <= wal->max_disk_index && wal->offsets[start_idx].seg_id == 0) start_idx++;
-    }
+
+    // FIX 1: Jump directly to the rebased offset, skipping all purged records in O(1) time
+    uint64_t first_idx = raft_wal_first_index(wal);
+    if (start_idx < first_idx) start_idx = first_idx;
 
     size_t total_entries = 0;
     raft_entry_t* entries = NULL;

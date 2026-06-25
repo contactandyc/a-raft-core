@@ -109,11 +109,48 @@ MACRO_TEST(io_boot_with_purged_wal) {
     cleanup_wal_files(wal_path);
 }
 
+MACRO_TEST(raft_io_boot_uses_rebased_wal_offsets_after_purge) {
+    const char* wal_path = "/tmp/raft_test_io_rebase";
+    cleanup_wal_files(wal_path);
+
+    raft_wal_t wal;
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 0), 0);
+
+    // Expand the WAL significantly
+    uint8_t dummy[1024] = {0};
+    for (uint64_t i = 1; i <= 2000; i++) {
+        raft_wal_append(&wal, 1, i, 0, 0, 0, dummy, 1024);
+    }
+    raft_wal_flush_batch(&wal);
+
+    // Trigger sliding window base change
+    raft_wal_purge_head(&wal, 1000);
+    raft_wal_close(&wal);
+
+    // Re-initialize to verify the new base is picked up by recovery
+    MACRO_ASSERT_EQ_INT(raft_wal_init(&wal, wal_path, 1, 0), 0);
+    MACRO_ASSERT_TRUE(wal.offset_base_index > 1);
+
+    uint64_t peers[] = {1, 2, 3};
+    bool learners[] = {false, false, false};
+
+    // The boot function MUST rely on first_index and successfully skip missing indices
+    raft_t* core = raft_io_boot(&wal, 1, peers, learners, 3, 1, 0, 1000, 1000, 1000, 1);
+    MACRO_ASSERT_TRUE(core != NULL);
+    MACRO_ASSERT_EQ_INT(raft_last_index(core), 2000);
+
+    raft_destroy(core);
+    raft_wal_close(&wal);
+    cleanup_wal_files(wal_path);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
     MACRO_ADD(tests, io_save_and_boot);
     MACRO_ADD(tests, io_boot_with_purged_wal);
+    MACRO_ADD(tests, raft_io_boot_uses_rebased_wal_offsets_after_purge);
+
     macro_run_all("raft_io_layer", tests, test_count);
     return 0;
 }

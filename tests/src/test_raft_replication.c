@@ -1331,6 +1331,62 @@ MACRO_TEST(leader_resends_snapshot_from_conflict_index_on_chunk_reject) {
     raft_destroy(r);
 }
 
+MACRO_TEST(raft_follower_rejects_payload_exceeding_max_payload_size) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    uint32_t huge_len = RAFT_MAX_PAYLOAD_SIZE + 1;
+    uint8_t* huge_data = calloc(1, huge_len);
+
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_NORMAL, .data = huge_data, .data_len = huge_len };
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_EQ_INT(ready.num_messages, 1);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+
+    // Core MUST NOT crash or alter state!
+    MACRO_ASSERT_FALSE(raft_has_fatal_error(r));
+    MACRO_ASSERT_EQ_INT(raft_last_index(r), 0);
+
+    free(huge_data);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_follower_rejects_wrapped_append_index) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_entry_t e = { .term = 1, .index = 1, .type = ENTRY_NORMAL, .data_len = 0 };
+    // Maliciously set index just below UINT64_MAX to cause math overflow during log iteration
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = UINT64_MAX - 1, .log_term = 0,
+                       .entries = &e, .num_entries = 5, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    raft_destroy(r);
+}
+
+MACRO_TEST(raft_follower_rejects_invalid_entry_type) {
+    uint64_t peers[] = {2, 3};
+    raft_t* r = raft_create(1, peers, 2);
+
+    raft_entry_t e = { .term = 1, .index = 1, .type = 99, .data_len = 0 }; // 99 is not a valid enum type
+    raft_msg_t app = { .type = MSG_APPEND_ENTRIES, .to = 1, .from = 2, .term = 1, .index = 0, .log_term = 0,
+                       .entries = &e, .num_entries = 1, .commit = 0 };
+
+    raft_step_remote(r, &app);
+
+    raft_ready_t ready = raft_get_ready(r);
+    MACRO_ASSERT_TRUE(ready.messages[0].reject);
+    raft_destroy(r);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1390,6 +1446,11 @@ int main(void) {
 
     MACRO_ADD(tests, leader_uses_reject_hints_even_when_follower_log_is_longer);
     MACRO_ADD(tests, leader_resends_snapshot_from_conflict_index_on_chunk_reject);
+    MACRO_ADD(tests, raft_follower_rejects_payload_exceeding_max_payload_size);
+
+    MACRO_ADD(tests, raft_follower_rejects_wrapped_append_index);
+    MACRO_ADD(tests, raft_follower_rejects_invalid_entry_type);
+
     macro_run_all("raft_replication", tests, test_count);
     return 0;
 }
